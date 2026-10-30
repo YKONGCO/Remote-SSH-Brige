@@ -294,7 +294,8 @@ export function ServerModal({
           <p className="field-help">
             仅影响 MCP
             调用，保存后立即生效。文件根目录仅限制文件操作；命令与终端使用 SSH
-            账号权限。全局安全保护仍然生效。
+            账号权限。全局安全保护仍然生效。 目录浏览、移动、删除等 MCP
+            操作统一通过 exec 执行；终端各项授权对应 terminal 工具的 action。
           </p>
           {error && <div className="error-inline">{error}</div>}
         </div>

@@ -186,7 +186,7 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
     let legacy = Server::default();
     assert_eq!(
         legacy.effective_mcp_permissions(),
-        ["list_files", "read_file", "preview_file", "download"]
+        ["read_file", "preview_file"]
     );
     let legacy = Server {
         allow_exec: true,

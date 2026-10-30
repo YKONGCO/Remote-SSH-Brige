@@ -4,10 +4,8 @@ export const permissionGroups = [
   {
     title: "文件读取",
     operations: [
-      ["list_files", "浏览目录"],
       ["read_file", "读取文本"],
       ["preview_file", "预览文件"],
-      ["download", "下载文件"],
     ],
   },
   {
@@ -15,10 +13,6 @@ export const permissionGroups = [
     operations: [
       ["write_file", "写入文本"],
       ["edit_file", "精确编辑（需读取权限）"],
-      ["upload", "上传文件"],
-      ["mkdir", "创建目录"],
-      ["rename", "重命名 / 移动"],
-      ["remove", "删除文件 / 目录"],
     ],
   },
   { title: "命令执行", operations: [["exec", "执行命令"]] },
@@ -41,7 +35,10 @@ export const allMcpPermissions = permissionGroups.flatMap((group) =>
 
 // Absent permissions belong to the legacy three-switch configuration.
 export function selectedMcpPermissions(server: Server): string[] {
-  if (server.mcp_permissions != null) return server.mcp_permissions;
+  if (server.mcp_permissions != null)
+    return server.mcp_permissions.filter((permission) =>
+      allMcpPermissions.some((kind) => kind === permission),
+    );
   return permissionGroups.flatMap((group, index) =>
     index === 0 ||
     (index === 1 && server.allow_write) ||

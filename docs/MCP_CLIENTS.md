@@ -23,10 +23,16 @@ MCP 页面提供 Claude Code、Codex、Gemini CLI、OpenCode、Cursor、Pi 的�
 
 视觉参考 [Windows 设计指南](https://learn.microsoft.com/zh-cn/windows/apps/design/guidelines-overview)，统一中性背景、少量强调色、4px 控件圆角与 8px 容器/弹层圆角。客户端图标来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，MIT 许可保存在 `src/assets/clients/LICENSE`。
 
-## 0.2.0 工具接口升级
+## 0.3.0 工具精简
+
+升级后重新连接以刷新工具清单。对外仅保留 `list_servers`、`exec`、`read_file`、`write_file`、`edit_file`、`preview_file`、`terminal`。
+
+原 list_files、mkdir、rename、remove、upload、download 不再可调用，相关操作改用已授权的 exec 命令；不会自动授予 exec 或放宽命令策略。桌面对应 SFTP 功能保留。原六个终端工具改为 `terminal` 的 list/open/read/write/resize/close 动作：例如 `terminal(action="read", server_id="...", session_id="...", cursor=0)`；list 只传 action。`list_servers.terminal_actions` 返回各服务器已授权的动作。
+
+## 0.2.0 读取与编辑协议（0.3.0 沿用）
 
 升级后重新连接 MCP 以刷新工具 Schema。新增 `edit_file`，需要在服务器权限里明确授予精确编辑和读取文本；旧配置保持原授权。
 
-`read_file` 的第一个文本块现在是原始文本和可选的续读提示，不再是含 content 的 JSON 全文。元数据位于 `structuredContent`：根据 `has_more` 和 `next_offset` 续读。需要完整字节内容时使用 `download`。`list_files` 默认返回最多 200 项，根据 `next_offset` 继续。
+`read_file` 的第一个文本块是原始文本和可选续读提示，不再是含 content 的 JSON 全文。元数据位于 `structuredContent`：根据 `has_more` 和 `next_offset` 续读。0.3.0 的完整字节传输和目录浏览改走 exec。
 
 各工具拒绝无关参数，请仅发送对应 Schema 中的字段。`write_file` 的 `content` 必填，空字符串可写空文件；`mode` 默认 overwrite，可指定 create 防止覆盖。父目录必须存在。

@@ -35,15 +35,6 @@ args!(ReadArgs {
     #[schemars(range(min = 1, max = 2000))]
     limit: Option<u64>,
 });
-args!(ListArgs {
-    #[schemars(length(min = 1, max = 8192))]
-    path: String,
-    /// Entry index (0-indexed; default 0). Directory changes can invalidate pagination.
-    offset: Option<u64>,
-    /// Maximum entries, 1-1000 (default 200).
-    #[schemars(range(min = 1, max = 1000))]
-    limit: Option<u64>,
-});
 args!(WriteArgs {
     #[schemars(length(min = 1, max = 8192))]
     path: String,
@@ -59,55 +50,12 @@ args!(EditArgs {
     #[schemars(length(min = 1, max = 100))]
     edits: Vec<FileEdit>,
 });
-args!(ContentArgs {
-    #[schemars(length(min = 1, max = 8192))]
-    path: String,
-    /// Base64-encoded file bytes.
-    content: String,
-});
-args!(RenameArgs {
-    #[schemars(length(min = 1, max = 8192))]
-    path: String,
-    /// Absolute destination path; must not already exist.
-    #[schemars(length(min = 1, max = 8192))]
-    target: String,
-});
 args!(ExecArgs {
     #[schemars(length(min = 1, max = 16384))]
     command: String,
     /// Seconds, 0 uses application default; otherwise 1-300.
     #[schemars(range(max = 300))]
     timeout_secs: Option<u64>,
-});
-args!(OpenArgs {
-    #[schemars(range(min = 20, max = 500))]
-    cols: Option<u32>,
-    #[schemars(range(min = 5, max = 200))]
-    rows: Option<u32>,
-});
-args!(SessionArgs {
-    #[schemars(length(min = 1, max = 128))]
-    session_id: String,
-});
-args!(TerminalReadArgs {
-    #[schemars(length(min = 1, max = 128))]
-    session_id: String,
-    /// Byte cursor returned by the previous read (default 0).
-    cursor: Option<u64>,
-});
-args!(TerminalWriteArgs {
-    #[schemars(length(min = 1, max = 128))]
-    session_id: String,
-    /// Raw terminal input. Include newline to execute a command.
-    content: String,
-});
-args!(ResizeArgs {
-    #[schemars(length(min = 1, max = 128))]
-    session_id: String,
-    #[schemars(range(min = 20, max = 500))]
-    cols: u32,
-    #[schemars(range(min = 5, max = 200))]
-    rows: u32,
 });
 
 macro_rules! into_op {
@@ -121,14 +69,115 @@ macro_rules! into_op {
 }
 into_op!(PathArgs, a, {path: a.path});
 into_op!(ReadArgs, a, {path: a.path, file_request: Some(FileRequest::Read {offset:a.offset.unwrap_or(1),limit:a.limit.unwrap_or(2000)})});
-into_op!(ListArgs, a, {path: a.path, file_request: Some(FileRequest::List {offset:a.offset.unwrap_or(0),limit:a.limit.unwrap_or(200)})});
 into_op!(WriteArgs, a, {path:a.path, content:a.content, file_request:Some(FileRequest::Write {mode:a.mode.unwrap_or_default()})});
 into_op!(EditArgs, a, {path:a.path, file_request:Some(FileRequest::Edit {edits:a.edits})});
-into_op!(ContentArgs, a, {path:a.path, content:a.content});
-into_op!(RenameArgs, a, {path:a.path, target:a.target});
 into_op!(ExecArgs, a, {command:a.command, timeout_secs:a.timeout_secs.unwrap_or(0)});
-into_op!(OpenArgs, a, {cols:a.cols.unwrap_or(100), rows:a.rows.unwrap_or(30)});
-into_op!(SessionArgs, a, {session_id:a.session_id});
-into_op!(TerminalReadArgs, a, {session_id:a.session_id, cursor:a.cursor.unwrap_or(0)});
-into_op!(TerminalWriteArgs, a, {session_id:a.session_id, content:a.content});
-into_op!(ResizeArgs, a, {session_id:a.session_id, cols:a.cols, rows:a.rows});
+
+/// A discriminated union keeps action-specific required fields and rejects
+/// accidental combinations (for example, command on a read request).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(extend("type" = "object"))]
+pub enum TerminalArgs {
+    List {},
+    Open {
+        #[schemars(length(min = 1, max = 128))]
+        server_id: String,
+        #[schemars(range(min = 20, max = 500))]
+        cols: Option<u32>,
+        #[schemars(range(min = 5, max = 200))]
+        rows: Option<u32>,
+    },
+    Read {
+        #[schemars(length(min = 1, max = 128))]
+        server_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        session_id: String,
+        /// Byte cursor from the previous read, initially 0.
+        cursor: Option<u64>,
+    },
+    Write {
+        #[schemars(length(min = 1, max = 128))]
+        server_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        session_id: String,
+        /// Raw input; include newline to execute a command.
+        content: String,
+    },
+    Resize {
+        #[schemars(length(min = 1, max = 128))]
+        server_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        session_id: String,
+        #[schemars(range(min = 20, max = 500))]
+        cols: u32,
+        #[schemars(range(min = 5, max = 200))]
+        rows: u32,
+    },
+    Close {
+        #[schemars(length(min = 1, max = 128))]
+        server_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        session_id: String,
+    },
+}
+
+impl TerminalArgs {
+    pub fn operation(self) -> Option<Operation> {
+        let mut op = Operation::default();
+        match self {
+            Self::List {} => return None,
+            Self::Open {
+                server_id,
+                cols,
+                rows,
+            } => {
+                op.kind = "terminal_open".into();
+                op.server_id = server_id;
+                op.cols = cols.unwrap_or(100);
+                op.rows = rows.unwrap_or(30);
+            }
+            Self::Read {
+                server_id,
+                session_id,
+                cursor,
+            } => {
+                op.kind = "terminal_read".into();
+                op.server_id = server_id;
+                op.session_id = session_id;
+                op.cursor = cursor.unwrap_or(0);
+            }
+            Self::Write {
+                server_id,
+                session_id,
+                content,
+            } => {
+                op.kind = "terminal_write".into();
+                op.server_id = server_id;
+                op.session_id = session_id;
+                op.content = content;
+            }
+            Self::Resize {
+                server_id,
+                session_id,
+                cols,
+                rows,
+            } => {
+                op.kind = "terminal_resize".into();
+                op.server_id = server_id;
+                op.session_id = session_id;
+                op.cols = cols;
+                op.rows = rows;
+            }
+            Self::Close {
+                server_id,
+                session_id,
+            } => {
+                op.kind = "terminal_close".into();
+                op.server_id = server_id;
+                op.session_id = session_id;
+            }
+        }
+        Some(op)
+    }
+}

@@ -484,13 +484,28 @@ try {
   check("Reject browser Origin", browser.status === 403);
   await mcp.connect(transport);
   const tools = await mcp.listTools();
-  check("MCP initialize and discover 18 tools", tools.tools.length === 18);
+  check(
+    "MCP exposes exactly 7 focused tools",
+    JSON.stringify(tools.tools.map((t) => t.name).sort()) ===
+      JSON.stringify(
+        [
+          "list_servers",
+          "exec",
+          "read_file",
+          "write_file",
+          "edit_file",
+          "preview_file",
+          "terminal",
+        ].sort(),
+      ),
+  );
   const call = async (name, args = {}) => {
     try {
       const result = await mcp.callTool({
         name,
         arguments:
-          name === "list_servers" || name === "list_terminals"
+          name === "list_servers" ||
+          (name === "terminal" && args.action === "list")
             ? args
             : { server_id: "test-host", ...args },
       });
@@ -512,12 +527,10 @@ try {
   };
   for (const [name, expected] of Object.entries({
     list_servers: [],
-    list_terminals: [],
     read_file: ["server_id", "path", "offset", "limit"],
     write_file: ["server_id", "path", "content", "mode"],
     edit_file: ["server_id", "path", "edits"],
     exec: ["server_id", "command", "timeout_secs"],
-    terminal_write: ["server_id", "session_id", "content"],
   })) {
     const schema = tools.tools.find((tool) => tool.name === name).inputSchema;
     check(
@@ -533,7 +546,13 @@ try {
     ["write_file", { path: "/workspace/new" }],
     ["read_file", { path: "/workspace/hello.txt", command: "irrelevant" }],
     ["read_file", { path: "/workspace/hello.txt", offset: 0 }],
-    ["list_files", { path: "/workspace", limit: 0 }],
+    ["terminal", {}],
+    ["terminal", { action: "unknown" }],
+    ["terminal", { action: "list", server_id: "irrelevant" }],
+    ["terminal", { action: "open", cols: 0 }],
+    ["terminal", { action: "write", session_id: "s" }],
+    ["terminal", { action: "read", session_id: "s", content: "irrelevant" }],
+    ["terminal", { action: "resize", session_id: "s", cols: 100 }],
     ["exec", { command: "pwd", timeout_secs: 301 }],
     ["edit_file", { path: "/workspace/hello.txt", edits: [] }],
   ])
@@ -541,6 +560,38 @@ try {
       "Reject invalid " + name + " arguments: " + JSON.stringify(args),
       (await call(name, args)).error,
     );
+  const terminalSchema = tools.tools.find(
+    (tool) => tool.name === "terminal",
+  ).inputSchema;
+  check(
+    "Terminal schema is discriminated by action",
+    terminalSchema.type === "object" &&
+      terminalSchema.oneOf.length === 6 &&
+      terminalSchema.oneOf.every(
+        (variant) =>
+          variant.additionalProperties === false &&
+          variant.required.includes("action"),
+      ),
+  );
+  for (const oldName of [
+    "list_files",
+    "mkdir",
+    "rename",
+    "remove",
+    "upload",
+    "download",
+    "list_terminals",
+    "terminal_open",
+    "terminal_read",
+    "terminal_write",
+    "terminal_resize",
+    "terminal_close",
+  ]) {
+    check(
+      "Retired tool is not callable: " + oldName,
+      (await call(oldName, {})).error,
+    );
+  }
   const hosts = await value("list_servers", {});
   check(
     "Discovery exposes independently configured Shell policy",
@@ -591,41 +642,33 @@ try {
   const limitedHost = hosts.find((host) => host.id === "limited-host");
   check(
     "Discovery exposes precise tool permissions",
-    limitedHost.mcp_permissions.includes("upload") &&
-      !limitedHost.mcp_permissions.includes("remove"),
+    limitedHost.mcp_permissions.includes("read_file") &&
+      !limitedHost.mcp_permissions.includes("upload") &&
+      !limitedHost.mcp_permissions.includes("exec") &&
+      JSON.stringify(limitedHost.terminal_actions) ===
+        JSON.stringify(["open", "read", "close"]),
   );
-  await value("upload", {
-    server_id: "limited-host",
-    path: "/workspace/limited.txt",
-    content: Buffer.from("limited upload").toString("base64"),
-  });
+  entries.set("/workspace/limited.txt", Buffer.from("limited read"));
   const limitedText = await value("read_file", {
     server_id: "limited-host",
     path: "/workspace/limited.txt",
   });
   check(
-    "Upload and text read permissions work independently",
-    limitedText.content === "limited upload",
+    "Legacy file grants do not imply shell permission",
+    limitedText.content === "limited read" && !limitedHost.allow_exec,
   );
-  for (const kind of [
-    "write_file",
-    "remove",
-    "download",
-    "exec",
-    "terminal_write",
+  for (const [kind, args] of [
+    ["write_file", { path: "/workspace/limited.txt", content: "denied" }],
+    ["exec", { command: "fixture:streams" }],
+    [
+      "terminal",
+      { action: "write", session_id: "denied-session", content: "denied" },
+    ],
   ]) {
-    const args =
-      kind === "exec"
-        ? { command: "fixture:streams" }
-        : kind === "terminal_write"
-          ? { session_id: "denied-session", content: "denied" }
-          : kind === "write_file"
-            ? { path: "/workspace/limited.txt", content: "denied" }
-            : { path: "/workspace/limited.txt" };
     const denied = await call(kind, { server_id: "limited-host", ...args });
     check(
-      `Granular permission rejects ${kind} despite legacy grants`,
-      denied.error && denied.value.includes("未授权"),
+      "Independent permission denies " + kind,
+      denied.error && JSON.parse(denied.value).code === "PERMISSION_DENIED",
     );
   }
   const mismatch = await call("read_file", {
@@ -643,11 +686,20 @@ try {
       exec.stdout.includes("stdout ✓") &&
       exec.stderr.includes("stderr ✓"),
   );
-  const listing = await value("list_files", { path: "/workspace" });
-  check(
-    "Real SFTP directory listing",
-    listing.entries.some((f) => f.name === "hello.txt"),
-  );
+  for (const command of [
+    "ls -la /workspace",
+    "mv /workspace/from /workspace/to",
+    "mkdir /workspace/new-dir",
+    "find /workspace -type f",
+    "grep -n port /workspace/config",
+    "base64 /workspace/binary.bin",
+  ]) {
+    const result = await value("exec", { command });
+    check(
+      "Use exec instead of a dedicated tool: " + command,
+      result.stdout.includes(command),
+    );
+  }
   const text = await value("read_file", { path: "/workspace/hello.txt" });
   check("Read remote UTF-8 file", text.content === "hello SSH\n");
   const preview = await value("preview_file", { path: "/workspace/hello.txt" });
@@ -689,14 +741,6 @@ try {
     (await value("read_file", { path: "/workspace/page.txt", offset: 3 }))
       .content === "三\r\n",
   );
-  const directoryPage = await value("list_files", {
-    path: "/workspace",
-    limit: 1,
-  });
-  check(
-    "Directory pagination advances",
-    directoryPage.entries.length === 1 && directoryPage.next_offset === 1,
-  );
   await value("write_file", {
     path: "/workspace/edit.txt",
     content: "keep “quotes”  \r\nport=80\r\ndebug=true\r\n",
@@ -737,7 +781,7 @@ try {
     edits: [{ old_text: "limited", new_text: "denied-edit" }],
   });
   check(
-    "Edit permission is independent of upload",
+    "Edit permission is independent of shell access",
     deniedEdit.error && deniedEdit.value.includes("未授权"),
   );
   await value("write_file", {
@@ -819,62 +863,27 @@ try {
     "Temporary files are cleaned up",
     ![...entries.keys()].some((p) => p.includes(".remote-desk-")),
   );
-  await value("upload", {
-    path: "/workspace/binary.bin",
-    content: Buffer.from([0, 255, 16, 128]).toString("base64"),
-  });
+  entries.set("/workspace/binary.bin", Buffer.from([0, 255, 16, 128]));
   check(
-    "Binary upload and download round trip",
-    (await value("download", { path: "/workspace/binary.bin" })).base64 ===
-      Buffer.from([0, 255, 16, 128]).toString("base64"),
-  );
-  check(
-    "Binary preview returns metadata instead of executable content",
+    "Binary preview returns metadata",
     (await value("preview_file", { path: "/workspace/binary.bin" })).kind ===
       "unsupported",
   );
-  await value("mkdir", { path: "/workspace/new-dir" });
-  const large = Buffer.alloc(3 * 1024 * 1024, 120);
-  await value("upload", {
-    path: "/workspace/large.bin",
-    content: large.toString("base64"),
+  await value("write_file", {
+    path: "/workspace/large.txt",
+    content: "x".repeat(3 * 1024 * 1024),
   });
   check(
-    "Configured upload limit permits a request above the former MCP 4 MiB body cap",
-    entries.get("/workspace/large.bin").length === large.length,
+    "Configured write limit permits large text",
+    entries.get("/workspace/large.txt").length === 3 * 1024 * 1024,
   );
-  const oversizedDownload = await call("download", {
-    path: "/workspace/large.bin",
+  const tooLarge = await call("write_file", {
+    path: "/workspace/too-large.txt",
+    content: "x".repeat(4 * 1024 * 1024 + 1),
   });
   check(
-    "Configured download limit rejects oversized remote files",
-    oversizedDownload.error && oversizedDownload.value.includes("1 MiB"),
-  );
-  const oversizedUpload = await call("upload", {
-    path: "/workspace/too-large.bin",
-    content: Buffer.alloc(4 * 1024 * 1024 + 1).toString("base64"),
-  });
-  check(
-    "Configured upload limit rejects oversized payloads without writing",
-    oversizedUpload.error && !entries.has("/workspace/too-large.bin"),
-  );
-  await value("remove", { path: "/workspace/large.bin" });
-  await value("rename", {
-    path: "/workspace/new.txt",
-    target: "/workspace/renamed.txt",
-  });
-  check(
-    "Create directory and rename file",
-    (await value("list_files", { path: "/workspace" })).entries.some(
-      (e) => e.name === "renamed.txt",
-    ),
-  );
-  await value("remove", { path: "/workspace/renamed.txt" });
-  await value("remove", { path: "/workspace/new-dir" });
-  check(
-    "Remove file and empty directory",
-    !entries.has("/workspace/renamed.txt") &&
-      !entries.has("/workspace/new-dir"),
+    "Configured write limit rejects oversized text",
+    tooLarge.error && !entries.has("/workspace/too-large.txt"),
   );
   check(
     "Deny traversal outside configured root",
@@ -884,26 +893,29 @@ try {
     "Deny symlink escape outside configured root",
     (await call("read_file", { path: "/workspace/escape" })).error,
   );
-  check(
-    "Deny deletion of authorized root",
-    (await call("remove", { path: "/workspace" })).error,
-  );
-  const terminal = await value("terminal_open", { cols: 100, rows: 30 });
+  const terminal = await value("terminal", {
+    action: "open",
+    cols: 100,
+    rows: 30,
+  });
   check(
     "Configured session limit rejects additional terminals",
-    (await call("terminal_open", {})).error,
+    (await call("terminal", { action: "open" })).error,
   );
-  await value("terminal_write", {
+  await value("terminal", {
+    action: "write",
     session_id: terminal.session_id,
     content: "cd /workspace/kept\n",
   });
-  await value("terminal_write", {
+  await value("terminal", {
+    action: "write",
     session_id: terminal.session_id,
     content: "pwd\n",
   });
   let output = "";
   for (let n = 0; n < 30; n++) {
-    const r = await value("terminal_read", {
+    const r = await value("terminal", {
+      action: "read",
       session_id: terminal.session_id,
       cursor: 0,
     });
@@ -915,34 +927,37 @@ try {
     "Persistent SSH PTY retains working directory between tool calls",
     output.includes("/workspace/kept"),
   );
-  const terminals = await value("list_terminals", {});
+  const terminals = await value("terminal", { action: "list" });
   check(
     "Discover persistent terminal sessions",
     terminals.some((t) => t.id === terminal.session_id),
   );
-  await value("terminal_resize", {
+  await value("terminal", {
+    action: "resize",
     session_id: terminal.session_id,
     cols: 120,
     rows: 40,
   });
-  await value("terminal_close", { session_id: terminal.session_id });
+  await value("terminal", { action: "close", session_id: terminal.session_id });
   check(
     "Resize and close persistent terminal",
-    (await value("list_terminals", {})).length === 0,
+    (await value("terminal", { action: "list" })).length === 0,
   );
-  const limitedTerminal = await value("terminal_open", {
+  const limitedTerminal = await value("terminal", {
+    action: "open",
     server_id: "limited-host",
     cols: 100,
     rows: 30,
   });
-  const visibleTerminals = await value("list_terminals", {});
+  const visibleTerminals = await value("terminal", { action: "list" });
   check(
     "Terminal discovery respects independent list permission",
     !visibleTerminals.some(
       (session) => session.id === limitedTerminal.session_id,
     ),
   );
-  const limitedOutput = await value("terminal_read", {
+  const limitedOutput = await value("terminal", {
+    action: "read",
     server_id: "limited-host",
     session_id: limitedTerminal.session_id,
     cursor: 0,
@@ -951,7 +966,8 @@ try {
     "Terminal output can be read without input permission",
     typeof limitedOutput.base64 === "string",
   );
-  const deniedInput = await call("terminal_write", {
+  const deniedInput = await call("terminal", {
+    action: "write",
     server_id: "limited-host",
     session_id: limitedTerminal.session_id,
     content: "pwd\n",
@@ -960,7 +976,8 @@ try {
     "Existing terminal input is denied without permission",
     deniedInput.error && deniedInput.value.includes("未授权"),
   );
-  await value("terminal_close", {
+  await value("terminal", {
+    action: "close",
     server_id: "limited-host",
     session_id: limitedTerminal.session_id,
   });

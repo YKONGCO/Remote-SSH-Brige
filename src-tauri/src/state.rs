@@ -106,6 +106,7 @@ impl AppState {
     }
     pub fn save_server(&self, mut server: Server, secret: Option<String>) -> Result<Server> {
         if let Some(permissions) = &mut server.mcp_permissions {
+            permissions.retain(|kind| !RETIRED_MCP_OPERATIONS.contains(&kind.as_str()));
             anyhow::ensure!(
                 permissions
                     .iter()
@@ -115,12 +116,9 @@ impl AppState {
             permissions.sort();
             permissions.dedup();
             server.allow_exec = permissions.iter().any(|kind| kind == "exec");
-            server.allow_write = permissions.iter().any(|kind| {
-                matches!(
-                    kind.as_str(),
-                    "write_file" | "upload" | "mkdir" | "rename" | "remove"
-                )
-            });
+            server.allow_write = permissions
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "write_file" | "edit_file"));
             server.allow_terminal = permissions
                 .iter()
                 .any(|kind| kind.starts_with("terminal_") || kind == "list_terminals");

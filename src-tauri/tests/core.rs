@@ -55,15 +55,28 @@ fn legacy_database_migrates_and_granular_permissions_persist() {
     let mut migrated = state.server(&legacy.id).unwrap();
     assert!(migrated.mcp_enabled);
     assert!(migrated.mcp_permissions.is_none());
-    assert!(migrated.permits_mcp("remove"));
-    assert!(migrated.permits_mcp("download"));
+    assert!(!migrated.permits_mcp("remove"));
+    assert!(!migrated.permits_mcp("download"));
+    assert!(migrated.permits_mcp("write_file"));
     assert!(!migrated.permits_mcp("exec"));
-    migrated.mcp_permissions = Some(vec!["upload".into(), "terminal_read".into()]);
+    migrated.mcp_permissions = Some(vec![
+        "upload".into(),
+        "read_file".into(),
+        "terminal_read".into(),
+    ]);
     state.save_server(migrated, None).unwrap();
     drop(state);
     let state = AppState::open(dir.clone()).unwrap();
     let mut saved = state.server(&legacy.id).unwrap();
-    assert!(saved.permits_mcp("upload"));
+    assert!(!saved.permits_mcp("upload"));
+    assert!(!saved
+        .mcp_permissions
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|op| op == "upload"));
+    assert!(saved.permits_mcp("read_file"));
+    assert!(!saved.permits_mcp("exec"));
     assert!(saved.permits_mcp("terminal_read"));
     for denied in [
         "write_file",
@@ -142,7 +155,7 @@ async fn granular_denials_are_enforced_before_network_and_survive_live_updates()
     assert!(error.to_string().contains("未授权"));
     let audits = state.audit.lock().unwrap();
     assert!(audits.iter().all(|entry| !entry.success));
-    assert!(audits.iter().any(|entry| entry.kind == "upload"));
+    assert!(audits.iter().any(|entry| entry.kind == "terminal_write"));
     drop(audits);
     drop(state);
     cleanup(dir);
@@ -226,6 +239,39 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
     cleanup(dir);
 }
 
+#[test]
+fn retired_file_grants_are_stripped_without_granting_shell_access() {
+    use remote_desk_lib::model::RETIRED_MCP_OPERATIONS;
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state
+        .save_server(
+            Server {
+                allow_exec: true,
+                allow_write: true,
+                mcp_permissions: Some(
+                    RETIRED_MCP_OPERATIONS
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                ),
+                ..server()
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(saved.mcp_permissions, Some(vec![]));
+    assert!(!saved.allow_exec);
+    assert!(!saved.allow_write);
+    assert!(saved.effective_mcp_permissions().is_empty());
+    assert!(saved.terminal_actions().is_empty());
+    drop(state);
+    let state = AppState::open(dir.clone()).unwrap();
+    assert!(!state.server(&saved.id).unwrap().permits_mcp("exec"));
+    drop(state);
+    cleanup(dir);
+}
+
 #[tokio::test]
 async fn transfer_limits_apply_to_desktop_and_mcp_before_network_access() {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -249,6 +295,9 @@ async fn transfer_limits_apply_to_desktop_and_mcp_before_network_access() {
         .unwrap();
     for source in ["desktop", "mcp"] {
         for kind in ["upload", "write_file"] {
+            if source == "mcp" && kind == "upload" {
+                continue;
+            } // upload remains desktop-only.
             let bytes = vec![b'x'; 1024 * 1024 + 1];
             let content = if kind == "upload" {
                 STANDARD.encode(bytes)

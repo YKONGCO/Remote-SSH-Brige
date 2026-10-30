@@ -158,16 +158,10 @@ impl Default for Server {
     }
 }
 pub const MCP_OPERATIONS: &[&str] = &[
-    "list_files",
     "read_file",
     "preview_file",
-    "download",
     "write_file",
     "edit_file",
-    "upload",
-    "mkdir",
-    "rename",
-    "remove",
     "exec",
     "list_terminals",
     "terminal_open",
@@ -176,7 +170,30 @@ pub const MCP_OPERATIONS: &[&str] = &[
     "terminal_resize",
     "terminal_close",
 ];
+/// Retained only to recognize and strip old grants when a server is saved.
+/// Never translate these into shell access.
+pub const RETIRED_MCP_OPERATIONS: &[&str] = &[
+    "list_files",
+    "download",
+    "upload",
+    "mkdir",
+    "rename",
+    "remove",
+];
 impl Server {
+    pub fn terminal_actions(&self) -> Vec<&'static str> {
+        [
+            ("list", "list_terminals"),
+            ("open", "terminal_open"),
+            ("read", "terminal_read"),
+            ("write", "terminal_write"),
+            ("resize", "terminal_resize"),
+            ("close", "terminal_close"),
+        ]
+        .into_iter()
+        .filter_map(|(action, permission)| self.permits_mcp(permission).then_some(action))
+        .collect()
+    }
     pub fn permits_mcp(&self, kind: &str) -> bool {
         if !self.enabled || !self.mcp_enabled || !MCP_OPERATIONS.contains(&kind) {
             return false;
@@ -187,10 +204,10 @@ impl Server {
         }
         match kind {
             "exec" => self.allow_exec,
-            "write_file" | "upload" | "mkdir" | "rename" | "remove" => self.allow_write,
+            "write_file" => self.allow_write,
             "list_terminals" | "terminal_open" | "terminal_read" | "terminal_write"
             | "terminal_resize" | "terminal_close" => self.allow_terminal,
-            "list_files" | "read_file" | "preview_file" | "download" => true,
+            "read_file" | "preview_file" => true,
             _ => false,
         }
     }

@@ -117,7 +117,7 @@ export const newServer = (): Server => ({
   allow_write: false,
   allow_terminal: false,
   mcp_enabled: true,
-  mcp_permissions: ["list_files", "read_file", "preview_file", "download"],
+  mcp_permissions: ["read_file", "preview_file"],
   root: "/",
 });
 export const labels: Record<string, string> = {

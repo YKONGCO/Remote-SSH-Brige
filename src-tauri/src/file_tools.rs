@@ -189,13 +189,13 @@ pub fn read_page(
             if line.contains(&0) {
                 return Err(error(
                     "UNSUPPORTED_TEXT",
-                    "Not UTF-8 text; use preview_file or download",
+                    "Not UTF-8 text; use preview_file or exec if permitted",
                 ));
             }
             let text = std::str::from_utf8(&line).map_err(|_| {
                 error(
                     "UNSUPPORTED_TEXT",
-                    "Not UTF-8 text; use preview_file or download",
+                    "Not UTF-8 text; use preview_file or exec if permitted",
                 )
             })?;
             content.push_str(text);
@@ -215,7 +215,7 @@ pub fn read_page(
         } else {
             error(
                 "READ_SCAN_LIMIT",
-                "Cannot locate offset within download scan budget; use download",
+                "Cannot locate offset within scan budget; use bounded exec inspection if permitted",
             )
         });
     }

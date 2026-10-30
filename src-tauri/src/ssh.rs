@@ -111,7 +111,7 @@ fn remote_path(sftp: &Sftp, server: &Server, value: &str, create: bool) -> Resul
                     if e.code() == ssh2::ErrorCode::SFTP(2) {
                         file_tools::error(
                             "PARENT_NOT_FOUND",
-                            "Parent directory must exist; create it with mkdir first",
+                            "Parent directory must exist; create it first (use exec for MCP)",
                         )
                     } else {
                         e.into()
