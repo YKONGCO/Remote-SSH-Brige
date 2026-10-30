@@ -42,6 +42,12 @@ const entries = new Map([
 ]);
 const { STATUS_CODE: STATUS, OPEN_MODE: OPEN } = sftpUtils;
 const clients = new Set();
+const fixture = {
+  rejectCommit: false,
+  dropCommitResponse: false,
+  createRace: false,
+  commitCalls: 0,
+};
 const canonical = (p) => (p === "/" ? "/" : p.replace(/\/+$/, ""));
 const stats = (p) => {
   const e = entries.get(p);
@@ -247,10 +253,46 @@ const ssh = new Server(
               }
             ok(id);
           };
-          channel.on("RENAME", rename);
-          channel.on("EXTENDED", (id, name, ...args) => {
-            if (name === "posix-rename@openssh.com") rename(id, ...args);
-            else fail(id, STATUS.OP_UNSUPPORTED);
+          channel.on("RENAME", (id, from, to) => {
+            if (entries.has(canonical(to))) return fail(id, STATUS.FAILURE);
+            rename(id, from, to);
+          });
+          channel.on("EXTENDED", (id, name, data) => {
+            fixture.commitCalls++;
+            if (fixture.rejectCommit) return fail(id, STATUS.OP_UNSUPPORTED);
+            let cursor = 0;
+            const readString = () => {
+              const size = data.readUInt32BE(cursor);
+              cursor += 4;
+              const value = data.subarray(cursor, cursor + size).toString();
+              cursor += size;
+              return canonical(value);
+            };
+            const from = readString(),
+              to = readString();
+            if (name === "hardlink@openssh.com") {
+              if (fixture.createRace) {
+                entries.set(to, Buffer.from("concurrent-create"));
+                fixture.createRace = false;
+              }
+              if (entries.has(to)) return fail(id, STATUS.FAILURE);
+              if (!entries.has(from)) return fail(id);
+              entries.set(to, entries.get(from));
+              if (fixture.dropCommitResponse) {
+                channel.end();
+                return;
+              }
+              ok(id);
+            } else if (name === "posix-rename@openssh.com") {
+              if (fixture.dropCommitResponse) {
+                const moved = entries.get(from);
+                entries.delete(from);
+                entries.set(to, moved);
+                channel.end();
+                return;
+              }
+              rename(id, from, to);
+            } else fail(id, STATUS.OP_UNSUPPORTED);
           });
         });
       }),
@@ -274,6 +316,25 @@ const configServer = {
   allow_exec: true,
   allow_write: true,
   allow_terminal: true,
+  mcp_permissions: [
+    "list_files",
+    "read_file",
+    "preview_file",
+    "download",
+    "write_file",
+    "edit_file",
+    "upload",
+    "mkdir",
+    "rename",
+    "remove",
+    "exec",
+    "list_terminals",
+    "terminal_open",
+    "terminal_read",
+    "terminal_write",
+    "terminal_resize",
+    "terminal_close",
+  ],
   root: "/workspace",
 };
 await writeFile(
@@ -423,22 +484,63 @@ try {
   check("Reject browser Origin", browser.status === 403);
   await mcp.connect(transport);
   const tools = await mcp.listTools();
-  check("MCP initialize and discover 17 tools", tools.tools.length === 17);
+  check("MCP initialize and discover 18 tools", tools.tools.length === 18);
   const call = async (name, args = {}) => {
-    const result = await mcp.callTool({
-      name,
-      arguments: { server_id: "test-host", ...args },
-    });
-    return {
-      error: result.isError,
-      value: result.content?.map((c) => c.text || "").join(""),
-    };
+    try {
+      const result = await mcp.callTool({
+        name,
+        arguments:
+          name === "list_servers" || name === "list_terminals"
+            ? args
+            : { server_id: "test-host", ...args },
+      });
+      return {
+        error: result.isError,
+        value: result.content?.map((c) => c.text || "").join(""),
+        metadata: result.structuredContent,
+      };
+    } catch (error) {
+      return { error: true, value: String(error) };
+    }
   };
   const value = async (name, args) => {
     const r = await call(name, args);
     assert.ok(!r.error, r.value);
-    return JSON.parse(r.value);
+    return name === "read_file"
+      ? { content: r.value, ...r.metadata }
+      : JSON.parse(r.value);
   };
+  for (const [name, expected] of Object.entries({
+    list_servers: [],
+    list_terminals: [],
+    read_file: ["server_id", "path", "offset", "limit"],
+    write_file: ["server_id", "path", "content", "mode"],
+    edit_file: ["server_id", "path", "edits"],
+    exec: ["server_id", "command", "timeout_secs"],
+    terminal_write: ["server_id", "session_id", "content"],
+  })) {
+    const schema = tools.tools.find((tool) => tool.name === name).inputSchema;
+    check(
+      name + " exposes only its own parameters",
+      JSON.stringify(Object.keys(schema.properties || {}).sort()) ===
+        JSON.stringify(expected.sort()) &&
+        schema.additionalProperties === false,
+    );
+  }
+  for (const [name, args] of [
+    ["list_servers", { server_id: "irrelevant" }],
+    ["read_file", {}],
+    ["write_file", { path: "/workspace/new" }],
+    ["read_file", { path: "/workspace/hello.txt", command: "irrelevant" }],
+    ["read_file", { path: "/workspace/hello.txt", offset: 0 }],
+    ["list_files", { path: "/workspace", limit: 0 }],
+    ["exec", { command: "pwd", timeout_secs: 301 }],
+    ["edit_file", { path: "/workspace/hello.txt", edits: [] }],
+  ])
+    check(
+      "Reject invalid " + name + " arguments: " + JSON.stringify(args),
+      (await call(name, args)).error,
+    );
   const hosts = await value("list_servers", {});
   check(
     "Discovery exposes independently configured Shell policy",
@@ -512,12 +614,15 @@ try {
     "exec",
     "terminal_write",
   ]) {
-    const denied = await call(kind, {
-      server_id: "limited-host",
-      path: "/workspace/limited.txt",
-      content: "denied",
-      command: "fixture:streams",
-    });
+    const args =
+      kind === "exec"
+        ? { command: "fixture:streams" }
+        : kind === "terminal_write"
+          ? { session_id: "denied-session", content: "denied" }
+          : kind === "write_file"
+            ? { path: "/workspace/limited.txt", content: "denied" }
+            : { path: "/workspace/limited.txt" };
+    const denied = await call(kind, { server_id: "limited-host", ...args });
     check(
       `Granular permission rejects ${kind} despite legacy grants`,
       denied.error && denied.value.includes("未授权"),
@@ -563,6 +668,156 @@ try {
     "Atomic SFTP replace existing file",
     (await value("read_file", { path: "/workspace/new.txt" })).content ===
       "updated",
+  );
+  await value("write_file", {
+    path: "/workspace/page.txt",
+    content: "一\r\n二\r\n三\r\n",
+  });
+  const page = await call("read_file", {
+    path: "/workspace/page.txt",
+    limit: 2,
+  });
+  check(
+    "Read returns raw text with continuation metadata",
+    !page.error &&
+      page.value.startsWith("一\r\n二\r\n") &&
+      page.value.includes("offset=3") &&
+      page.metadata.next_offset === 3,
+  );
+  check(
+    "Read continuation preserves original bytes",
+    (await value("read_file", { path: "/workspace/page.txt", offset: 3 }))
+      .content === "三\r\n",
+  );
+  const directoryPage = await value("list_files", {
+    path: "/workspace",
+    limit: 1,
+  });
+  check(
+    "Directory pagination advances",
+    directoryPage.entries.length === 1 && directoryPage.next_offset === 1,
+  );
+  await value("write_file", {
+    path: "/workspace/edit.txt",
+    content: "keep “quotes”  \r\nport=80\r\ndebug=true\r\n",
+  });
+  const edited = await value("edit_file", {
+    path: "/workspace/edit.txt",
+    edits: [
+      { old_text: "port=80", new_text: "port=90" },
+      { old_text: "debug=true", new_text: "debug=false" },
+    ],
+  });
+  check(
+    "Batch edit commits once and returns diff",
+    edited.applied_edits === 2 && edited.diff.includes("+port=90"),
+  );
+  check(
+    "Batch edit preserves CRLF and untouched text",
+    entries.get("/workspace/edit.txt").toString() ===
+      "keep “quotes”  \r\nport=90\r\ndebug=false\r\n",
+  );
+  const beforeFailure = Buffer.from(entries.get("/workspace/edit.txt"));
+  const failedBatch = await call("edit_file", {
+    path: "/workspace/edit.txt",
+    edits: [
+      { old_text: "port=90", new_text: "port=99" },
+      { old_text: "missing-text", new_text: "never-committed-secret" },
+    ],
+  });
+  check(
+    "Failed batch leaves original file intact",
+    failedBatch.error &&
+      failedBatch.value.includes("EDIT_NOT_FOUND") &&
+      beforeFailure.equals(entries.get("/workspace/edit.txt")),
+  );
+  const deniedEdit = await call("edit_file", {
+    server_id: "limited-host",
+    path: "/workspace/limited.txt",
+    edits: [{ old_text: "limited", new_text: "denied-edit" }],
+  });
+  check(
+    "Edit permission is independent of upload",
+    deniedEdit.error && deniedEdit.value.includes("未授权"),
+  );
+  await value("write_file", {
+    path: "/workspace/create-only.txt",
+    content: "created",
+    mode: "create",
+  });
+  check(
+    "Create-only mode refuses overwrite",
+    (
+      await call("write_file", {
+        path: "/workspace/create-only.txt",
+        content: "overwritten",
+        mode: "create",
+      })
+    ).error &&
+      entries.get("/workspace/create-only.txt").toString() === "created",
+  );
+  fixture.createRace = true;
+  check(
+    "Atomic create refuses a concurrent creator",
+    (
+      await call("write_file", {
+        path: "/workspace/create-race.txt",
+        content: "must-not-win",
+        mode: "create",
+      })
+    ).error &&
+      entries.get("/workspace/create-race.txt").toString() ===
+        "concurrent-create",
+  );
+  fixture.rejectCommit = true;
+  const unsupported = await call("write_file", {
+    path: "/workspace/edit.txt",
+    content: "must-not-commit",
+  });
+  fixture.rejectCommit = false;
+  check(
+    "Unsupported atomic write fails without touching destination",
+    unsupported.error &&
+      unsupported.value.includes("ATOMIC_WRITE_UNSUPPORTED") &&
+      beforeFailure.equals(entries.get("/workspace/edit.txt")),
+  );
+  fixture.dropCommitResponse = true;
+  const commitCount = fixture.commitCalls;
+  const uncertain = await call("write_file", {
+    path: "/workspace/uncertain.txt",
+    content: "committed-without-ack",
+  });
+  fixture.dropCommitResponse = false;
+  check(
+    "Lost commit response is reported without retry",
+    uncertain.error &&
+      uncertain.value.includes("COMMIT_STATUS_UNKNOWN") &&
+      fixture.commitCalls === commitCount + 1 &&
+      entries.get("/workspace/uncertain.txt").toString() ===
+        "committed-without-ack",
+  );
+  await value("write_file", {
+    path: "/workspace/concurrent.txt",
+    content: "a=1\nb=1\n",
+  });
+  const parallel = await Promise.all([
+    call("edit_file", {
+      path: "/workspace/concurrent.txt",
+      edits: [{ old_text: "a=1", new_text: "a=2" }],
+    }),
+    call("edit_file", {
+      path: "/workspace/concurrent.txt",
+      edits: [{ old_text: "b=1", new_text: "b=2" }],
+    }),
+  ]);
+  check(
+    "Concurrent edits preserve both changes",
+    parallel.every((r) => !r.error) &&
+      entries.get("/workspace/concurrent.txt").toString() === "a=2\nb=2\n",
+  );
+  check(
+    "Temporary files are cleaned up",
+    ![...entries.keys()].some((p) => p.includes(".remote-desk-")),
   );
   await value("upload", {
     path: "/workspace/binary.bin",
@@ -739,7 +994,11 @@ try {
   check(
     "Audit excludes written file contents and terminal keystrokes",
     !JSON.stringify(logs).includes("原子写入") &&
-      !JSON.stringify(logs).includes("cd /workspace/kept"),
+      !JSON.stringify(logs).includes("cd /workspace/kept") &&
+      !JSON.stringify(logs).includes("never-committed-secret") &&
+      !JSON.stringify(logs.filter((l) => l.kind === "edit_file")).includes(
+        "+port=90",
+      ),
   );
   const recordedExec = logs.find(
     (entry) => entry.kind === "exec" && entry.response?.data?.exit_code === 7,

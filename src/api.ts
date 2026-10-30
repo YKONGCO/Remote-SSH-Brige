@@ -212,6 +212,7 @@ export async function operate<T = Record<string, unknown>>(
   const p = op.path || "/";
   const sensitive = [
     "write_file",
+    "edit_file",
     "upload",
     "mkdir",
     "rename",

@@ -552,6 +552,17 @@ fn audit_caps_multibyte_output_and_omits_file_and_input_payloads() {
         .log(&saved, "mcp", &op, &Ok(json!({"written":17})), 0)
         .unwrap();
     op.kind = "download".into();
+    let mut edit_op = op.clone();
+    edit_op.kind = "edit_file".into();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &edit_op,
+            &Ok(json!({"diff":"private-file-body","applied_edits":1,"written_bytes":10})),
+            0,
+        )
+        .unwrap();
     state
         .log(&saved, "mcp", &op, &Ok(json!({"base64":"cHJpdmF0ZQ=="})), 0)
         .unwrap();

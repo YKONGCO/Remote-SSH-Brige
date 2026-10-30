@@ -17,6 +17,7 @@ pub struct AppState {
     pub audit: Mutex<Vec<Audit>>,
     pub terminals: Mutex<HashMap<String, Arc<TerminalHandle>>>,
     pub terminal_open_lock: Mutex<()>,
+    pub file_mutation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub mcp: Mutex<McpStatus>,
     pub cancel: Mutex<Option<CancellationToken>>,
     pub service_lock: tokio::sync::Mutex<()>,
@@ -38,6 +39,7 @@ impl AppState {
             audit: Mutex::new(audit),
             terminals: Mutex::new(HashMap::new()),
             terminal_open_lock: Mutex::new(()),
+            file_mutation_locks: Mutex::new(HashMap::new()),
             mcp: Mutex::new(McpStatus::default()),
             cancel: Mutex::new(None),
             service_lock: tokio::sync::Mutex::new(()),
@@ -259,6 +261,23 @@ pub async fn execute(state: Arc<AppState>, op: Operation, source: &'static str) 
     .await;
     tokio::task::spawn_blocking(move || {
         let result = approval.and_then(|approved| {
+            // Serialize directory moves and child writes as well as edits, across MCP and desktop.
+            // Approval waits happen before acquiring the lock. A blocking SFTP call retains it
+            // until settled even if its async caller disconnects.
+            let file_lock = if crate::file_tools::mutates(&op.kind) {
+                Some(
+                    state
+                        .file_mutation_locks
+                        .lock()
+                        .unwrap()
+                        .entry(op.server_id.clone())
+                        .or_default()
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            let _guard = file_lock.as_ref().map(|lock| lock.lock().unwrap());
             let live = state.server(&op.server_id)?;
             if approved && serde_json::to_value(&live)? != serde_json::to_value(&server)? {
                 bail!("服务器配置已变更，审批失效，请重新发起操作")
@@ -299,7 +318,55 @@ fn validate_operation(
         bail!("服务器已停用")
     }
     if source == "mcp" && !server.permits_mcp(&op.kind) {
-        bail!("此服务器未授权 MCP 操作：{}", op.kind)
+        return Err(crate::file_tools::error(
+            "PERMISSION_DENIED",
+            "此服务器未授权 MCP 操作",
+        ));
+    }
+    if source == "mcp" {
+        anyhow::ensure!(
+            !op.server_id.is_empty() && op.server_id.len() <= 128,
+            "INVALID_ARGUMENT: server_id is required"
+        );
+        if matches!(
+            op.kind.as_str(),
+            "read_file"
+                | "write_file"
+                | "edit_file"
+                | "list_files"
+                | "preview_file"
+                | "download"
+                | "upload"
+                | "remove"
+                | "rename"
+                | "mkdir"
+        ) {
+            anyhow::ensure!(!op.path.is_empty(), "INVALID_ARGUMENT: path is required");
+        }
+        if op.kind == "rename" {
+            anyhow::ensure!(
+                !op.target.is_empty(),
+                "INVALID_ARGUMENT: target is required"
+            );
+        }
+        if op.kind == "exec" {
+            anyhow::ensure!(
+                !op.command.trim().is_empty() && op.timeout_secs <= 300,
+                "INVALID_ARGUMENT: command is required; timeout_secs must be 0-300"
+            );
+        }
+        if matches!(op.kind.as_str(), "terminal_open" | "terminal_resize") {
+            anyhow::ensure!(
+                (20..=500).contains(&op.cols) && (5..=200).contains(&op.rows),
+                "INVALID_ARGUMENT: cols must be 20-500; rows must be 5-200"
+            );
+        }
+        if op.kind.starts_with("terminal_") && op.kind != "terminal_open" {
+            anyhow::ensure!(
+                !op.session_id.is_empty(),
+                "INVALID_ARGUMENT: session_id is required"
+            );
+        }
     }
     anyhow::ensure!(
         op.path.len() <= 8192
@@ -349,6 +416,9 @@ fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
         }
         Ok(value) if op.kind == "read_file" => {
             json!({"bytes": value["content"].as_str().unwrap_or("").len(), "message":"读取完成，文件正文不写入操作记录"})
+        }
+        Ok(value) if op.kind == "edit_file" => {
+            json!({"path":op.path,"applied_edits":value["applied_edits"],"written_bytes":value["written_bytes"],"diff_truncated":value["diff_truncated"],"message":"编辑完成，正文及 diff 不写入操作记录"})
         }
         Ok(value) if op.kind == "download" => {
             use base64::Engine;

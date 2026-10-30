@@ -172,7 +172,7 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
         for operation in MCP_OPERATIONS {
             assert_eq!(
                 server.permits_mcp(operation),
-                operation == granted,
+                operation == granted && *granted != "edit_file",
                 "{granted}: {operation}"
             );
         }
@@ -194,7 +194,19 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
         allow_terminal: true,
         ..legacy
     };
-    assert_eq!(legacy.effective_mcp_permissions(), MCP_OPERATIONS);
+    assert_eq!(
+        legacy.effective_mcp_permissions(),
+        MCP_OPERATIONS
+            .iter()
+            .copied()
+            .filter(|op| *op != "edit_file")
+            .collect::<Vec<_>>()
+    );
+    let editor = Server {
+        mcp_permissions: Some(vec!["read_file".into(), "edit_file".into()]),
+        ..legacy.clone()
+    };
+    assert!(editor.permits_mcp("edit_file"));
     let empty = Server {
         mcp_permissions: Some(vec![]),
         ..legacy
@@ -324,6 +336,37 @@ async fn request(queue: &ApprovalQueue) -> security::ApprovalView {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn edit_approval_previews_and_hashes_all_replacements_and_cancels_cleanly() {
+    use remote_desk_lib::model::{FileEdit, FileRequest};
+    use sha2::{Digest, Sha256};
+    let queue = std::sync::Arc::new(ApprovalQueue::default());
+    let op = Operation {
+        kind: "edit_file".into(),
+        path: "/workspace/config".into(),
+        file_request: Some(FileRequest::Edit {
+            edits: vec![FileEdit {
+                old_text: "private old".into(),
+                new_text: "private new".into(),
+            }],
+        }),
+        ..Default::default()
+    };
+    let payload = serde_json::to_string(&op.file_request).unwrap();
+    let worker = queue.clone();
+    let task = tokio::spawn(async move { worker.wait(&Server::default(), &op, "mcp").await });
+    let view = request(&queue).await;
+    assert_eq!(view.content_preview, payload);
+    assert_eq!(view.content_bytes, payload.len());
+    assert_eq!(
+        view.content_sha256,
+        format!("{:x}", Sha256::digest(payload.as_bytes()))
+    );
+    task.abort();
+    let _ = task.await;
+    assert!(queue.list().is_empty());
 }
 
 #[tokio::test]

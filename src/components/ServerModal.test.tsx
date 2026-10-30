@@ -28,6 +28,23 @@ const initial = {
   auth: "agent" as const,
 };
 
+test("editing requires read permission and revoking read removes edit permission", async () => {
+  const user = userEvent.setup();
+  const save = vi.fn().mockResolvedValue(undefined);
+  render(<ServerModal initial={initial} onClose={vi.fn()} onSave={save} />);
+  const read = screen.getByRole("checkbox", { name: "读取文本" });
+  const edit = screen.getByRole("checkbox", { name: "精确编辑（需读取权限）" });
+  expect(edit.getAttribute("aria-checked")).toBe("false");
+  await user.click(edit);
+  expect(edit.getAttribute("aria-checked")).toBe("true");
+  await user.click(read);
+  expect(edit.getAttribute("aria-checked")).toBe("false");
+  expect((edit as HTMLButtonElement).disabled).toBe(true);
+  await user.click(screen.getByRole("button", { name: "保存服务器" }));
+  await waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(save.mock.calls[0][0].mcp_permissions).not.toContain("edit_file");
+});
+
 test("file upload and terminal output can be granted independently", async () => {
   const user = userEvent.setup();
   const save = vi.fn().mockResolvedValue(undefined);

@@ -1,7 +1,9 @@
 pub mod clients;
 mod command_policy;
 pub mod database;
+pub mod file_tools;
 pub mod mcp;
+mod mcp_args;
 pub mod model;
 pub mod security;
 pub mod ssh;

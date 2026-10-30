@@ -22,3 +22,11 @@ MCP 页面提供 Claude Code、Codex、Gemini CLI、OpenCode、Cursor、Pi 的�
 配置格式依据：[Claude Code MCP](https://code.claude.com/docs/en/mcp)、[Codex MCP](https://developers.openai.com/codex/mcp)、[Gemini CLI MCP](https://geminicli.com/docs/tools/mcp-server/)、[OpenCode MCP](https://opencode.ai/docs/mcp-servers/)、[Cursor MCP](https://cursor.com/docs/context/mcp)、[Pi MCP](https://pi.dev/docs/latest/mcp)。
 
 视觉参考 [Windows 设计指南](https://learn.microsoft.com/zh-cn/windows/apps/design/guidelines-overview)，统一中性背景、少量强调色、4px 控件圆角与 8px 容器/弹层圆角。客户端图标来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，MIT 许可保存在 `src/assets/clients/LICENSE`。
+
+## 0.2.0 工具接口升级
+
+升级后重新连接 MCP 以刷新工具 Schema。新增 `edit_file`，需要在服务器权限里明确授予精确编辑和读取文本；旧配置保持原授权。
+
+`read_file` 的第一个文本块现在是原始文本和可选的续读提示，不再是含 content 的 JSON 全文。元数据位于 `structuredContent`：根据 `has_more` 和 `next_offset` 续读。需要完整字节内容时使用 `download`。`list_files` 默认返回最多 200 项，根据 `next_offset` 继续。
+
+各工具拒绝无关参数，请仅发送对应 Schema 中的字段。`write_file` 的 `content` 必填，空字符串可写空文件；`mode` 默认 overwrite，可指定 create 防止覆盖。父目录必须存在。

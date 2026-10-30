@@ -12,7 +12,14 @@ use tokio::sync::oneshot;
 pub fn sensitive(op: &Operation, source: &str) -> bool {
     matches!(
         op.kind.as_str(),
-        "write_file" | "upload" | "mkdir" | "remove" | "rename" | "exec" | "terminal_open"
+        "write_file"
+            | "edit_file"
+            | "upload"
+            | "mkdir"
+            | "remove"
+            | "rename"
+            | "exec"
+            | "terminal_open"
     ) || (source == "mcp" && op.kind == "terminal_write")
 }
 
@@ -172,12 +179,19 @@ impl ApprovalQueue {
         let (tx, rx) = oneshot::channel();
         let review = if op.kind == "write_file" {
             std::borrow::Cow::Borrowed(op.content.as_str())
+        } else if op.kind == "edit_file" {
+            std::borrow::Cow::Owned(serde_json::to_string(&op.file_request)?)
         } else if op.kind == "terminal_write" {
             std::borrow::Cow::Owned(serde_json::to_string(&op.content)?)
         } else {
             std::borrow::Cow::Borrowed("")
         };
         let preview: String = review.chars().take(8192).collect();
+        let content_bytes = if op.kind == "edit_file" {
+            review.len()
+        } else {
+            op.content.len()
+        };
         let view = ApprovalView {
             id: id.clone(),
             server_id: server.id.clone(),
@@ -191,8 +205,15 @@ impl ApprovalQueue {
             command: op.command.clone(),
             content_truncated: preview.len() < review.len(),
             content_preview: preview,
-            content_bytes: op.content.len(),
-            content_sha256: format!("{:x}", Sha256::digest(op.content.as_bytes())),
+            content_bytes,
+            content_sha256: format!(
+                "{:x}",
+                Sha256::digest(if op.kind == "edit_file" {
+                    review.as_bytes()
+                } else {
+                    op.content.as_bytes()
+                })
+            ),
             created_at: chrono::Utc::now().to_rfc3339(),
             expires_at: (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc3339(),
         };
@@ -201,11 +222,10 @@ impl ApprovalQueue {
             Self::prune(&mut pending);
             anyhow::ensure!(pending.len() < 16, "待审批队列已满，请稍后重试");
             let budget = (96 * 1024 * 1024)
-                .max(op.content.len())
+                .max(content_bytes)
                 .max(pending.values().map(|p| p.budget_bytes).max().unwrap_or(0));
             anyhow::ensure!(
-                pending.values().map(|p| p.budget_bytes).sum::<usize>() + op.content.len()
-                    <= budget,
+                pending.values().map(|p| p.budget_bytes).sum::<usize>() + content_bytes <= budget,
                 "待审批内容超过队列大小限制"
             );
             anyhow::ensure!(
@@ -218,7 +238,7 @@ impl ApprovalQueue {
                     view,
                     inserted: Instant::now(),
                     digest,
-                    budget_bytes: op.content.len(),
+                    budget_bytes: content_bytes,
                     decision: tx,
                 },
             );

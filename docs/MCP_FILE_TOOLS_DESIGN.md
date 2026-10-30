@@ -1,20 +1,20 @@
 # MCP 文件工具设计：参考 Pi Agent
 
-状态：接口设计，尚未修改运行时代码。日期：2026-10-31。
+状态：已落地到 0.2.0，含后端、权限 UI 与自动化测试。日期：2026-10-31。
 
 ## 1. 源码依据与取舍
 
-以 [earendil-works/pi](https://github.com/earendil-works/pi) 的 main 分支为依据，核对日期为 2026-10-31；这些链接随分支更新，不代表固定版本。实施移植前应记录实际参考的 commit SHA。本文不以教程为依据。
+以 [earendil-works/pi](https://github.com/earendil-works/pi) 源码为依据，核对日期为 2026-10-31；本次实现记录的上游版本为 [2a46c4208004c4c5a41b75d775710f774ad9b630](https://github.com/earendil-works/pi/tree/2a46c4208004c4c5a41b75d775710f774ad9b630/packages/coding-agent/src/core/tools)。下表 main 链接便于跟踪后续变更。本文不以教程为依据。
 
-| 源码 | 实际行为 | 本项目设计 |
-| --- | --- | --- |
-| [read.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/read.ts) | path、offset?、limit?；行号从 1 开始；原始文本附续读提示；支持图片 | 保留文本与分页语义；图片暂由 preview_file 处理 |
-| [truncate.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/truncate.ts) | 默认最多 2000 行、50 KiB；从头截断保留完整行 | 沿用输出预算，长行不返回假完整内容 |
-| [edit.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/edit.ts) | edits[]；去 BOM、归一化换行、写回恢复；生成 diff/patch | 沿用批量替换及文本处理；字段使用项目的 snake_case |
-| [edit-diff.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/edit-diff.ts) | 精确匹配优先、有限模糊匹配回退；拒绝歧义、重叠和无变化 | 沿用匹配策略，增加明确错误码和输出预算 |
-| [write.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/write.ts) | path、content；创建或覆盖，自动创建父目录 | 默认创建/覆盖；额外提供 create 模式；建目录继续独立授权 |
-| [file-mutation-queue.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/file-mutation-queue.ts) | 模块级队列按文件路径串行；已有文件使用 realpath 作为 key | 使用共享队列；第一版按服务器串行以覆盖目录移动冲突 |
-| [ls.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/ls.ts) | path?、limit?；默认 500 项；按名称排序，含隐藏文件，目录加 / | 保留本项目条目元数据与目录优先排序；增加分页 |
+| 源码                                                                                                                                 | 实际行为                                                           | 本项目设计                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ | ------------------------------------------------------- |
+| [read.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/read.ts)                               | path、offset?、limit?；行号从 1 开始；原始文本附续读提示；支持图片 | 保留文本与分页语义；图片暂由 preview_file 处理          |
+| [truncate.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/truncate.ts)                       | 默认最多 2000 行、50 KiB；从头截断保留完整行                       | 沿用输出预算，长行不返回假完整内容                      |
+| [edit.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/edit.ts)                               | edits[]；去 BOM、归一化换行、写回恢复；生成 diff/patch             | 沿用批量替换及文本处理；字段使用项目的 snake_case       |
+| [edit-diff.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/edit-diff.ts)                     | 精确匹配优先、有限模糊匹配回退；拒绝歧义、重叠和无变化             | 沿用匹配策略，增加明确错误码和输出预算                  |
+| [write.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/write.ts)                             | path、content；创建或覆盖，自动创建父目录                          | 默认创建/覆盖；额外提供 create 模式；建目录继续独立授权 |
+| [file-mutation-queue.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/file-mutation-queue.ts) | 模块级队列按文件路径串行；已有文件使用 realpath 作为 key           | 使用共享队列；第一版按服务器串行以覆盖目录移动冲突      |
+| [ls.ts](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/ls.ts)                                   | path?、limit?；默认 500 项；按名称排序，含隐藏文件，目录加 /       | 保留本项目条目元数据与目录优先排序；增加分页            |
 
 独立 Schema、Operations 适配和读/写/编辑职责划分取自源码。create 模式、目录分页、SFTP 流式扫描、独立删除、严格参数校验、权限、审批和原子提交属于本项目设计，不应描述成 Pi 自带行为。Pi 的默认 write Operations 调用本地 writeFile，不能据此推断其拥有本项目要求的 SFTP 原子提交保证。
 
@@ -36,18 +36,18 @@ Pi 本身没有独立删除工具；本项目的 remove 和 rename 是远程文�
 
 每个工具使用自己的参数结构。下面未标记 ? 的字段全部必填，? 表示可省略。所有对象拒绝未定义字段；必填字符串不得缺失，标识、路径和匹配文本不得为空。content 和 new_text 允许为空字符串。
 
-| 工具 | 参数 | 职责 |
-| --- | --- | --- |
-| list_files | server_id, path, offset?, limit? | 分页浏览目录 |
-| read_file | server_id, path, offset?, limit? | 分段读取 UTF-8 文本 |
-| write_file | server_id, path, content, mode? | 创建或完整覆盖文本 |
-| edit_file | server_id, path, edits | 唯一文本匹配，批量差量修改 |
-| remove | server_id, path | 删除文件、符号链接或空目录 |
-| mkdir | server_id, path | 创建单级目录，父目录必须存在 |
-| rename | server_id, path, target | 重命名/移动，不覆盖目标 |
-| preview_file | server_id, path | 保留现有文本/图片预览 |
-| download | server_id, path | 保留 Base64 完整下载 |
-| upload | server_id, path, content | 保留 Base64 完整上传 |
+| 工具         | 参数                             | 职责                         |
+| ------------ | -------------------------------- | ---------------------------- |
+| list_files   | server_id, path, offset?, limit? | 分页浏览目录                 |
+| read_file    | server_id, path, offset?, limit? | 分段读取 UTF-8 文本          |
+| write_file   | server_id, path, content, mode?  | 创建或完整覆盖文本           |
+| edit_file    | server_id, path, edits           | 唯一文本匹配，批量差量修改   |
+| remove       | server_id, path                  | 删除文件、符号链接或空目录   |
+| mkdir        | server_id, path                  | 创建单级目录，父目录必须存在 |
+| rename       | server_id, path, target          | 重命名/移动，不覆盖目标      |
+| preview_file | server_id, path                  | 保留现有文本/图片预览        |
+| download     | server_id, path                  | 保留 Base64 完整下载         |
+| upload       | server_id, path, content         | 保留 Base64 完整上传         |
 
 其余工具也拆分 Schema：exec 只接收 server_id、command、timeout_secs?；终端工具仅接收各自需要的会话、游标、尺寸或输入字段。list_servers 和 list_terminals 继续无参数。
 
@@ -115,8 +115,8 @@ MCP content 提供原始文本和明确续读提示；structuredContent 仅提�
 - content 是必填 UTF-8 字符串，空串表示创建/覆盖为空文件。
 - 父目录必须存在；缺少时返回 PARENT_NOT_FOUND，Agent 先按已有 mkdir 权限逐级创建。
 - 使用现有 upload_limit 约束 UTF-8 字节数；同目录临时文件、关闭写入后原子重命名，保留现有权限位。服务端不支持所需原子操作时失败，不降级为先清空目标再写入。
-- create 提交时需要服务端明确支持的原子“不覆盖”语义；不支持时返回 ATOMIC_CREATE_UNSUPPORTED，不能把 flags=0 的行为直接视为跨服务端保证。
-- 返回 path、created、written_bytes。created 表示本次实际创建，不根据最终 stat 猜测。
+- create 提交使用 hardlink@openssh.com 将完整临时文件链接到尚不存在的目标，再清理临时名称；不支持时返回 ATOMIC_CREATE_UNSUPPORTED，不能把 flags=0 的行为直接视为跨服务端保证。overwrite 使用 posix-rename@openssh.com，不支持则返回 ATOMIC_WRITE_UNSUPPORTED。通过独立 SFTP 子系统通道发送扩展请求，不回退到通用重命名或 shell。
+- 返回 path、created、written_bytes，并保留桌面已有 written 字段。create 成功必定为创建；overwrite 的 created 基于提交前 stat，在应用队列内准确，但无法判断外部进程在检查与提交之间的创建/删除。
 
 ## 6. edit_file：精确、批量、一次提交
 
@@ -208,4 +208,4 @@ write_file、edit_file、upload、remove、rename、mkdir 共用应用级修改�
 
 必要验证：Schema 不暴露无关字段；缺失路径/命令直接失败；中文和 UTF-8 字节边界；CRLF/BOM/末尾空行；空文件；越界 offset；超长单行；大目录和输出上限；编辑零匹配/重复/重叠/批量失败不落盘；精确优先、模糊回退、归一化歧义、归一化后空匹配、未变化行保持、无变化拒绝；create 竞争；同应用并发编辑；目录移动与子文件写入；越界与符号链接；只读、删除保护、撤销权限、审批后变更；日志中无正文/diff；取消、重命名失败时旧文件完整；提交状态未知不自动重试。
 
-现有 scripts/integration.mjs 使用内存 SSH/SFTP 服务，且断言工具数量为 17、read_file 返回 JSON 全文，必须调整。这些测试不能证明真实 OpenSSH 服务端的原子/no-replace 语义，还需针对目标服务端做专项验证。
+scripts/integration.mjs 已更新为发现 18 个工具并读取原始文本/structuredContent，覆盖原子写入、仅创建竞争、扩展不支持、提交响应丢失、并发编辑和日志脱敏。这些测试使用内存 SSH/SFTP 服务，不能替代针对真实目标 OpenSSH 服务端的验证。

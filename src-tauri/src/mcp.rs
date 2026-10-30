@@ -1,3 +1,4 @@
+use crate::mcp_args::*;
 use crate::{
     model::*,
     state::{execute, AppState},
@@ -22,60 +23,10 @@ use rmcp::{
     },
     ServerHandler,
 };
-use serde::Deserialize;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RemoteArgs {
-    /// Configured server ID returned by list_servers.
-    pub server_id: String,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub target: String,
-    #[serde(default)]
-    pub content: String,
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub session_id: String,
-    #[serde(default)]
-    pub cursor: u64,
-    #[serde(default = "default_cols")]
-    pub cols: u32,
-    #[serde(default = "default_rows")]
-    pub rows: u32,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-}
-fn default_cols() -> u32 {
-    100
-}
-fn default_rows() -> u32 {
-    30
-}
-fn default_timeout() -> u64 {
-    0
-}
-impl RemoteArgs {
-    fn op(self, kind: &str) -> Operation {
-        Operation {
-            kind: kind.into(),
-            server_id: self.server_id,
-            path: self.path,
-            target: self.target,
-            content: self.content,
-            command: self.command,
-            session_id: self.session_id,
-            cursor: self.cursor,
-            cols: self.cols,
-            rows: self.rows,
-            timeout_secs: self.timeout_secs,
-        }
-    }
-}
 #[derive(Clone)]
 pub struct RemoteMcp {
     state: Arc<AppState>,
@@ -89,16 +40,47 @@ impl RemoteMcp {
             tool_router: Self::tool_router(),
         }
     }
-    async fn call(&self, kind: &str, args: RemoteArgs) -> CallToolResult {
-        match execute(self.state.clone(), args.op(kind), "mcp").await {
+    async fn call(&self, kind: &str, args: impl Into<Operation>) -> CallToolResult {
+        let mut op = args.into();
+        op.kind = kind.into();
+        match execute(self.state.clone(), op, "mcp").await {
+            Ok(mut v) if kind == "read_file" => {
+                let mut text = v["content"].as_str().unwrap_or("").to_string();
+                if let Some(object) = v.as_object_mut() {
+                    object.remove("content");
+                }
+                if v["first_line_exceeds_limit"] == true {
+                    text.push_str(
+                        "[Starting line exceeds 50 KiB. Use download to inspect this file.]",
+                    );
+                } else if v["has_more"] == true {
+                    text.push_str(&format!(
+                        "\n\n[More content. Use offset={} to continue.{}]",
+                        v["next_offset"],
+                        if v["truncated_by"] == "scan_bytes" {
+                            " Download scan budget reached; further reads may require download."
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                result.structured_content = Some(v);
+                result
+            }
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
-            Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
+            Err(e) => {
+                let code = crate::file_tools::error_code(&e);
+                CallToolResult::error(vec![ContentBlock::text(
+                    serde_json::json!({"code":code,"message":format!("{e:#}")}).to_string(),
+                )])
+            }
         }
     }
     #[tool(
         description = "List enabled SSH servers with IDs, file root and MCP permissions. Credentials are never exposed."
     )]
-    async fn list_servers(&self) -> CallToolResult {
+    async fn list_servers(&self, Parameters(_a): Parameters<EmptyArgs>) -> CallToolResult {
         let policy = self.state.settings.lock().unwrap().clone();
         let servers: Vec<_> = self.state.config.lock().unwrap().servers.iter().filter(|s| s.enabled && s.mcp_enabled).map(|s| serde_json::json!({"id":s.id,"name":s.name,"host":s.host,"root":s.root,"allow_exec":s.permits_mcp("exec"),"allow_write":s.permits_mcp("write_file"),"allow_terminal":s.permits_mcp("terminal_open"),"mcp_permissions":s.effective_mcp_permissions(),
             "security":{"deletion_protection":policy.deletion_protection,"command_protection":policy.block_dangerous_commands,"command_policy":policy.effective_command_policy(),"read_only":policy.remote_read_only,"approval_mode":policy.approval_mode}})).collect();
@@ -109,97 +91,103 @@ impl RemoteMcp {
     #[tool(
         description = "Execute a command with exec permission. Check list_servers security.command_policy for independent diagnostic-only, pipe, redirection, compound, script and substitution permissions. Known dangerous shell commands are blocked when command_protection is enabled. External scripts and interpreter code cannot be fully inspected. Approval, when enabled, waits up to 120 seconds for the desktop user. File root is not a shell sandbox."
     )]
-    async fn exec(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
         self.call("exec", a).await
     }
     #[tool(
-        description = "List files at an absolute remote path within the configured root. Requires list_files permission."
+        description = "List files within root. Paginate by 0-indexed entry offset (default 0), limit (default 200, max 1000), and 50 KiB output budget. Includes hidden entries. Requires list_files permission."
     )]
-    async fn list_files(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn list_files(&self, Parameters(a): Parameters<ListArgs>) -> CallToolResult {
         self.call("list_files", a).await
     }
     #[tool(
-        description = "Read a UTF-8 text file at path. Requires read_file permission. Size is capped by the custom download limit (default 128 MiB, up to 256 MiB)."
+        description = "Read UTF-8 text with 1-indexed offset and optional limit. Returns original text capped at 2000 lines or 50 KiB, with continuation metadata. Continue with next_offset. Requires read_file permission. Use preview_file for images and download for complete bytes."
     )]
-    async fn read_file(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn read_file(&self, Parameters(a): Parameters<ReadArgs>) -> CallToolResult {
         self.call("read_file", a).await
     }
     #[tool(
         description = "Preview a remote file within the configured root, up to 2 MiB or the download limit. Requires preview_file permission. Returns UTF-8 text, raster image base64, or unsupported metadata. Large text is truncated with an explicit flag. Does not execute HTML or SVG."
     )]
-    async fn preview_file(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn preview_file(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         self.call("preview_file", a).await
     }
     #[tool(
-        description = "Atomically replace or create UTF-8 file at path with content. Requires write_file permission."
+        description = "Create or completely overwrite UTF-8 text. mode defaults to overwrite; create refuses existing targets. Parent must exist. Use edit_file for targeted changes. Requires write_file permission."
     )]
-    async fn write_file(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn write_file(&self, Parameters(a): Parameters<WriteArgs>) -> CallToolResult {
         self.call("write_file", a).await
+    }
+    #[tool(
+        description = "Edit UTF-8 text with edits[].old_text/new_text. Each old_text must uniquely match the same original file; edits must not overlap. Exact matching first, then limited whitespace/Unicode normalization. All changes commit together. Requires edit_file and read_file permissions. Returns bounded diff. Never include read continuation notices in old_text."
+    )]
+    async fn edit_file(&self, Parameters(a): Parameters<EditArgs>) -> CallToolResult {
+        self.call("edit_file", a).await
     }
     #[tool(
         description = "Create a directory at path. Requires mkdir permission. Parent must exist."
     )]
-    async fn mkdir(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn mkdir(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         self.call("mkdir", a).await
     }
     #[tool(
         description = "Delete a file or EMPTY directory at path. Requires remove permission. Does not recursively delete."
     )]
-    async fn remove(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn remove(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         self.call("remove", a).await
     }
     #[tool(
         description = "Rename path to target within the allowed root, without overwriting. Requires rename permission."
     )]
-    async fn rename(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn rename(&self, Parameters(a): Parameters<RenameArgs>) -> CallToolResult {
         self.call("rename", a).await
     }
     #[tool(
         description = "Download file at path as base64. Requires download permission. Size is capped by the custom download limit (default 128 MiB, up to 256 MiB)."
     )]
-    async fn download(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn download(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         self.call("download", a).await
     }
     #[tool(
         description = "Upload base64-encoded content to path. Size is capped by the custom upload limit (default 128 MiB, up to 256 MiB), requires upload permission."
     )]
-    async fn upload(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn upload(&self, Parameters(a): Parameters<ContentArgs>) -> CallToolResult {
         self.call("upload", a).await
     }
     #[tool(
         description = "Open a persistent SSH PTY shell (cols, rows). Returns session_id. Requires terminal_open permission. Session lasts until closed, disconnected or this app exits."
     )]
-    async fn terminal_open(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn terminal_open(&self, Parameters(a): Parameters<OpenArgs>) -> CallToolResult {
         self.call("terminal_open", a).await
     }
     #[tool(
         description = "Read persistent terminal output by session_id and byte cursor (initially 0). Returns base64 bytes and next cursor. Requires terminal_read permission."
     )]
-    async fn terminal_read(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn terminal_read(&self, Parameters(a): Parameters<TerminalReadArgs>) -> CallToolResult {
         self.call("terminal_read", a).await
     }
     #[tool(
         description = "Write content to persistent terminal session_id. Include newline to execute a command. Requires terminal_write permission."
     )]
-    async fn terminal_write(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn terminal_write(&self, Parameters(a): Parameters<TerminalWriteArgs>) -> CallToolResult {
         self.call("terminal_write", a).await
     }
     #[tool(
         description = "Resize a persistent terminal session_id using cols and rows. Requires terminal_resize permission."
     )]
-    async fn terminal_resize(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn terminal_resize(&self, Parameters(a): Parameters<ResizeArgs>) -> CallToolResult {
         self.call("terminal_resize", a).await
     }
     #[tool(
         description = "Close and remove persistent terminal session_id. Requires terminal_close permission."
     )]
-    async fn terminal_close(&self, Parameters(a): Parameters<RemoteArgs>) -> CallToolResult {
+    async fn terminal_close(&self, Parameters(a): Parameters<SessionArgs>) -> CallToolResult {
         self.call("terminal_close", a).await
     }
     #[tool(
         description = "List persistent sessions on MCP-enabled servers with list_terminals permission."
     )]
-    async fn list_terminals(&self) -> CallToolResult {
+    async fn list_terminals(&self, Parameters(_a): Parameters<EmptyArgs>) -> CallToolResult {
         let allowed: Vec<_> = self
             .state
             .config
@@ -227,7 +215,9 @@ impl RemoteMcp {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RemoteMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions("SSH MCP Bridge gives AI agents permission-controlled remote server access over MCP and SSH. Call list_servers first. Each server's mcp_permissions lists the allowed tool names; all other operations are denied. Legacy allow_* fields are summaries only. Global security settings may further restrict granted operations. File roots apply only to SFTP, not exec or terminal. Persistent sessions share state with the desktop UI.")
+        let mut info = Implementation::from_build_env();
+        info.version = env!("CARGO_PKG_VERSION").into();
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(info).with_instructions("SSH MCP Bridge gives AI agents permission-controlled remote server access over MCP and SSH. Call list_servers first. Each server's mcp_permissions lists the allowed tool names; all other operations are denied. Legacy allow_* fields are summaries only. Global security settings may further restrict granted operations. Use read_file for bounded text reads and edit_file for targeted edits. Continue reads using structuredContent.next_offset. File roots apply only to SFTP, not exec or terminal. Persistent sessions share state with the desktop UI.")
     }
 }
 async fn authorize(

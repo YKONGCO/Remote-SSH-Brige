@@ -128,6 +128,7 @@ export const labels: Record<string, string> = {
   list_files: "浏览目录",
   read_file: "读取文件",
   write_file: "写入文件",
+  edit_file: "精确编辑文件",
   mkdir: "创建目录",
   remove: "删除文件",
   rename: "重命名",

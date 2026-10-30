@@ -14,6 +14,7 @@ export const permissionGroups = [
     title: "文件修改",
     operations: [
       ["write_file", "写入文本"],
+      ["edit_file", "精确编辑（需读取权限）"],
       ["upload", "上传文件"],
       ["mkdir", "创建目录"],
       ["rename", "重命名 / 移动"],
@@ -46,7 +47,9 @@ export function selectedMcpPermissions(server: Server): string[] {
     (index === 1 && server.allow_write) ||
     (index === 2 && server.allow_exec) ||
     (index === 3 && server.allow_terminal)
-      ? group.operations.map(([kind]) => kind)
+      ? group.operations
+          .filter(([kind]) => kind !== "edit_file")
+          .map(([kind]) => kind)
       : [],
   );
 }
@@ -55,6 +58,8 @@ export function withMcpPermissions(
   server: Server,
   permissions: string[],
 ): Server {
+  if (!permissions.includes("read_file"))
+    permissions = permissions.filter((kind) => kind !== "edit_file");
   return {
     ...server,
     mcp_permissions: permissions,

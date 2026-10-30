@@ -79,24 +79,40 @@ npm.cmd run dev
 
 ## MCP 工具
 
-| 工具                   | 作用 / 主要参数                                                             |
-| ---------------------- | --------------------------------------------------------------------------- |
-| list_servers           | 启用的服务器、ID、文件根目录和权限，不返回凭据                              |
-| exec                   | server_id、command、timeout_secs；返回 stdout、stderr、exit_code、truncated |
-| list_files             | server_id、path；列出目录                                                   |
-| read_file / write_file | server_id、path；写入时传 UTF-8 content                                     |
-| preview_file           | server_id、path；返回只读文本或图片预览，最大 2 MiB 且受下载上限约束        |
-| mkdir / remove         | server_id、path；remove 只删除文件或空目录                                  |
-| rename                 | server_id、path、target；不覆盖已有目标                                     |
-| upload / download      | server_id、path；传输 base64 content / 返回 base64                          |
-| list_terminals         | 列出 MCP 可访问的终端会话                                                   |
-| terminal_open          | server_id、cols、rows；返回 session_id                                      |
-| terminal_read          | server_id、session_id、cursor；返回 base64、下一 cursor、alive、truncated   |
-| terminal_write         | server_id、session_id、content；执行命令需要包含换行                        |
-| terminal_resize        | server_id、session_id、cols、rows                                           |
-| terminal_close         | server_id、session_id                                                       |
+| 工具              | 作用 / 主要参数                                                                    |
+| ----------------- | ---------------------------------------------------------------------------------- |
+| list_servers      | 启用的服务器、ID、文件根目录和权限，不返回凭据                                     |
+| exec              | server_id、command、timeout_secs；返回 stdout、stderr、exit_code、truncated        |
+| list_files        | server_id、path、offset?（从 0 开始）、limit?（默认 200，最多 1000）；目录分页     |
+| read_file         | server_id、path、offset?（从 1 开始）、limit?（默认及最多 2000）；最多 50 KiB 文本 |
+| write_file        | server_id、path、content、mode?；默认 overwrite，create 仅创建，父目录须存在       |
+| edit_file         | server_id、path、edits[{old_text,new_text}]；匹配原文，批量提交，返回有界 diff     |
+| preview_file      | server_id、path；返回只读文本或图片预览，最大 2 MiB 且受下载上限约束               |
+| mkdir / remove    | server_id、path；remove 只删除文件或空目录                                         |
+| rename            | server_id、path、target；不覆盖已有目标                                            |
+| upload / download | server_id、path；传输 base64 content / 返回 base64                                 |
+| list_terminals    | 列出 MCP 可访问的终端会话                                                          |
+| terminal_open     | server_id、cols、rows；返回 session_id                                             |
+| terminal_read     | server_id、session_id、cursor；返回 base64、下一 cursor、alive、truncated          |
+| terminal_write    | server_id、session_id、content；执行命令需要包含换行                               |
+| terminal_resize   | server_id、session_id、cols、rows                                                  |
+| terminal_close    | server_id、session_id                                                              |
 
-共 17 个工具。先 list_servers 获取 ID、权限与安全策略，再调用相应工具。文件路径使用远端 POSIX 绝对路径。
+共 18 个工具，每个工具使用独立参数 Schema，拒绝无关字段。先 list_servers 获取 ID、权限与安全策略，再调用相应工具。文件路径使用远端 POSIX 绝对路径。
+
+0.2.0 的 `read_file` 返回原始文本及续读提示，`structuredContent` 返回 `has_more`、`next_offset`、行号范围等元数据；客户端不能再把文本块作为旧版 JSON 全文解析。行数或字节限制先达到者生效，续读传 `next_offset`。超长单行不返回部分行，提示使用 `download`。完整字节传输继续使用 `download`，桌面编辑器仍读取完整原文。升级后需重新连接并发现工具。
+
+`edit_file` 同时需要 `read_file` 和 `edit_file` 权限，旧配置不会自动获得编辑权限。每项 `old_text` 必须在同一份原文中唯一匹配，各项不得重叠；任一项失败均不提交。先精确匹配，失败后进行有限的 Unicode/空白归一化匹配；写回保留 BOM 和检测到的换行样式，混合换行可能统一。正文及 diff 不写入审计。
+
+```json
+{
+  "server_id": "服务器 ID",
+  "path": "/srv/app/config.json",
+  "edits": [{ "old_text": "\"port\": 8080", "new_text": "\"port\": 9090" }]
+}
+```
+
+写入、编辑和上传通过同目录临时文件提交：覆盖依赖 `posix-rename@openssh.com`，仅创建依赖 `hardlink@openssh.com`，服务端不支持则明确失败。提交期间断连返回 `COMMIT_STATUS_UNKNOWN`，应先读回核验再决定是否重试。同一服务器配置的桌面与 MCP 文件修改串行化；这不锁住远端其他进程。完整接口与边界见 [文件工具设计](docs/MCP_FILE_TOOLS_DESIGN.md)。
 
 ```text
 terminal_open(server_id="...", cols=100, rows=30) → session_id
@@ -114,7 +130,7 @@ terminal_read(server_id="...", session_id="...", cursor=0)
 - 审计历史持续保存在 SQLite；列表显示最近 500 条，详情按记录 ID 读取。旧版 10 MB JSONL 滚动归档机制已停用。
 - 新配置的上传与下载上限默认各为 128 MiB，可在设置中分别输入 1–256 MiB 的自定义整数，按回车或离开输入框保存。已有保存值保留不变；限制同时约束文本写入与读取，桌面和 MCP 共用后端校验。MCP 请求体限额随当前配置生效，无需重启服务。当前为整文件 Base64 传输，上限控制在 256 MiB；GB 级传输需要流式实现。文本必须为 UTF-8。文件保存使用同目录临时文件和原子重命名，服务端需支持此能力。保留原文件权限位，但不保证所有者、ACL、扩展属性或硬链接关系不变。
 - 文件根目录对 SFTP 生效，解析路径和符号链接。它不是操作系统级沙箱，无法阻止远端其他进程制造文件系统竞态。
-- 在服务器编辑窗口的「MCP 访问权限」中，可关闭整台服务器的 MCP 访问，或分别授权 16 项操作：浏览目录、读取文本、预览、下载、文本写入、上传、创建目录、重命名 / 移动、删除、命令执行，以及终端会话列表、创建、读取输出、输入、调整尺寸和关闭。关闭 MCP 访问后不再向 MCP 列出该服务器，已知 ID 也不能调用。桌面操作不受这些 MCP 授权限制。
+- 在服务器编辑窗口的「MCP 访问权限」中，可关闭整台服务器的 MCP 访问，或分别授权 17 项操作：浏览目录、读取文本、预览、下载、文本写入、精确编辑、上传、创建目录、重命名 / 移动、删除、命令执行，以及终端会话列表、创建、读取输出、输入、调整尺寸和关闭。关闭 MCP 访问后不再向 MCP 列出该服务器，已知 ID 也不能调用。桌面操作不受这些 MCP 授权限制。
 - 新增服务器默认仅授予四项文件读取权限。旧配置自动保留原三个开关对应的权限，编辑保存后使用细分授权；权限保存在 SQLite，保存后每次 MCP 操作重新校验，无需重启服务。`list_servers` 返回的 `mcp_permissions` 为当前允许的工具名；旧 `allow_*` 字段仅作兼容摘要。
 - **exec 和终端拥有 SSH 账户的完整 shell 权限，不受 SFTP 根目录限制。** 细分授权按工具入口生效，例如禁用下载不会阻止已授权的文本读取或命令读取文件；全局删除保护、危险命令拦截、只读与审批策略继续生效。
 - 「设置 → 命令与 Shell 权限」可独立控制诊断白名单、管道、重定向、组合命令、脚本、命令替换和 MCP 交互终端，不需要为了使用管道而关闭高危拦截。Shell 命令按语法树检查，已知高危命令在管道、组合命令及可解析的嵌套 Shell 中仍会被拒绝。外部脚本、任意解释器代码和交互终端输入无法完整静态检查，具体规则见 [安全控制](docs/SECURITY_CONTROLS.md)。
@@ -151,7 +167,9 @@ src-tauri/src/
   state.rs                 共享状态、配置、权限、审计
   ssh.rs                   SSH 指纹 / 认证、exec 与 SFTP
   terminal.rs              PTY 会话、输出缓冲与输入队列
-  mcp.rs                   17 个 MCP 工具、认证和服务生命周期
+  mcp.rs                   18 个 MCP 工具、认证和服务生命周期
+  mcp_args.rs              各工具独立输入 Schema，映射到类型化文件请求
+  file_tools.rs            有界分页读取、目录分页、批量文本编辑和 diff
   lib.rs                   桌面命令与应用入口
   bin/headless.rs          无窗口 MCP 调试入口
 src-tauri/tests/core.rs     后端核心测试

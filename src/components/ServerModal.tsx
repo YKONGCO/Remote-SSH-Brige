@@ -261,7 +261,12 @@ export function ServerModal({
                     <label key={kind}>
                       <Checkbox
                         checked={selectedPermissions.includes(kind)}
-                        disabled={!mcpEnabled || busy}
+                        disabled={
+                          !mcpEnabled ||
+                          busy ||
+                          (kind === "edit_file" &&
+                            !selectedPermissions.includes("read_file"))
+                        }
                         onCheckedChange={(checked) =>
                           setServer((current) => {
                             const permissions = selectedMcpPermissions(current);

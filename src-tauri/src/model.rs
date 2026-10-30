@@ -163,6 +163,7 @@ pub const MCP_OPERATIONS: &[&str] = &[
     "preview_file",
     "download",
     "write_file",
+    "edit_file",
     "upload",
     "mkdir",
     "rename",
@@ -181,7 +182,8 @@ impl Server {
             return false;
         }
         if let Some(permissions) = &self.mcp_permissions {
-            return permissions.iter().any(|permission| permission == kind);
+            return permissions.iter().any(|permission| permission == kind)
+                && (kind != "edit_file" || permissions.iter().any(|p| p == "read_file"));
         }
         match kind {
             "exec" => self.allow_exec,
@@ -238,6 +240,35 @@ pub struct Operation {
     pub cols: u32,
     pub rows: u32,
     pub timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_request: Option<FileRequest>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileRequest {
+    Read { offset: u64, limit: u64 },
+    List { offset: u64, limit: u64 },
+    Write { mode: WriteMode },
+    Edit { edits: Vec<FileEdit> },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, schemars::JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    Create,
+    #[default]
+    Overwrite,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileEdit {
+    /// Unique text from the original file. Never include read continuation notices.
+    #[schemars(length(min = 1))]
+    pub old_text: String,
+    /// Replacement text; empty deletes the matched block.
+    pub new_text: String,
 }
 #[derive(Clone, Serialize)]
 pub struct TerminalInfo {
