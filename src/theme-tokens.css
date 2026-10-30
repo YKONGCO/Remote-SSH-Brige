@@ -1,0 +1,171 @@
+/* CC Switch palette, pinned to 9941a6455ef9405cf9d3620057fddd283223a607.
+ * Source: https://github.com/farion1231/cc-switch/blob/9941a6455ef9405cf9d3620057fddd283223a607/src/index.css
+ * MIT: Copyright (c) 2025 Jason Young. See docs/licenses/CC_SWITCH_LICENSE.txt.
+ * Base palette follows upstream; action colors use the requested deep blue.
+ */
+@layer fluent {
+  :root {
+    --bg-app: #ffffff;
+    --bg-sidebar: #f5f5f7;
+    --bg-subtle: #efeff2;
+    --bg-selected: #e4e4ea;
+    --bg-card: #ffffff;
+    --border-strong: #cfcfd6;
+    --text-1: #18181b;
+    --text-2: #52525b;
+    --text-3: #65656e;
+    --action-bg: #3b70b6;
+    --action-fg: #ffffff;
+    --action-hover: #3264a6;
+    --action-text: #3264a6;
+    --action-soft: #edf3fb;
+    --tab-hover: #e1e8f2;
+    --inverse-bg: #18181b;
+    --inverse-fg: #ffffff;
+    --inverse-hover: #2e2e33;
+    --overlay: rgba(9, 9, 11, 0.36);
+    --control-off: #888890;
+    --direct-fill: #0a84ff;
+    --direct-text: #0063c7;
+    --direct-soft: #eaf3ff;
+    --route-fill: #0d9488;
+    --route-text: #06726b;
+    --route-soft: #e7f6f4;
+    --stack-fill: #7c3aed;
+    --stack-text: #6d28d9;
+    --stack-soft: #f2ecfe;
+    --chart-1: #0891b2;
+    --chart-2: #db2777;
+    --success: #16a34a;
+    --success-text: #007634;
+    --success-soft: #e8f7ee;
+    --warning: #d97706;
+    --warning-text: #a64a00;
+    --warning-soft: #fef3c7;
+    --danger: #dc2626;
+    --danger-text: #b91c1c;
+    --danger-soft: #fee2e2;
+    --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+    --shadow-md:
+      0 4px 12px rgba(16, 24, 40, 0.08), 0 1px 3px rgba(16, 24, 40, 0.06);
+    --shadow-lg:
+      0 20px 40px rgba(16, 24, 40, 0.16), 0 4px 12px rgba(16, 24, 40, 0.08);
+    --border-default: hsl(240 10.2% 90.4%);
+  }
+  :root[data-theme="dark"] {
+    --bg-app: #1c1c1e;
+    --bg-sidebar: #161618;
+    --bg-subtle: #26262a;
+    --bg-selected: #313136;
+    --bg-card: #2e2e33;
+    --border-strong: #4a4a52;
+    --text-1: #e4e4e7;
+    --text-2: #ababb3;
+    --text-3: #9a9aa2;
+    --action-bg: #4278b6;
+    --action-fg: #ffffff;
+    --action-hover: #386ba7;
+    --action-text: #9bbcec;
+    --action-soft: rgba(66, 120, 182, 0.16);
+    --tab-hover: #344052;
+    --inverse-bg: #f4f4f5;
+    --inverse-fg: #18181b;
+    --inverse-hover: #e4e4e7;
+    --overlay: rgba(0, 0, 0, 0.55);
+    --control-off: #6f6f77;
+    --direct-fill: #4a8fd9;
+    --direct-text: #8fb8e6;
+    --direct-soft: rgba(74, 143, 217, 0.12);
+    --route-fill: #2a9d8f;
+    --route-text: #7cc4ba;
+    --route-soft: rgba(42, 157, 143, 0.12);
+    --stack-fill: #8b74d6;
+    --stack-text: #b5a6e3;
+    --stack-soft: rgba(139, 116, 214, 0.12);
+    --chart-1: #38bdf8;
+    --chart-2: #f472b6;
+    --success: #4ade80;
+    --success-text: #4ade80;
+    --success-soft: #0f2b1a;
+    --warning: #fbbf24;
+    --warning-text: #fcd34d;
+    --warning-soft: #33260a;
+    --danger: #f87171;
+    --danger-text: #fca5a5;
+    --danger-soft: #3a1414;
+    --shadow-sm:
+      0 0 0 1px rgba(255, 255, 255, 0.08), 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 20px 40px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+    --border-default: hsl(240 5.3% 25.7%);
+  }
+  :root {
+    --app-fill: var(--bg-app);
+    --navigation-fill: var(--bg-sidebar);
+    --page-fill: var(--bg-app);
+    --card-fill: var(--bg-card);
+    --surface-0: var(--app-fill);
+    --surface-1: var(--bg-subtle);
+    --surface-2: var(--page-fill);
+    --surface-3: var(--card-fill);
+    --row-hover: var(--bg-subtle);
+    --row-pressed: var(--bg-selected);
+    --ink: var(--text-1);
+    --ink-secondary: var(--text-2);
+    --ink-tertiary: var(--text-3);
+    --hairline: var(--border-default);
+    --control-fill: var(--bg-card);
+    --input-fill: var(--bg-card);
+    --control-hover: var(--bg-subtle);
+    --control-pressed: var(--bg-selected);
+    --ghost-hover: var(--bg-subtle);
+    --ghost-pressed: var(--bg-selected);
+    --menu-hover: var(--bg-subtle);
+    --selected-hover: var(--bg-selected);
+    --accent-fill: var(--action-bg);
+    --accent-hover: var(--action-hover);
+    --accent-pressed: var(--action-hover);
+    --accent-ink: var(--action-fg);
+    --accent-subtle: var(--action-soft);
+    --accent-text: var(--action-text);
+    --selection-fill: var(--action-bg);
+    --selection-ink: var(--action-fg);
+    --success-bg: var(--success-soft);
+    --error-fill: var(--danger);
+    --error-text: var(--danger-text);
+    --error-bg: var(--danger-soft);
+    --error-hover: var(--danger);
+    --error-pressed: var(--danger);
+    --warning-bg: var(--warning-soft);
+    --info-text: var(--text-2);
+    --info-bg: var(--bg-subtle);
+    --control-shadow: none;
+    --flyout-shadow: var(--shadow-md);
+    --overlay-fill: var(--overlay);
+    --background: var(--bg-app);
+    --card: var(--bg-card);
+    --foreground: var(--text-1);
+    --text-secondary: var(--text-2);
+    --text-tertiary: var(--text-3);
+    --primary: var(--action-bg);
+    --blue: var(--direct-text);
+    --orange: var(--warning-text);
+    --green: var(--success-text);
+    --line: var(--border-default);
+    --muted: var(--text-3);
+    --color-primary-foreground: var(--action-fg);
+    --color-destructive: var(--danger);
+    --color-destructive-foreground: #ffffff;
+    --color-secondary: var(--bg-subtle);
+    --color-secondary-foreground: var(--text-2);
+    --color-muted: var(--bg-subtle);
+    --color-muted-foreground: var(--text-3);
+    --color-accent: var(--bg-subtle);
+    --color-accent-foreground: var(--text-1);
+    --color-popover: var(--bg-card);
+    --color-popover-foreground: var(--text-1);
+    --color-border: var(--border-default);
+    --color-input: var(--border-strong);
+    --color-ring: var(--action-text);
+  }
+}

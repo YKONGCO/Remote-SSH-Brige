@@ -1,0 +1,58 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="512"
+  height="512"
+  viewBox="0 0 512 512"
+  fill="none"
+>
+  <title>SSH MCP Bridge</title>
+  <defs>
+    <linearGradient
+      id="blue"
+      x1="88"
+      y1="40"
+      x2="424"
+      y2="488"
+      gradientUnits="userSpaceOnUse"
+    >
+      <stop stop-color="#4278B6" />
+      <stop offset="0.55" stop-color="#3B70B6" />
+      <stop offset="1" stop-color="#3264A6" />
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="120" fill="url(#blue)" />
+  <rect
+    x="170"
+    y="112"
+    width="240"
+    height="204"
+    rx="44"
+    fill="#EDF3FB"
+    fill-opacity="0.16"
+    stroke="#EDF3FB"
+    stroke-opacity="0.8"
+    stroke-width="16"
+  />
+  <path
+    d="M220 164H274"
+    stroke="#FFFFFF"
+    stroke-opacity="0.85"
+    stroke-width="14"
+    stroke-linecap="round"
+  />
+  <circle cx="358" cy="164" r="8" fill="#FFFFFF" fill-opacity="0.85" />
+  <rect x="102" y="196" width="266" height="204" rx="44" fill="#FFFFFF" />
+  <path
+    d="M154 255L190 287L154 319"
+    stroke="#3B70B6"
+    stroke-width="19"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M226 321H284"
+    stroke="#3B70B6"
+    stroke-width="19"
+    stroke-linecap="round"
+  />
+</svg>
