@@ -76,10 +76,10 @@ test("wildcard binding requires a reachable IP for remote configuration", async 
   const configuration = JSON.parse(
     screen.getByText(/"mcpServers"/).textContent!,
   );
-  expect(configuration.mcpServers["remote-desk"].url).toBe(
+  expect(configuration.mcpServers["remote-ssh"].url).toBe(
     "http://192.168.1.10:18920/mcp",
   );
-  expect(configuration.mcpServers["remote-desk"].headers.Authorization).toBe(
+  expect(configuration.mcpServers["remote-ssh"].headers.Authorization).toBe(
     "Bearer fixture-token",
   );
 });
@@ -93,7 +93,7 @@ test("Pi exposes one-click configuration alongside the generic JSON config", asy
   expect(api).toHaveBeenCalledWith("configure_mcp_client", { id: "pi" });
   expect(screen.queryByRole("combobox", { name: "配置格式" })).toBeNull();
   expect(screen.getByText(/"mcpServers"/).textContent).toContain(
-    '"remote-desk"',
+    '"remote-ssh"',
   );
 });
 test("one click configures the selected client and token changes reload status", async () => {
@@ -131,7 +131,7 @@ test("manual JSON is always visible and copies the original schema", async () =>
   const configuration = screen.getByText(/"mcpServers"/).textContent!;
   expect(JSON.parse(configuration)).toEqual({
     mcpServers: {
-      "remote-desk": {
+      "remote-ssh": {
         url: "http://127.0.0.1:18920/mcp",
         headers: { Authorization: "Bearer fixture-token" },
       },

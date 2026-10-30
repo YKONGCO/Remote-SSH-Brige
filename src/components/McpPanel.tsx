@@ -16,6 +16,7 @@ import {
   WandSparkles,
 } from "lucide-react";
 import { api, desktop } from "../api";
+import { mcpServerName } from "../branding";
 import { clientNames, type ClientId, type McpClient } from "../mcp-clients";
 import type { McpStatus, Server } from "../types";
 import { mcpPermissionSummary } from "../mcp-permissions";
@@ -59,7 +60,7 @@ function ManualMcpConfig({
   const configuration = JSON.stringify(
     {
       mcpServers: {
-        "remote-desk": {
+        [mcpServerName]: {
           url: mcpUrl(remote ? targetHost : listenHost, status.port),
           headers: { Authorization: `Bearer ${status.token}` },
         },
@@ -168,7 +169,9 @@ export function McpPanel({
     setError("");
     try {
       setClients(await api<McpClient[]>("configure_mcp_client", { id }));
-      notify(`${clientNames[id]} 已配置，请在客户端重新连接 remote-desk。`);
+      notify(
+        `${clientNames[id]} 已配置，请在客户端重新连接 ${mcpServerName}。`,
+      );
     } catch (e) {
       setError(String(e));
     } finally {

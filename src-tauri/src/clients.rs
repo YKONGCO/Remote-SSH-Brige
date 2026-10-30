@@ -1,4 +1,4 @@
-use crate::model::McpStatus;
+use crate::model::{McpStatus, MCP_SERVER_NAME};
 use anyhow::{bail, Context, Result};
 use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde::Serialize;
@@ -9,7 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const KEY: &str = "remote-desk";
+const KEY: &str = MCP_SERVER_NAME;
+const LEGACY_KEY: &str = "remote-desk";
 const MAX_CONFIG: u64 = 2 * 1024 * 1024;
 const TRANSPORT_KEYS: &[&str] = &[
     "command",
@@ -94,7 +95,7 @@ fn entry(id: &str, old: Option<&Value>, status: &McpStatus) -> Result<Value> {
     let mut result = match old {
         Some(Value::Object(v)) => v.clone(),
         None => Default::default(),
-        _ => bail!("已有 remote-desk 配置不是对象"),
+        _ => bail!("已有 {KEY} 配置不是对象"),
     };
     for key in TRANSPORT_KEYS {
         result.remove(*key);
@@ -138,8 +139,49 @@ pub fn update(id: &str, source: &str, status: &McpStatus) -> Result<String> {
         let servers = doc["mcp_servers"]
             .as_table_like_mut()
             .context("mcp_servers 必须是表")?;
-        if let Some(current) = servers.get(KEY) {
-            anyhow::ensure!(current.is_table_like(), "已有 remote-desk 配置不是表");
+        for key in [KEY, LEGACY_KEY] {
+            if let Some(current) = servers.get(key) {
+                anyhow::ensure!(current.is_table_like(), "已有 {key} 配置不是表");
+            }
+        }
+        if let Some(legacy) = servers.remove(LEGACY_KEY) {
+            if let Some(current) = servers.get_mut(KEY) {
+                if let (Some(old_table), Some(new_table)) =
+                    (legacy.as_table(), current.as_table_mut())
+                {
+                    let old_prefix = old_table
+                        .decor()
+                        .prefix()
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let old_suffix = old_table
+                        .decor()
+                        .suffix()
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let new_prefix = new_table
+                        .decor()
+                        .prefix()
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let header_comment = if old_suffix.starts_with('#') {
+                        format!("{old_suffix}\n")
+                    } else {
+                        String::new()
+                    };
+                    let prefix = format!("{old_prefix}{header_comment}{new_prefix}");
+                    new_table.decor_mut().set_prefix(prefix);
+                }
+                let table = current.as_table_like_mut().unwrap();
+                for (key, value) in legacy.as_table_like().unwrap().iter() {
+                    if table.get(key).is_none() {
+                        table.insert(key, value.clone());
+                    }
+                }
+            } else {
+                servers.insert(KEY, legacy);
+            }
         }
         if servers.get(KEY).is_none() {
             servers.insert(KEY, toml_edit::Item::Table(toml_edit::Table::new()));
@@ -148,7 +190,7 @@ pub fn update(id: &str, source: &str, status: &McpStatus) -> Result<String> {
             .get_mut(KEY)
             .unwrap()
             .as_table_like_mut()
-            .context("remote-desk 必须是表")?;
+            .context("remote-ssh 必须是表")?;
         for key in TRANSPORT_KEYS {
             table.remove(key);
         }
@@ -177,17 +219,33 @@ pub fn update(id: &str, source: &str, status: &McpStatus) -> Result<String> {
         .object_value_or_create(map_key)
         .context("MCP 配置必须是对象")?;
     let current = servers.object_value(KEY).and_then(|v| v.to_serde_value());
-    if servers.get(KEY).is_some() && current.is_none() {
-        bail!("已有 remote-desk 配置不是对象")
+    let legacy = servers
+        .object_value(LEGACY_KEY)
+        .and_then(|v| v.to_serde_value());
+    for (key, value) in [(KEY, &current), (LEGACY_KEY, &legacy)] {
+        if servers.get(key).is_some() && value.is_none() {
+            bail!("已有 {key} 配置不是对象")
+        }
     }
-    let next = entry(id, current.as_ref(), status)?;
-    if current.as_ref() == Some(&next) {
+    let mut merged = legacy
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(current) = current.as_ref().and_then(Value::as_object) {
+        merged.extend(current.clone());
+    }
+    let next = entry(id, Some(&Value::Object(merged)), status)?;
+    if legacy.is_none() && current.as_ref() == Some(&next) {
         return Ok(source.into());
     }
     if let Some(prop) = servers.get(KEY) {
         prop.set_value(input(next));
     } else {
         servers.append(KEY, input(next));
+    }
+    if let Some(prop) = servers.get(LEGACY_KEY) {
+        prop.remove();
     }
     Ok(root.to_string())
 }
@@ -224,7 +282,7 @@ pub fn list(targets: &[ClientTarget], status: &McpStatus) -> Vec<ClientConnectio
                 };
                 if status.running && value {
                     Ok("configured")
-                } else if source.contains(KEY) {
+                } else if source.contains(KEY) || source.contains(LEGACY_KEY) {
                     Ok("outdated")
                 } else {
                     Ok("available")

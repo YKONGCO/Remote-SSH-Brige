@@ -163,7 +163,7 @@ mod desktop {
                 let icon = app.default_window_icon().cloned().ok_or("缺少托盘图标")?;
                 TrayIconBuilder::with_id("main-tray")
                     .icon(icon)
-                    .tooltip("SSH MCP Bridge")
+                    .tooltip("Remote SSH MCP")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id.as_ref() {
@@ -219,7 +219,7 @@ mod desktop {
                 stop_mcp
             ])
             .run(tauri::generate_context!())
-            .expect("启动 SSH MCP Bridge 失败");
+            .expect("启动 Remote SSH MCP 失败");
     }
 }
 #[cfg(feature = "desktop")]

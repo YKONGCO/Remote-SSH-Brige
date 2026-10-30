@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+pub const MCP_SERVER_NAME: &str = "remote-ssh";
+pub const MCP_SERVER_TITLE: &str = "Remote SSH MCP";
 pub const MAX_TRANSFER_MIB: u64 = 256;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]

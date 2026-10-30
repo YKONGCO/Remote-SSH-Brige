@@ -1,3 +1,4 @@
+import { productName } from "./branding";
 import { McpPanel } from "./components/McpPanel";
 import { Settings } from "./components/Settings";
 import { ApprovalCenter } from "./components/ApprovalCenter";
@@ -328,7 +329,7 @@ export default function App() {
       <aside className="sidebar">
         <div
           className="sidebar-brand"
-          title="SSH MCP Bridge"
+          title={productName}
           data-tauri-drag-region
         >
           <img
@@ -338,8 +339,8 @@ export default function App() {
             draggable={false}
           />
           <span className="sidebar-brand-name" data-tauri-drag-region>
-            <strong data-tauri-drag-region>SSH MCP</strong>
-            <small data-tauri-drag-region>Bridge</small>
+            <strong data-tauri-drag-region>Remote SSH</strong>
+            <small data-tauri-drag-region>MCP</small>
           </span>
         </div>
         <nav aria-label="主导航">

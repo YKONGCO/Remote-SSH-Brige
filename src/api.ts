@@ -105,7 +105,7 @@ let files: Record<string, string | null> = {
   "/var": null,
   "/tmp": null,
   "/README.md":
-    "# SSH MCP Bridge\n\n通过 MCP 为 AI Agent 提供可控的 SSH 远程服务器访问。这是浏览器演示文件，实际 SSH 操作请使用桌面应用。\n",
+    "# Remote SSH MCP\n\n通过 MCP 为 AI Agent 提供可控的 SSH 远程服务器访问。这是浏览器演示文件，实际 SSH 操作请使用桌面应用。\n",
   "/etc/nginx": null,
   "/etc/nginx/nginx.conf":
     "worker_processes auto;\nevents { worker_connections 1024; }\nhttp {\n    server { listen 80; root /var/www/html; }\n}\n",
@@ -331,7 +331,7 @@ export async function operate<T = Record<string, unknown>>(
         base64: op.cursor
           ? ""
           : btoa(
-              "\r\nSSH MCP Bridge - browser preview\r\nPermission-controlled SSH access for AI agents over MCP.\r\nUse the desktop app for a real SSH shell.\r\n\r\n$ ",
+              "\r\nRemote SSH MCP - browser preview\r\nPermission-controlled SSH access for AI agents over MCP.\r\nUse the desktop app for a real SSH shell.\r\n\r\n$ ",
             ),
         cursor: 1,
         alive: true,

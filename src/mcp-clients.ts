@@ -1,3 +1,5 @@
+import { mcpServerName } from "./branding";
+
 export type ClientId =
   "claude" | "codex" | "gemini" | "opencode" | "cursor" | "pi";
 export interface McpClient {
@@ -19,7 +21,7 @@ export function clientConfig(id: ClientId, port: number, token: string) {
   const url = `http://127.0.0.1:${port}/mcp`;
   const headers = { Authorization: `Bearer ${token}` };
   if (id === "codex")
-    return `[mcp_servers.remote-desk]\nurl = ${JSON.stringify(url)}\nenabled = true\nhttp_headers = { Authorization = ${JSON.stringify(headers.Authorization)} }`;
+    return `[mcp_servers.${mcpServerName}]\nurl = ${JSON.stringify(url)}\nenabled = true\nhttp_headers = { Authorization = ${JSON.stringify(headers.Authorization)} }`;
   const entry =
     id === "opencode"
       ? { type: "remote", url, headers, enabled: true, oauth: false }
@@ -31,7 +33,7 @@ export function clientConfig(id: ClientId, port: number, token: string) {
             ? { type: "http", url, headers }
             : { url, headers };
   return JSON.stringify(
-    { [id === "opencode" ? "mcp" : "mcpServers"]: { "remote-desk": entry } },
+    { [id === "opencode" ? "mcp" : "mcpServers"]: { [mcpServerName]: entry } },
     null,
     2,
   );

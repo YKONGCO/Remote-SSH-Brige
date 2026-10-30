@@ -2,9 +2,10 @@ import { useEffect, useState, type ReactNode, type Ref } from "react";
 import { Minus, Square, Copy, X, PanelTopClose } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { desktop } from "../api";
+import { productName } from "../branding";
 export function WindowBar({
   onError,
-  title = "SSH MCP Bridge",
+  title = productName,
   actionsRef,
   children,
 }: {

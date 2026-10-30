@@ -483,6 +483,11 @@ try {
   });
   check("Reject browser Origin", browser.status === 403);
   await mcp.connect(transport);
+  check(
+    "MCP reports the new service name and title",
+    mcp.getServerVersion()?.name === "remote-ssh" &&
+      mcp.getServerVersion()?.title === "Remote SSH MCP",
+  );
   const tools = await mcp.listTools();
   check(
     "MCP exposes exactly 7 focused tools",

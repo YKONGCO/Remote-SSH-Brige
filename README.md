@@ -1,10 +1,10 @@
-# SSH MCP Bridge
+# Remote SSH MCP
 
 连接 AI Agent 与 SSH 服务器的 MCP 桥接工具。通过 MCP 将远程服务器的命令执行、文件操作和持久终端提供给 Agent，使用逐项授权、命令策略、人工审批和审计记录控制访问。桌面界面用于配置 SSH 连接、授予权限、处理审批与查看操作结果。
 
 技术栈：Tauri 2 + React / TypeScript + shadcn/ui + Rust MCP SDK（rmcp 3.8.0）+ SQLite + SSH / SFTP。
 
-产品名称为「SSH MCP Bridge」，突出通过 MCP 为 Agent 提供 SSH 远程控制能力。应用标识、现有数据库与 MCP 客户端中的 `remote-desk` 配置键继续沿用，保留已保存的服务器、凭据与客户端连接。下文旧版构建包的文件名为历史产物名称。
+产品名称为「Remote SSH MCP」，MCP 协议名称和客户端配置键统一为 `remote-ssh`。升级后在 MCP 页面重新一键配置，会备份并迁移旧的 `remote-desk` 条目，保留其他服务和非连接配置选项；新旧条目同时存在时，同名选项以 `remote-ssh` 为准。应用标识、数据库文件、凭据服务与偏好设置的内部标识继续沿用，保留已保存的服务器和凭据。内部构建目标与下文旧构建包文件名仍保留原名。
 
 Agent 通过 MCP 发现已授权服务器并调用工具；用户可在桌面端调整权限、审批敏感操作或查看审计，也可通过文件和终端页面辅助排查。MCP 服务支持本机及按 IP 远程接入。
 
@@ -23,7 +23,7 @@ Agent 通过 MCP 发现已授权服务器并调用工具；用户可在桌面端
 
 ## 直接运行桌面程序
 
-当前工作区最新界面构建位于 .artifacts/headers/RemoteDesk.exe，须与同目录的 WebView2Loader.dll 放在一起。程序内嵌前端资源，运行时不需要 Node.js 或 Vite。机器上需有 Microsoft WebView2 Runtime。
+历史独立构建位于 .artifacts/headers/RemoteDesk.exe，仍使用旧品牌，须与同目录的 WebView2Loader.dll 放在一起。该独立包内嵌前端资源，运行时不需要 Node.js 或 Vite，机器上需有 Microsoft WebView2 Runtime。本次改名后的 0.3.1 调试编译产物位于 .artifacts/desktop-check/debug/remote-desk.exe；开发运行使用下方 npm.cmd run desktop，独立发行包需重新构建。运行新版前先从托盘退出旧版，避免单实例机制恢复旧窗口。
 
 这是供当前工作区验收的开发构建，已去除调试符号，尚未制作或签名安装包。
 
