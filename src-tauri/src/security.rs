@@ -17,6 +17,7 @@ pub fn sensitive(op: &Operation, source: &str) -> bool {
             | "upload"
             | "mkdir"
             | "remove"
+            | "remove_path"
             | "rename"
             | "exec"
             | "terminal_open"
@@ -91,7 +92,7 @@ pub fn check(settings: &RuntimeSettings, op: &Operation, source: &str) -> Result
         bail!("只读保护已开启：禁止修改文件、执行命令和终端输入")
     }
     if settings.deletion_protection && op.kind == "remove" {
-        bail!("删除保护已开启：请在设置中关闭后再删除远程文件")
+        bail!("桌面删除保护已开启：请在设置中关闭后再删除远程文件")
     }
     if source == "mcp"
         && !settings.effective_command_policy().allow_mcp_terminal
@@ -116,6 +117,10 @@ pub struct ApprovalView {
     pub kind: String,
     pub path: String,
     pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_ok: Option<bool>,
     pub command: String,
     pub content_preview: String,
     pub content_bytes: usize,
@@ -202,6 +207,14 @@ impl ApprovalQueue {
             kind: op.kind.clone(),
             path: op.path.clone(),
             target: op.target.clone(),
+            recursive: match op.file_request {
+                Some(crate::model::FileRequest::Remove { recursive, .. }) => Some(recursive),
+                _ => None,
+            },
+            missing_ok: match op.file_request {
+                Some(crate::model::FileRequest::Remove { missing_ok, .. }) => Some(missing_ok),
+                _ => None,
+            },
             command: op.command.clone(),
             content_truncated: preview.len() < review.len(),
             content_preview: preview,

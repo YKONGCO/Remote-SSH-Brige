@@ -23,7 +23,13 @@ MCP 页面提供 Claude Code、Codex、Gemini CLI、OpenCode、Cursor、Pi 的�
 
 视觉参考 [Windows 设计指南](https://learn.microsoft.com/zh-cn/windows/apps/design/guidelines-overview)，统一中性背景、少量强调色、4px 控件圆角与 8px 容器/弹层圆角。客户端图标来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，MIT 许可保存在 `src/assets/clients/LICENSE`。
 
-## 0.3.0 工具精简
+## 0.4.0 安全删除
+
+重新连接后新增 `remove_path(server_id, path, recursive?, missing_ok?)`，当前共 8 个工具。先在服务器权限中独立授予“安全删除文件 / 目录”，不需开启 exec 或关闭命令保护、桌面删除保护。旧 remove 授权不会转换为新权限。
+
+默认 recursive=false，missing_ok=true；非空目录需显式递归，目标已不存在默认视为清理完成。文件路径须在授权 root 内，不跟随链接删除目标，不允许删除 root 或系统顶层目录。全局只读和审批继续生效，递归审批展示完整删除范围。失败时检查 details 中的部分进度和未知结果标志，再决定是否重试。
+
+## 0.3.0 工具精简（0.4.0 在此基础上增加安全删除）
 
 升级后重新连接以刷新工具清单。对外仅保留 `list_servers`、`exec`、`read_file`、`write_file`、`edit_file`、`preview_file`、`terminal`。
 

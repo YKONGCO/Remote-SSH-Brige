@@ -13,6 +13,7 @@ export const permissionGroups = [
     operations: [
       ["write_file", "写入文本"],
       ["edit_file", "精确编辑（需读取权限）"],
+      ["remove_path", "安全删除文件 / 目录"],
     ],
   },
   { title: "命令执行", operations: [["exec", "执行命令"]] },
@@ -45,7 +46,7 @@ export function selectedMcpPermissions(server: Server): string[] {
     (index === 2 && server.allow_exec) ||
     (index === 3 && server.allow_terminal)
       ? group.operations
-          .filter(([kind]) => kind !== "edit_file")
+          .filter(([kind]) => kind !== "edit_file" && kind !== "remove_path")
           .map(([kind]) => kind)
       : [],
   );

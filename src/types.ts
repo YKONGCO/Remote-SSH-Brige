@@ -84,6 +84,8 @@ export interface FilePreview {
   truncated: boolean;
 }
 export interface ApprovalRequest {
+  recursive?: boolean | null;
+  missing_ok?: boolean | null;
   created_at?: string;
   id: string;
   server_id: string;
@@ -129,6 +131,7 @@ export const labels: Record<string, string> = {
   read_file: "读取文件",
   write_file: "写入文件",
   edit_file: "精确编辑文件",
+  remove_path: "安全删除文件 / 目录",
   mkdir: "创建目录",
   remove: "删除文件",
   rename: "重命名",

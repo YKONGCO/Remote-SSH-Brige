@@ -122,6 +122,22 @@ export function ApprovalCenter({
                   </dd>
                   <dt>操作</dt>
                   <dd>{labels[request.kind] || request.kind}</dd>
+                  {request.kind === "remove_path" && (
+                    <>
+                      <dt>删除范围</dt>
+                      <dd>
+                        {request.recursive
+                          ? "整个目录及其内容（不跟随符号链接）"
+                          : "仅文件、符号链接或空目录"}
+                      </dd>
+                      <dt>目标不存在</dt>
+                      <dd>
+                        {request.missing_ok !== false
+                          ? "视为已完成"
+                          : "返回错误"}
+                      </dd>
+                    </>
+                  )}
                   <dt>有效期</dt>
                   <dd>
                     {new Date(request.expires_at).toLocaleTimeString("zh-CN", {

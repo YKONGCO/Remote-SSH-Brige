@@ -71,8 +71,12 @@ impl RemoteMcp {
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
             Err(e) => {
                 let code = crate::file_tools::error_code(&e);
+                let details = e
+                    .downcast_ref::<crate::file_tools::FileError>()
+                    .and_then(|e| e.details.clone());
                 CallToolResult::error(vec![ContentBlock::text(
-                    serde_json::json!({"code":code,"message":format!("{e:#}")}).to_string(),
+                    serde_json::json!({"code":code,"message":format!("{e:#}"),"details":details})
+                        .to_string(),
                 )])
             }
         }
@@ -83,7 +87,7 @@ impl RemoteMcp {
     async fn list_servers(&self, Parameters(_a): Parameters<EmptyArgs>) -> CallToolResult {
         let policy = self.state.settings.lock().unwrap().clone();
         let servers: Vec<_> = self.state.config.lock().unwrap().servers.iter().filter(|s| s.enabled && s.mcp_enabled).map(|s| serde_json::json!({"id":s.id,"name":s.name,"host":s.host,"root":s.root,"allow_exec":s.permits_mcp("exec"),"allow_write":s.permits_mcp("write_file"),"allow_terminal":s.permits_mcp("terminal_open"),"mcp_permissions":s.effective_mcp_permissions(),"terminal_actions":s.terminal_actions(),
-            "security":{"deletion_protection":policy.deletion_protection,"command_protection":policy.block_dangerous_commands,"command_policy":policy.effective_command_policy(),"read_only":policy.remote_read_only,"approval_mode":policy.approval_mode}})).collect();
+            "security":{"deletion_protection":policy.deletion_protection,"deletion_protection_scope":"desktop_remove","command_protection":policy.block_dangerous_commands,"command_policy":policy.effective_command_policy(),"read_only":policy.remote_read_only,"approval_mode":policy.approval_mode}})).collect();
         CallToolResult::success(vec![ContentBlock::text(
             serde_json::json!(servers).to_string(),
         )])
@@ -95,7 +99,7 @@ impl RemoteMcp {
         self.call("exec", a).await
     }
     #[tool(
-        description = "Read UTF-8 text with 1-indexed offset and optional limit. Returns original text capped at 2000 lines or 50 KiB, with continuation metadata. Continue with next_offset. Requires read_file permission. Use preview_file for images. Use exec for listing, moving, removing, creating directories, or binary transfer, if permitted."
+        description = "Read UTF-8 text with 1-indexed offset and optional limit. Returns original text capped at 2000 lines or 50 KiB, with continuation metadata. Continue with next_offset. Requires read_file permission. Use preview_file for images and remove_path for safe deletion. Use exec for listing, moving, creating directories, or binary transfer, if permitted."
     )]
     async fn read_file(&self, Parameters(a): Parameters<ReadArgs>) -> CallToolResult {
         self.call("read_file", a).await
@@ -117,6 +121,12 @@ impl RemoteMcp {
     )]
     async fn edit_file(&self, Parameters(a): Parameters<EditArgs>) -> CallToolResult {
         self.call("edit_file", a).await
+    }
+    #[tool(
+        description = "Safely delete an exact file, symlink, or directory within the configured root via SFTP, without invoking rm. Requires independent remove_path permission; legacy remove/write/exec grants do not authorize it. Independent of the desktop deletion toggle; read-only and approval policies still apply. recursive defaults false (non-empty directories fail); missing_ok defaults true for idempotent cleanup. Never follows symlinks; cannot delete the allowed root or system top-level directories. Recursive deletion preflights at most 10000 entries and depth 64. Failures may report acknowledged removed_entries and an unknown outcome; inspect before retrying."
+    )]
+    async fn remove_path(&self, Parameters(a): Parameters<RemoveArgs>) -> CallToolResult {
+        self.call("remove_path", a).await
     }
     #[tool(
         description = "Manage a persistent SSH PTY using action: list, open, read, write, resize, close. Each action accepts only its own fields. list takes no server_id. Other actions require server_id; existing sessions require session_id. Permissions are independent per action; check list_servers.terminal_actions. Unlike exec, sessions retain working directory and interactive process state."
@@ -164,7 +174,7 @@ impl ServerHandler for RemoteMcp {
         info.description =
             Some("Remote SSH commands, file editing and persistent terminals over MCP.".into());
         info.version = env!("CARGO_PKG_VERSION").into();
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(info).with_instructions("Remote SSH MCP gives AI agents permission-controlled remote server access over MCP and SSH. Call list_servers first. Each server's mcp_permissions lists operation grants; terminal_actions lists permitted actions for the terminal tool. Use exec for ls/find/grep/mv/mkdir/rm and binary transfer, subject to the command policy. Removed SFTP tool grants never imply exec permission. Legacy allow_* fields are summaries only. Global security settings may further restrict granted operations. Use read_file for bounded text reads and edit_file for targeted edits. Continue reads using structuredContent.next_offset. File roots apply only to SFTP, not exec or terminal. Persistent sessions share state with the desktop UI.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(info).with_instructions("Remote SSH MCP gives AI agents permission-controlled remote server access over MCP and SSH. Call list_servers first. Each server's mcp_permissions lists operation grants; terminal_actions lists permitted actions for the terminal tool. Use remove_path for scoped file/directory deletion without lowering command protection; use exec for ls/find/grep/mv/mkdir and binary transfer, subject to the command policy. Removed SFTP tool grants never imply exec permission. Legacy allow_* fields are summaries only. Global security settings may further restrict granted operations. Use read_file for bounded text reads and edit_file for targeted edits. Continue reads using structuredContent.next_offset. File roots apply only to SFTP, not exec or terminal. Persistent sessions share state with the desktop UI.")
     }
 }
 async fn authorize(

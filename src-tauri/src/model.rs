@@ -164,6 +164,7 @@ pub const MCP_OPERATIONS: &[&str] = &[
     "preview_file",
     "write_file",
     "edit_file",
+    "remove_path",
     "exec",
     "list_terminals",
     "terminal_open",
@@ -266,6 +267,7 @@ pub struct Operation {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileRequest {
+    Remove { recursive: bool, missing_ok: bool },
     Read { offset: u64, limit: u64 },
     List { offset: u64, limit: u64 },
     Write { mode: WriteMode },

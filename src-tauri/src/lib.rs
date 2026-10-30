@@ -5,6 +5,7 @@ pub mod file_tools;
 pub mod mcp;
 mod mcp_args;
 pub mod model;
+pub mod safe_remove;
 pub mod security;
 pub mod ssh;
 pub mod state;

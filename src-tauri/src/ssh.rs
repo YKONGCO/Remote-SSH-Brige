@@ -172,6 +172,19 @@ pub fn operate_with_settings(
         return exec(&session, op, settings);
     }
     let sftp = session.sftp()?;
+    if let Some(FileRequest::Remove {
+        recursive,
+        missing_ok,
+    }) = op.file_request
+    {
+        return crate::safe_remove::remove(
+            &SftpRemoval(&sftp),
+            &server.root,
+            &op.path,
+            recursive,
+            missing_ok,
+        );
+    }
     if let Some(FileRequest::Read { offset, limit }) = op.file_request {
         let p = remote_path(&sftp, server, &op.path, false)?;
         let mut file = sftp.open(&p)?;
@@ -379,6 +392,74 @@ pub fn operate_with_settings(
         _ => bail!("未知操作：{}", op.kind),
     }
 }
+struct SftpRemoval<'a>(&'a Sftp);
+impl crate::safe_remove::FileSystem for SftpRemoval<'_> {
+    fn realpath(&self, path: &str) -> Result<String> {
+        Ok(self
+            .0
+            .realpath(Path::new(path))?
+            .to_str()
+            .context("Remote path is not UTF-8")?
+            .replace('\\', "/"))
+    }
+    fn metadata(&self, path: &str) -> Result<crate::safe_remove::Metadata> {
+        let st = self.0.lstat(Path::new(path))?;
+        let kind = if st.file_type().is_symlink() {
+            crate::safe_remove::Kind::Symlink
+        } else if st.is_dir() {
+            crate::safe_remove::Kind::Directory
+        } else if st.is_file() {
+            crate::safe_remove::Kind::File
+        } else {
+            return Err(file_tools::error(
+                "UNSUPPORTED_FILE_TYPE",
+                "Safe deletion supports regular files, directories, and symlinks only",
+            ));
+        };
+        Ok(crate::safe_remove::Metadata {
+            kind,
+            size: st.size,
+            modified: st.mtime,
+        })
+    }
+    fn entries(&self, path: &str, limit: usize, exhaustive: bool) -> Result<Vec<String>> {
+        let mut dir = self.0.opendir(Path::new(path))?;
+        let mut names = Vec::new();
+        loop {
+            match dir.readdir() {
+                Ok((name, _)) => {
+                    if name == Path::new(".") || name == Path::new("..") {
+                        continue;
+                    }
+                    if names.len() >= limit {
+                        return Err(file_tools::error(
+                            "REMOVE_LIMIT",
+                            "Directory exceeds the deletion entry budget; no entries were deleted",
+                        ));
+                    }
+                    names.push(
+                        name.to_str()
+                            .context("Remote filename is not UTF-8")?
+                            .to_string(),
+                    );
+                    if !exhaustive && names.len() >= limit {
+                        break;
+                    }
+                }
+                Err(e) if e.code() == ssh2::ErrorCode::Session(-16) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(names)
+    }
+    fn unlink(&self, path: &str) -> Result<()> {
+        mutation_result(self.0.unlink(Path::new(path)))
+    }
+    fn rmdir(&self, path: &str) -> Result<()> {
+        mutation_result(self.0.rmdir(Path::new(path)))
+    }
+}
+
 fn mutation_result(result: std::result::Result<(), ssh2::Error>) -> Result<()> {
     result.map_err(|e| match e.code() {
         ssh2::ErrorCode::Session(_) | ssh2::ErrorCode::SFTP(6 | 7) => file_tools::error(

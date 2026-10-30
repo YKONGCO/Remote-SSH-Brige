@@ -47,6 +47,9 @@ const fixture = {
   dropCommitResponse: false,
   createRace: false,
   commitCalls: 0,
+  failDeletePath: null,
+  dropDeletePath: null,
+  deleteCalls: 0,
 };
 const canonical = (p) => (p === "/" ? "/" : p.replace(/\/+$/, ""));
 const stats = (p) => {
@@ -228,8 +231,15 @@ const ssh = new Server(
           });
           channel.on("REMOVE", (id, p) => {
             p = canonical(p);
+            fixture.deleteCalls++;
             if (!entries.has(p)) return fail(id);
+            if (p === fixture.failDeletePath)
+              return fail(id, STATUS.PERMISSION_DENIED);
             entries.delete(p);
+            if (p === fixture.dropDeletePath) {
+              channel.end();
+              return;
+            }
             ok(id);
           });
           channel.on("RMDIR", (id, p) => {
@@ -323,6 +333,7 @@ const configServer = {
     "download",
     "write_file",
     "edit_file",
+    "remove_path",
     "upload",
     "mkdir",
     "rename",
@@ -378,7 +389,7 @@ settingsDB
   .prepare("INSERT INTO metadata(key,value) VALUES('runtime_settings',?)")
   .run(
     JSON.stringify({
-      deletion_protection: false,
+      deletion_protection: true,
       block_dangerous_commands: true,
       command_policy: {
         diagnostic_only: false,
@@ -490,7 +501,7 @@ try {
   );
   const tools = await mcp.listTools();
   check(
-    "MCP exposes exactly 7 focused tools",
+    "MCP exposes exactly 8 focused tools",
     JSON.stringify(tools.tools.map((t) => t.name).sort()) ===
       JSON.stringify(
         [
@@ -499,6 +510,7 @@ try {
           "read_file",
           "write_file",
           "edit_file",
+          "remove_path",
           "preview_file",
           "terminal",
         ].sort(),
@@ -536,6 +548,7 @@ try {
     write_file: ["server_id", "path", "content", "mode"],
     edit_file: ["server_id", "path", "edits"],
     exec: ["server_id", "command", "timeout_secs"],
+    remove_path: ["server_id", "path", "recursive", "missing_ok"],
   })) {
     const schema = tools.tools.find((tool) => tool.name === name).inputSchema;
     check(
@@ -560,6 +573,9 @@ try {
     ["terminal", { action: "resize", session_id: "s", cols: 100 }],
     ["exec", { command: "pwd", timeout_secs: 301 }],
     ["edit_file", { path: "/workspace/hello.txt", edits: [] }],
+    ["remove_path", {}],
+    ["remove_path", { path: "/workspace/file", recursive: "true" }],
+    ["remove_path", { path: "/workspace/file", force: true }],
   ])
     check(
       "Reject invalid " + name + " arguments: " + JSON.stringify(args),
@@ -897,6 +913,134 @@ try {
   check(
     "Deny symlink escape outside configured root",
     (await call("read_file", { path: "/workspace/escape" })).error,
+  );
+  await value("write_file", {
+    path: "/workspace/mcp_test_remote_ssh.txt",
+    content: "",
+  });
+  const cleanup = await value("remove_path", {
+    path: "/workspace/mcp_test_remote_ssh.txt",
+  });
+  check(
+    "Safe removal deletes an empty test file while command and desktop protection stay on",
+    cleanup.removed &&
+      cleanup.removed_entries === 1 &&
+      !entries.has("/workspace/mcp_test_remote_ssh.txt") &&
+      hosts[0].security.deletion_protection &&
+      hosts[0].security.command_protection,
+  );
+  const repeated = await value("remove_path", {
+    path: "/workspace/mcp_test_remote_ssh.txt",
+  });
+  check(
+    "Safe cleanup is idempotent",
+    repeated.missing && !repeated.removed && repeated.removed_entries === 0,
+  );
+  check(
+    "Strict missing mode reports NOT_FOUND",
+    JSON.parse(
+      (
+        await call("remove_path", {
+          path: "/workspace/mcp_test_remote_ssh.txt",
+          missing_ok: false,
+        })
+      ).value,
+    ).code === "NOT_FOUND",
+  );
+  entries.set("/workspace/delete-tree", null);
+  entries.set("/workspace/delete-tree/a", Buffer.from("a"));
+  entries.set("/workspace/delete-tree/sub", null);
+  entries.set("/workspace/delete-tree/sub/b", Buffer.from("b"));
+  entries.set("/workspace/delete-tree/outside-link", {
+    link: "/outside/secret",
+  });
+  const nonEmpty = await call("remove_path", {
+    path: "/workspace/delete-tree",
+  });
+  check(
+    "Non-empty directory requires explicit recursion",
+    nonEmpty.error &&
+      JSON.parse(nonEmpty.value).code === "DIRECTORY_NOT_EMPTY" &&
+      entries.has("/workspace/delete-tree/a"),
+  );
+  const removedTree = await value("remove_path", {
+    path: "/workspace/delete-tree",
+    recursive: true,
+  });
+  check(
+    "Recursive deletion unlinks symlinks instead of their targets",
+    removedTree.removed_entries === 5 &&
+      !entries.has("/workspace/delete-tree") &&
+      entries.has("/outside/secret"),
+  );
+  entries.set("/workspace/empty-dir", null);
+  check(
+    "Empty directories need no recursive flag",
+    (await value("remove_path", { path: "/workspace/empty-dir" })).kind ===
+      "directory",
+  );
+  entries.set("/workspace/dangling-link", { link: "/outside/absent" });
+  check(
+    "Dangling link itself is removed",
+    (await value("remove_path", { path: "/workspace/dangling-link" })).kind ===
+      "symlink",
+  );
+  const outside = await call("remove_path", { path: "/outside/secret" });
+  check(
+    "Safe removal refuses root and outside paths",
+    (await call("remove_path", { path: "/workspace", recursive: true }))
+      .error &&
+      outside.error &&
+      entries.has("/outside/secret"),
+  );
+  const deniedRemoval = await call("remove_path", {
+    server_id: "limited-host",
+    path: "/workspace/limited.txt",
+  });
+  check(
+    "Safe deletion requires a new explicit permission",
+    deniedRemoval.error &&
+      JSON.parse(deniedRemoval.value).code === "PERMISSION_DENIED" &&
+      entries.has("/workspace/limited.txt"),
+  );
+  entries.set("/workspace/partial", null);
+  entries.set("/workspace/partial/a", Buffer.from("a"));
+  entries.set("/workspace/partial/b", Buffer.from("b"));
+  fixture.failDeletePath = "/workspace/partial/b";
+  const partial = await call("remove_path", {
+    path: "/workspace/partial",
+    recursive: true,
+  });
+  fixture.failDeletePath = null;
+  const partialDetails = JSON.parse(partial.value);
+  check(
+    "Recursive deletion reports partial progress on server denial",
+    partial.error &&
+      partialDetails.code === "PERMISSION_DENIED" &&
+      partialDetails.details.removed_entries === 1 &&
+      partialDetails.details.partial &&
+      !entries.has("/workspace/partial/a") &&
+      entries.has("/workspace/partial/b"),
+  );
+  await value("remove_path", { path: "/workspace/partial", recursive: true });
+  entries.set("/workspace/delete-unknown", Buffer.from("temp"));
+  fixture.dropDeletePath = "/workspace/delete-unknown";
+  const deleteCalls = fixture.deleteCalls;
+  const unknownDelete = await call("remove_path", {
+    path: "/workspace/delete-unknown",
+  });
+  fixture.dropDeletePath = null;
+  check(
+    "Lost delete response reports unknown outcome without retry",
+    unknownDelete.error &&
+      JSON.parse(unknownDelete.value).code === "COMMIT_STATUS_UNKNOWN" &&
+      JSON.parse(unknownDelete.value).details.outcome_unknown &&
+      fixture.deleteCalls === deleteCalls + 1 &&
+      !entries.has("/workspace/delete-unknown"),
+  );
+  check(
+    "Cleanup can be safely retried after inspecting unknown outcome",
+    (await value("remove_path", { path: "/workspace/delete-unknown" })).missing,
   );
   const terminal = await value("terminal", {
     action: "open",

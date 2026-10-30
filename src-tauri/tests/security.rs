@@ -199,7 +199,7 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
         MCP_OPERATIONS
             .iter()
             .copied()
-            .filter(|op| *op != "edit_file")
+            .filter(|op| *op != "edit_file" && *op != "remove_path")
             .collect::<Vec<_>>()
     );
     let editor = Server {

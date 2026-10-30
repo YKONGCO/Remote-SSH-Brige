@@ -25,7 +25,7 @@ test("settings immediately show changes and roll back a failed save without remo
     deletion_protection: true,
   });
   render(<Settings />);
-  const control = await screen.findByRole("switch", { name: "删除保护" });
+  const control = await screen.findByRole("switch", { name: "桌面删除保护" });
   await act(async () => {});
   let fail!: (error: Error) => void;
   vi.mocked(api).mockImplementationOnce(
@@ -36,13 +36,13 @@ test("settings immediately show changes and roll back a failed save without remo
   );
   fireEvent.click(control);
   expect(control.getAttribute("aria-checked")).toBe("false");
-  expect(screen.getByRole("switch", { name: "删除保护" })).toBe(control);
+  expect(screen.getByRole("switch", { name: "桌面删除保护" })).toBe(control);
   expect(control.closest(".settings-layout")?.getAttribute("aria-busy")).toBe(
     "true",
   );
   await act(async () => fail(new Error("save failed")));
   expect(control.getAttribute("aria-checked")).toBe("true");
-  expect(screen.getByRole("switch", { name: "删除保护" })).toBe(control);
+  expect(screen.getByRole("switch", { name: "桌面删除保护" })).toBe(control);
   expect(screen.getByRole("alert").textContent).toContain("save failed");
 });
 

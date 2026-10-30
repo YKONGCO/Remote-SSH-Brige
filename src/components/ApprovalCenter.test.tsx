@@ -78,6 +78,27 @@ test("expired approvals cannot be accepted", async () => {
     mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
   ).toBe(false);
 });
+
+test("recursive deletion scope is explicit before approval", async () => {
+  setup([
+    {
+      ...pending(),
+      kind: "remove_path",
+      path: "/srv/app/tmp",
+      command: "",
+      recursive: true,
+      missing_ok: true,
+    },
+  ]);
+  render(<ApprovalCenter onResolved={vi.fn()} />);
+  await screen.findByRole("dialog", { name: "审批操作" });
+  expect(screen.getByText("安全删除文件 / 目录")).toBeTruthy();
+  expect(screen.getByText("整个目录及其内容（不跟随符号链接）")).toBeTruthy();
+  expect(screen.getByText("视为已完成")).toBeTruthy();
+  expect(
+    mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
+  ).toBe(false);
+});
 test("approval entry stays visible with no requests and links to approval settings", async () => {
   setup([]);
   const user = userEvent.setup();

@@ -209,6 +209,7 @@ export default function App() {
             "preview_file",
             "write_file",
             "edit_file",
+            "remove_path",
             "mkdir",
             "remove",
             "rename",

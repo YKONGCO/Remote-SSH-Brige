@@ -23,7 +23,7 @@ Agent 通过 MCP 发现已授权服务器并调用工具；用户可在桌面端
 
 ## 直接运行桌面程序
 
-历史独立构建位于 .artifacts/headers/RemoteDesk.exe，仍使用旧品牌，须与同目录的 WebView2Loader.dll 放在一起。该独立包内嵌前端资源，运行时不需要 Node.js 或 Vite，机器上需有 Microsoft WebView2 Runtime。本次改名后的 0.3.1 调试编译产物位于 .artifacts/desktop-check/debug/remote-desk.exe；开发运行使用下方 npm.cmd run desktop，独立发行包需重新构建。运行新版前先从托盘退出旧版，避免单实例机制恢复旧窗口。
+历史独立构建位于 .artifacts/headers/RemoteDesk.exe，仍使用旧品牌，须与同目录的 WebView2Loader.dll 放在一起。该独立包内嵌前端资源，运行时不需要 Node.js 或 Vite，机器上需有 Microsoft WebView2 Runtime。当前 0.4.0 调试编译产物位于 .artifacts/desktop-check/debug/remote-desk.exe；开发运行使用下方 npm.cmd run desktop，独立发行包需重新构建。运行新版前先从托盘退出旧版，避免单实例机制恢复旧窗口。
 
 这是供当前工作区验收的开发构建，已去除调试符号，尚未制作或签名安装包。
 
@@ -86,12 +86,26 @@ npm.cmd run dev
 | read_file    | server_id、path、offset?（从 1 开始）、limit?（默认及最多 2000）；最多 50 KiB 文本 |
 | write_file   | server_id、path、content、mode?；默认 overwrite，create 仅创建，父目录须存在       |
 | edit_file    | server_id、path、edits[{old_text,new_text}]；匹配原文，批量提交，返回有界 diff     |
+| remove_path  | server_id、path、recursive?、missing_ok?；受根目录约束的安全删除，默认不递归且幂等 |
 | preview_file | server_id、path；返回只读文本或图片预览，最大 2 MiB 且受下载上限约束               |
 | terminal     | action 为 list/open/read/write/resize/close；按动作填写服务器、会话及输入参数      |
 
-0.3.0 对外精简为 7 个工具，拒绝无关字段。先 list_servers 获取 ID、权限与安全策略，再调用相应工具。文件工具路径使用远端 POSIX 绝对路径。
+0.4.0 对外保留 8 个工具，拒绝无关字段。先 list_servers 获取 ID、权限与安全策略，再调用相应工具。文件工具路径使用远端 POSIX 绝对路径。
 
-目录、搜索、移动、创建目录、删除及二进制传输统一通过 `exec` 使用 `ls`、`find`、`grep`、`mv`、`mkdir`、`rm`、`base64` 等远端命令，仍受现有命令策略、只读和审批控制。例如 `exec(server_id="...", command="ls -la /srv/app")`。高危拦截开启时仍会拒绝 `rm`。桌面文件管理保留 SFTP 浏览、上传、下载、重命名和删除。
+目录、搜索、移动、创建目录及二进制传输通过 `exec` 使用 `ls`、`find`、`grep`、`mv`、`mkdir`、`base64` 等远端命令，仍受现有命令策略、只读和审批控制。删除优先使用 `remove_path`，无需关闭危险命令拦截。高危拦截开启时仍会拒绝 Shell `rm`。桌面文件管理保留 SFTP 浏览、上传、下载、重命名和删除。
+
+在服务器权限中单独启用“安全删除文件 / 目录”后，可调用：
+
+```json
+{
+  "server_id": "服务器 ID",
+  "path": "/tmp/mcp_test_remote_ssh.txt"
+}
+```
+
+`remove_path` 通过 SFTP 删除，不执行 Shell；`recursive` 默认 false（只删除文件、链接或空目录），非空目录需显式设置 true。`missing_ok` 默认 true，重复清理已不存在的目标返回成功，且 removed=false、missing=true。路径必须在授权 root 内；禁止删除 root 自身、`/`、`/tmp`、`/etc` 等系统顶层目录，不展开通配符，不递归跟随链接。递归删除最多 10000 个条目、深度 64，完整预检失败时不删除。执行中失败可能部分完成，错误 details 返回 removed_entries、failed_path、partial、outcome_unknown；先核验再重试。全局只读和审批仍生效，审批会展示递归范围。
+
+原“删除保护”改标为“桌面删除保护”，继续阻止桌面 SFTP 删除；新的 MCP 安全删除由独立授权控制，不需要关闭这个开关。旧 remove、write 或 exec 授权不会自动获得 remove_path 权限。
 
 `read_file` 返回原始文本及续读提示，`structuredContent` 返回 `has_more`、`next_offset`、行号范围等元数据；客户端不能再把文本块作为 0.1.0 的 JSON 全文解析。行数或字节限制先达到者生效，续读传 `next_offset`。超长单行可用有界 `exec` 命令检查（需对应权限）；桌面编辑器仍读取完整原文。升级后需重新连接并发现工具。
 
@@ -125,7 +139,7 @@ terminal(action="close", server_id="...", session_id="...")
 - 审计历史持续保存在 SQLite；列表显示最近 500 条，详情按记录 ID 读取。旧版 10 MB JSONL 滚动归档机制已停用。
 - 新配置的上传与下载上限默认各为 128 MiB，可在设置中分别输入 1–256 MiB 的自定义整数，按回车或离开输入框保存。已有保存值保留不变；限制同时约束文本写入与读取，桌面和 MCP 共用后端校验。MCP 请求体限额随当前配置生效，无需重启服务。当前为整文件 Base64 传输，上限控制在 256 MiB；GB 级传输需要流式实现。文本必须为 UTF-8。文件保存使用同目录临时文件和原子重命名，服务端需支持此能力。保留原文件权限位，但不保证所有者、ACL、扩展属性或硬链接关系不变。
 - 文件根目录对 SFTP 生效，解析路径和符号链接。它不是操作系统级沙箱，无法阻止远端其他进程制造文件系统竞态。
-- 在服务器编辑窗口的「MCP 访问权限」中，可分别授权 11 项操作：读取、预览、写入、精确编辑、exec，以及 terminal 的列表、打开、读取、输入、调整尺寸和关闭动作。关闭 MCP 访问后不再列出该服务器，已知 ID 也不能调用。桌面操作不受这些 MCP 授权限制。
+- 在服务器编辑窗口的「MCP 访问权限」中，可分别授权 12 项操作：读取、预览、写入、精确编辑、安全删除、exec，以及 terminal 的列表、打开、读取、输入、调整尺寸和关闭动作。关闭 MCP 访问后不再列出该服务器，已知 ID 也不能调用。桌面操作不受这些 MCP 授权限制。
 - 新增服务器默认仅授予读取和预览。旧终端动作授权继续生效；已移除工具的授权不会自动转为 exec 权限，保存配置时清理。`list_servers.mcp_permissions` 是操作授权，终端仍使用原 terminal_open 等权限键；`terminal_actions` 列出 terminal 可用动作。旧 `allow_*` 字段仅作兼容摘要。
 - **exec 和终端使用 SSH 账户权限，不受 SFTP 根目录限制。** 只读、命令保护与审批继续生效；桌面 SFTP 删除保护不等同于 Shell 删除保护，`rm` 是否允许仍由命令策略控制。
 - 「设置 → 命令与 Shell 权限」可独立控制诊断白名单、管道、重定向、组合命令、脚本、命令替换和 MCP 交互终端，不需要为了使用管道而关闭高危拦截。Shell 命令按语法树检查，已知高危命令在管道、组合命令及可解析的嵌套 Shell 中仍会被拒绝。外部脚本、任意解释器代码和交互终端输入无法完整静态检查，具体规则见 [安全控制](docs/SECURITY_CONTROLS.md)。
@@ -147,7 +161,7 @@ npm.cmd run test:e2e
 
 核心测试覆盖配置持久化、主机变更清除信任、损坏配置保护、MCP 权限拒绝、敏感内容不进入日志以及 MCP 启停 / 端口复用。
 
-协议测试在 127.0.0.1 创建一次性 SSH/SFTP 服务，使用真正的 MCP JS 客户端连接 Rust 服务，验证 7 个工具发现、旧工具拒绝、SSH exec、SFTP 读取/写入/编辑/预览、符号链接越界、统一终端动作、超时与审计，不连接你的服务器。远端命令 / 文件语义由内存测试服务实现，不能代替真实 Linux / OpenSSH 服务器验收。报告保存在 .artifacts/integration-*/report.json。
+协议测试在 127.0.0.1 创建一次性 SSH/SFTP 服务，使用真正的 MCP JS 客户端连接 Rust 服务，验证 8 个工具发现、旧工具拒绝、SSH exec、SFTP 读取/写入/编辑/预览/安全删除、符号链接越界、统一终端动作、超时与审计，不连接你的服务器。远端命令 / 文件语义由内存测试服务实现，不能代替真实 Linux / OpenSSH 服务器验收。报告保存在 .artifacts/integration-*/report.json。
 
 ## 项目结构
 
@@ -162,7 +176,8 @@ src-tauri/src/
   state.rs                 共享状态、配置、权限、审计
   ssh.rs                   SSH 指纹 / 认证、exec 与 SFTP
   terminal.rs              PTY 会话、输出缓冲与输入队列
-  mcp.rs                   7 个 MCP 工具、认证和服务生命周期
+  mcp.rs                   8 个 MCP 工具、认证和服务生命周期
+  safe_remove.rs           删除预检、根目录约束、链接处理和部分失败进度
   mcp_args.rs              各工具独立输入 Schema，映射到类型化文件请求
   file_tools.rs            有界分页读取、目录分页、批量文本编辑和 diff
   lib.rs                   桌面命令与应用入口

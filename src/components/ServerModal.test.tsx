@@ -101,6 +101,21 @@ test("master switch preserves grants and legacy selections convert on save", asy
     screen.queryByRole("checkbox", { name: "删除文件 / 目录" }),
   ).toBeNull();
   expect(save.mock.calls[0][0].mcp_permissions).not.toContain("exec");
+  expect(save.mock.calls[0][0].mcp_permissions).not.toContain("remove_path");
+});
+
+test("safe deletion can be granted without shell access or writing", async () => {
+  const user = userEvent.setup();
+  const save = vi.fn().mockResolvedValue(undefined);
+  render(<ServerModal initial={initial} onClose={vi.fn()} onSave={save} />);
+  const remove = screen.getByRole("checkbox", { name: "安全删除文件 / 目录" });
+  expect(remove.getAttribute("aria-checked")).toBe("false");
+  await user.click(remove);
+  await user.click(screen.getByRole("button", { name: "保存服务器" }));
+  await waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(save.mock.calls[0][0].mcp_permissions).toContain("remove_path");
+  expect(save.mock.calls[0][0].mcp_permissions).not.toContain("exec");
+  expect(save.mock.calls[0][0].mcp_permissions).not.toContain("write_file");
 });
 
 test("retired file grants are hidden and saving does not grant exec", async () => {

@@ -1,6 +1,6 @@
 # MCP 工具设计：精简的 SSH Agent 接口
 
-状态：已实现，当前版本 0.3.1，工具接口沿用 0.3.0。日期：2026-10-31。
+状态：已实现，当前版本 0.4.0，共 8 个工具。日期：2026-10-31。
 
 产品名为 Remote SSH MCP，协议名称和客户端配置键为 remote-ssh；旧 remote-desk 配置通过一键配置备份迁移，数据、凭据和应用内部标识保持。
 
@@ -10,7 +10,7 @@
 
 read.ts 使用从 1 开始的行号分页，正文不逐行添加行号。edit.ts / edit-diff.ts 支持原文批量匹配、有限模糊回退、BOM 和换行处理。本项目增加 SFTP 根目录、逐项权限、审批、审计脱敏和原子提交。
 
-0.3.0 将 18 个工具精简为 7 个。目录、搜索、移动、创建目录、删除及二进制传输统一使用 exec，按现有策略调用 ls/find/grep/mv/mkdir/rm/base64 等远端命令。保留 preview_file 供文本/图片预览；终端合并为一个 terminal 工具，保留持久会话状态。
+在精简工具基础上，0.4.0 新增 remove_path 作为无需 Shell 的安全删除入口，共 8 个工具。目录、搜索、移动、创建目录及二进制传输使用 exec，按现有策略调用 ls/find/grep/mv/mkdir/base64 等命令。preview_file 供文本/图片预览；terminal 保留持久会话状态。
 
 桌面文件管理继续使用原有 SFTP 浏览、建目录、重命名、删除、上传和下载。这些内部操作不再注册为 MCP 工具，也不能通过已知旧工具名绕过路由。
 
@@ -18,15 +18,16 @@ read.ts 使用从 1 开始的行号分页，正文不逐行添加行号。edit.t
 
 `?` 表示可省略，其余必填。每个工具及 terminal 各动作均拒绝无关字段。标识、路径、命令和 old_text 不得为空；content、new_text 可为空。
 
-| 工具         | 参数                              | 默认值 / 行为                                                 |
-| ------------ | --------------------------------- | ------------------------------------------------------------- |
-| list_servers | {}                                | 发现服务器、操作授权、terminal_actions 和安全策略，不返回凭据 |
-| exec         | server_id, command, timeout_secs? | 超时默认 0 使用应用配置，范围 0–300 秒                        |
-| read_file    | server_id, path, offset?, limit?  | offset=1，limit=2000，最多 50 KiB 正文                        |
-| write_file   | server_id, path, content, mode?   | mode=overwrite，可选 create；父目录须存在                     |
-| edit_file    | server_id, path, edits            | 1–100 组 old_text/new_text，匹配同一原文，全部成功后提交      |
-| preview_file | server_id, path                   | 文本/图片预览，最多 2 MiB 且受下载限制                        |
-| terminal     | action 及对应参数                 | 见下表                                                        |
+| 工具         | 参数                                     | 默认值 / 行为                                                 |
+| ------------ | ---------------------------------------- | ------------------------------------------------------------- |
+| list_servers | {}                                       | 发现服务器、操作授权、terminal_actions 和安全策略，不返回凭据 |
+| exec         | server_id, command, timeout_secs?        | 超时默认 0 使用应用配置，范围 0–300 秒                        |
+| read_file    | server_id, path, offset?, limit?         | offset=1，limit=2000，最多 50 KiB 正文                        |
+| write_file   | server_id, path, content, mode?          | mode=overwrite，可选 create；父目录须存在                     |
+| edit_file    | server_id, path, edits                   | 1–100 组 old_text/new_text，匹配同一原文，全部成功后提交      |
+| remove_path  | server_id, path, recursive?, missing_ok? | 默认不递归，缺失视为完成；精确路径、不跟随最终链接            |
+| preview_file | server_id, path                          | 文本/图片预览，最多 2 MiB 且受下载限制                        |
+| terminal     | action 及对应参数                        | 见下表                                                        |
 
 文件工具使用远端 POSIX 绝对路径，禁止 NUL、反斜杠和 ..；realpath 后必须在配置 root 内。exec 与 terminal 使用 SSH 账号的 Shell 权限，不受 SFTP 根目录限制。
 
@@ -97,13 +98,23 @@ write_file 的 content 必填且允许为空；overwrite 创建或完整覆盖�
 
 ## 权限、审批与升级
 
-权限界面保留 11 个授权项：read_file、preview_file、write_file、edit_file、exec 与六个终端动作。edit_file 同时要求 read_file；默认新服务器仅授权读取和预览。终端授权沿用 list_terminals、terminal_open 等内部键，合并工具不隐含开放所有动作。
+权限界面保留 12 个授权项：read_file、preview_file、write_file、edit_file、remove_path、exec 与六个终端动作。edit_file 同时要求 read_file；默认新服务器仅授权读取和预览，remove_path 必须单独开启，旧 remove / allow_write / exec 均不隐含新删除权限。终端授权沿用 list_terminals、terminal_open 等内部键，合并工具不隐含开放所有动作。
 
-list_servers.mcp_permissions 返回操作授权，terminal_actions 明确返回 terminal 可用动作。退役工具授权在加载后不对外生效，保存时清理；不自动授予 exec，不改变命令策略。mkdir/mv 仍可能被诊断白名单拒绝，rm 在高危拦截开启时仍被拒绝。只读、命令保护和审批继续生效；桌面删除保护不等于 Shell 删除保护。
+list_servers.mcp_permissions 返回操作授权，terminal_actions 明确返回 terminal 可用动作。退役工具授权在加载后不对外生效，保存时清理；不自动授予 exec，不改变命令策略。mkdir/mv 仍可能被诊断白名单拒绝，rm 在高危拦截开启时仍被拒绝。桌面删除保护仅控制旧桌面 remove，独立授权的 remove_path 不需关闭此开关；全局只读和审批仍生效。
 
 编辑审批展示全部替换请求前 8192 字符；完整请求和服务器配置绑定单次审批。审计仅保存路径、数量、字节、结果与耗时，不保存原文、新文本或 diff。命令及其输出沿用原 exec 审计规则。
 
-升级 0.3.0 后客户端需重新连接并发现工具。六个旧终端工具名改为 terminal/action，旧目录和二进制传输工具改为 exec。0.2.0 的读取、写入、编辑和预览参数保持。
+升级后客户端需重新连接并发现工具。六个旧终端工具名改为 terminal/action，旧目录和二进制传输工具改为 exec，安全删除使用 remove_path。读取、写入、编辑和预览参数保持。
+
+## 安全删除
+
+remove_path 的 recursive 默认 false，missing_ok 默认 true，不提供 force 或通配展开。只删除指定路径的文件、符号链接或空目录；非空目录须明确递归。已不存在时返回 removed=false、missing=true、removed_entries=0；missing_ok=false 则 NOT_FOUND。
+
+SFTP 只解析父目录以校验 root，最终链接用 lstat/unlink 处理，允许清理悬空或指向外部的链接本身；递归不进入链接。禁止删除授权 root、`/` 及系统顶层目录（含 `/tmp`、`/etc`、`/var` 等）；如 `/tmp/mcp_test_remote_ssh.txt` 在授权范围内，则可正常删除。
+
+递归先完整预检，最多 10000 个条目、深度 64；预检失败不删除。按子节点优先删除，执行前再次检查父目录、类型及文件属性。操作进入共享 SFTP 修改队列，但不能完全消除外部进程造成的 TOCTOU，递归也不支持事务回滚。
+
+成功返回 path、removed、missing、removed_entries、kind、recursive。执行中错误 details 包含 failed_path、removed_entries、partial 和 outcome_unknown；删除响应丢失则 COMMIT_STATUS_UNKNOWN，不自动重试。审批和审批记录包含 recursive / missing_ok，界面明确展示删除范围；操作审计只保存路径与结果元数据。
 
 ## 验证范围
 

@@ -13,6 +13,7 @@ pub const DIRECTORY_SCAN_LIMIT: usize = 10000;
 pub struct FileError {
     pub code: &'static str,
     message: &'static str,
+    pub details: Option<Value>,
 }
 impl fmt::Display for FileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -21,7 +22,24 @@ impl fmt::Display for FileError {
 }
 impl std::error::Error for FileError {}
 pub fn error(code: &'static str, message: &'static str) -> anyhow::Error {
-    FileError { code, message }.into()
+    FileError {
+        code,
+        message,
+        details: None,
+    }
+    .into()
+}
+pub fn error_with_details(
+    code: &'static str,
+    message: &'static str,
+    details: Value,
+) -> anyhow::Error {
+    FileError {
+        code,
+        message,
+        details: Some(details),
+    }
+    .into()
 }
 
 pub fn error_code(error: &anyhow::Error) -> &'static str {
@@ -46,13 +64,14 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
 pub fn mutates(kind: &str) -> bool {
     matches!(
         kind,
-        "write_file" | "edit_file" | "upload" | "remove" | "rename" | "mkdir"
+        "write_file" | "edit_file" | "upload" | "remove" | "remove_path" | "rename" | "mkdir"
     )
 }
 
 pub fn validate(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
     if let Some(request) = &op.file_request {
         let valid = match request {
+            FileRequest::Remove { .. } => op.kind == "remove_path",
             FileRequest::Read { offset, limit } => {
                 op.kind == "read_file" && *offset >= 1 && (1..=MAX_LINES).contains(limit)
             }
@@ -92,8 +111,11 @@ pub fn validate(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
                 "Invalid file request or pagination range",
             ));
         }
-    } else if op.kind == "edit_file" {
-        return Err(error("INVALID_ARGUMENT", "edit_file requires typed edits"));
+    } else if matches!(op.kind.as_str(), "edit_file" | "remove_path") {
+        return Err(error(
+            "INVALID_ARGUMENT",
+            "This operation requires a typed file request",
+        ));
     }
     Ok(())
 }

@@ -75,6 +75,20 @@ export function AuditDetails({
         ["申请时间", date(approval.requested_at)],
         ["处理时间", date(approval.decided_at)],
         ["有效期至", date(approval.expires_at)],
+        ...(approval.kind === "remove_path"
+          ? [
+              [
+                "删除范围",
+                approval.recursive
+                  ? "整个目录及其内容（不跟随符号链接）"
+                  : "仅文件、符号链接或空目录",
+              ] as [string, string],
+              [
+                "目标不存在",
+                approval.missing_ok !== false ? "视为已完成" : "返回错误",
+              ] as [string, string],
+            ]
+          : []),
         ...(approval.target
           ? [["目标路径", String(approval.target)] as [string, string]]
           : []),

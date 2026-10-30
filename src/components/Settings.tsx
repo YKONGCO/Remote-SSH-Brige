@@ -283,10 +283,10 @@ export function Settings() {
         <h2 className="settings-group-title">安全控制</h2>
         <div className="settings-card">
           <Row
-            title="删除保护"
-            description="阻止桌面和 MCP 删除远程文件与目录。"
+            title="桌面删除保护"
+            description="阻止桌面文件管理中的删除；MCP 安全删除由服务器的独立授权控制。"
           >
-            {securityToggle("deletion_protection", "删除保护")}
+            {securityToggle("deletion_protection", "桌面删除保护")}
           </Row>
           <Row
             title="危险命令拦截"

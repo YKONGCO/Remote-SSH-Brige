@@ -57,6 +57,15 @@ args!(ExecArgs {
     #[schemars(range(max = 300))]
     timeout_secs: Option<u64>,
 });
+args!(RemoveArgs {
+    /// Exact absolute remote path inside the configured root. No wildcard expansion.
+    #[schemars(length(min = 1, max = 8192))]
+    path: String,
+    /// Explicitly allow non-empty directory deletion. Default false. Symlinks are never followed.
+    recursive: Option<bool>,
+    /// Succeed when already absent, for idempotent cleanup. Default true.
+    missing_ok: Option<bool>,
+});
 
 macro_rules! into_op {
     ($ty:ident, $a:ident, {$($field:ident: $value:expr),* $(,)?}) => {
@@ -72,6 +81,7 @@ into_op!(ReadArgs, a, {path: a.path, file_request: Some(FileRequest::Read {offse
 into_op!(WriteArgs, a, {path:a.path, content:a.content, file_request:Some(FileRequest::Write {mode:a.mode.unwrap_or_default()})});
 into_op!(EditArgs, a, {path:a.path, file_request:Some(FileRequest::Edit {edits:a.edits})});
 into_op!(ExecArgs, a, {command:a.command, timeout_secs:a.timeout_secs.unwrap_or(0)});
+into_op!(RemoveArgs, a, {path:a.path, file_request:Some(FileRequest::Remove {recursive:a.recursive.unwrap_or(false),missing_ok:a.missing_ok.unwrap_or(true)})});
 
 /// A discriminated union keeps action-specific required fields and rejects
 /// accidental combinations (for example, command on a read request).

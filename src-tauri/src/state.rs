@@ -99,6 +99,7 @@ impl AppState {
                 "approved":approved,"kind":view.kind,"request_source":view.source,"decision_by":"desktop",
                 "server_name":view.server_name,"host":view.host,"username":view.username,
                 "path":view.path,"target":view.target,"command":view.command,
+                "recursive":view.recursive,"missing_ok":view.missing_ok,
                 "requested_at":view.created_at,"decided_at":chrono::Utc::now().to_rfc3339(),"expires_at":view.expires_at,
                 "content_bytes":view.content_bytes,"content_sha256":view.content_sha256
             }})), 0)
@@ -118,7 +119,7 @@ impl AppState {
             server.allow_exec = permissions.iter().any(|kind| kind == "exec");
             server.allow_write = permissions
                 .iter()
-                .any(|kind| matches!(kind.as_str(), "write_file" | "edit_file"));
+                .any(|kind| matches!(kind.as_str(), "write_file" | "edit_file" | "remove_path"));
             server.allow_terminal = permissions
                 .iter()
                 .any(|kind| kind.starts_with("terminal_") || kind == "list_terminals");
@@ -336,6 +337,7 @@ fn validate_operation(
                 | "download"
                 | "upload"
                 | "remove"
+                | "remove_path"
                 | "rename"
                 | "mkdir"
         ) {
@@ -394,7 +396,12 @@ fn clip_text(text: &str, max_bytes: usize, truncated: &mut bool) -> String {
 fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
     let mut truncated = false;
     let data = match result {
-        Err(error) => json!({"error": clip_text(&format!("{error:#}"), 16384, &mut truncated)}),
+        Err(error) => {
+            let details = error
+                .downcast_ref::<crate::file_tools::FileError>()
+                .and_then(|e| e.details.clone());
+            json!({"error": clip_text(&format!("{error:#}"), 16384, &mut truncated),"details":details})
+        }
         Ok(value) if op.kind == "exec" => {
             let stdout = clip_text(
                 value["stdout"].as_str().unwrap_or(""),
