@@ -2,7 +2,7 @@
 
 通过 MCP 将 SSH 服务器的命令执行、文件操作和持久终端提供给 AI Agent，并在桌面端统一管理连接、权限、审批和审计。
 
-基于 Tauri 2、React、TypeScript 和 Rust 构建，使用 SQLite 保存配置，通过 SSH / SFTP 访问远程服务器。提供 Windows x64，以及 macOS Apple Silicon（arm64）和 Intel（x64）的自动构建；macOS 桌面交互仍需实机验收。
+基于 Tauri 2、React、TypeScript 和 Rust 构建，使用 SQLite 保存配置，通过 SSH / SFTP 访问远程服务器。提供 Windows x64 和 macOS Apple Silicon（arm64）的自动构建；macOS 桌面交互仍需实机验收。
 
 ## 功能
 
@@ -74,10 +74,10 @@ MCP 默认仅监听本机；远程接入需显式修改监听地址。跨不可�
 
 推送到 `main`、提交针对 `main` 的 Pull Request 或推送 `v*` 标签时，GitHub Actions 会自动测试并构建桌面安装包。也可在仓库的 [Actions 页面](https://github.com/YKONGCO/Remote-SSH-Brige/actions/workflows/build.yml) 手动运行；产物在对应运行的 Artifacts 中保留 14 天。
 
-| 平台                        | 构建产物                                  | 签名状态                       |
-| --------------------------- | ----------------------------------------- | ------------------------------ |
-| Windows x64                 | NSIS 安装程序、便携 ZIP、SHA-256 校验文件 | 未签名                         |
-| macOS Apple Silicon / Intel | DMG、应用 ZIP、SHA-256 校验文件           | ad-hoc 签名，未进行 Apple 公证 |
+| 平台                         | 构建产物                                  | 签名状态                       |
+| ---------------------------- | ----------------------------------------- | ------------------------------ |
+| Windows x64                  | NSIS 安装程序、便携 ZIP、SHA-256 校验文件 | 未签名                         |
+| macOS Apple Silicon（arm64） | DMG、应用 ZIP、SHA-256 校验文件           | ad-hoc 签名，未进行 Apple 公证 |
 
 ```sh
 # 生成桌面程序和安装包

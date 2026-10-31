@@ -140,27 +140,15 @@ jobs:
           retention-days: 14
 
   macos:
-    name: macOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: macOS arm64
+    runs-on: macos-15
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-            target: aarch64-apple-darwin
-            build-jobs: "2"
-          - runner: macos-15-intel
-            arch: x64
-            target: x86_64-apple-darwin
-            build-jobs: "4"
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: ${{ matrix.build-jobs }}
+      CARGO_BUILD_JOBS: "2"
     defaults:
       run:
         shell: bash
@@ -179,7 +167,7 @@ jobs:
 
       - name: Set up Rust and macOS build tools
         env:
-          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_TARGET: aarch64-apple-darwin
         run: |
           rustup update stable --no-self-update
           rustup default stable
@@ -197,9 +185,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: macos-15-${{ matrix.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
+          key: macos-15-arm64-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            macos-15-${{ matrix.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
+            macos-15-arm64-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -235,7 +223,7 @@ jobs:
 
       - name: Prepare downloadable macOS packages
         env:
-          PACKAGE_ARCH: ${{ matrix.arch }}
+          PACKAGE_ARCH: arm64
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
@@ -283,7 +271,7 @@ jobs:
       - name: Upload macOS packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: remote-ssh-brige-macos-${{ matrix.arch }}-${{ github.run_number }}
+          name: remote-ssh-brige-macos-arm64-${{ github.run_number }}
           path: |
             .artifacts/packages/*.dmg
             .artifacts/packages/*.zip
@@ -298,7 +286,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: protocol-test-report-macos-${{ matrix.arch }}-${{ github.run_number }}
+          name: protocol-test-report-macos-arm64-${{ github.run_number }}
           path: .artifacts/integration-*/report.json
           include-hidden-files: true
           if-no-files-found: ignore
