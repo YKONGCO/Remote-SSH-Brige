@@ -1,44 +1,59 @@
 # MCP 客户端接入
 
-MCP 页面提供 Claude Code、Codex、Gemini CLI、OpenCode、Cursor、Pi 的用户级一键配置。先启动本地服务，再点击对应客户端的一键配置；修改已有文件前会在同目录创建 `.remote-desk-<uuid>.bak` 备份。客户端内需重新连接或重载服务，Pi 使用 `/reload`。
+## 一键配置
 
-0.3.1 起，产品名为 **Remote SSH MCP**，客户端配置键与协议名称统一为 `remote-ssh`。一键配置只更新该条目，并备份、迁移旧 `remote-desk` 条目；旧名会显示“需要更新”。新旧条目同时存在时合并额外选项，冲突项以新条目为准，最终只保留新键。其他服务和无关设置保持。JSON/JSONC 使用语法树编辑，TOML 使用 `toml_edit`，保留无关注释。损坏的文件、错误类型的服务映射、非普通文件和超过 2 MiB 的配置会停止自动写入。写入通过临时文件替换，同时检查外部修改并防止重复写入。应用不会仅因启动就修改客户端配置，迁移发生在用户点击一键配置时。
+在桌面端「MCP 服务」页启动服务后，选择 Claude Code、Codex、Gemini CLI、OpenCode、Cursor 或 Pi 的一键配置。写入后需在客户端重新连接或重载 MCP 服务。
 
-服务每次启动会更换令牌，已配置客户端会显示“需要更新”。检测只判断配置是否匹配，不代表客户端已运行、已连接或已安装。浏览器演示不写入本机配置。
+一键配置只更新 `remote-ssh` 条目，保留其非连接选项、其他服务和无关设置。修改已有文件前，会在同目录创建 `.remote-desk-<uuid>.bak` 备份。JSON / JSONC 使用语法树编辑，TOML 使用 `toml_edit`，保留无关注释；无效文件、错误类型的服务映射、非普通文件或超过 2 MiB 的配置会拒绝自动写入。
 
-页面的手动配置区直接显示通用 `mcpServers` JSON 并提供复制按钮。一键配置仍按目标客户端的原生格式写入。
+写入通过临时文件替换，并检查外部修改和重复写入。应用只在用户点击一键配置时修改配置文件。检测状态表示配置是否匹配，不代表客户端已安装、运行或连接成功。浏览器演示不会修改本机配置。
 
-配置路径：
+| 客户端      | 默认用户配置                                          | 支持的路径设置                 |
+| ----------- | ----------------------------------------------------- | ------------------------------ |
+| Claude Code | `~/.claude.json`                                      | —                              |
+| Codex       | `~/.codex/config.toml`                                | 绝对路径 `CODEX_HOME`          |
+| Gemini CLI  | `~/.gemini/settings.json`                             | —                              |
+| OpenCode    | `~/.config/opencode/opencode.json`，优先已有 `.jsonc` | 绝对路径 `XDG_CONFIG_HOME`     |
+| Cursor      | `~/.cursor/mcp.json`                                  | —                              |
+| Pi          | `~/.pi/agent/mcp.json`                                | 绝对路径 `PI_CODING_AGENT_DIR` |
 
-| 客户端      | 默认用户配置                                                                  |
-| ----------- | ----------------------------------------------------------------------------- |
-| Claude Code | `~/.claude.json`                                                              |
-| Codex       | `~/.codex/config.toml`，支持绝对路径的 `CODEX_HOME`                           |
-| Gemini CLI  | `~/.gemini/settings.json`                                                     |
-| OpenCode    | `~/.config/opencode/opencode.json`，优先已有 `.jsonc`，支持 `XDG_CONFIG_HOME` |
-| Cursor      | `~/.cursor/mcp.json`                                                          |
-| Pi          | `~/.pi/agent/mcp.json`，支持绝对路径的 `PI_CODING_AGENT_DIR`                  |
+服务每次启动都会更换 Token。重新启动服务后，已配置客户端会显示「需要更新」，请重新配置并连接。其他名称的条目不会自动识别或合并。
 
-配置格式依据：[Claude Code MCP](https://code.claude.com/docs/en/mcp)、[Codex MCP](https://developers.openai.com/codex/mcp)、[Gemini CLI MCP](https://geminicli.com/docs/tools/mcp-server/)、[OpenCode MCP](https://opencode.ai/docs/mcp-servers/)、[Cursor MCP](https://cursor.com/docs/context/mcp)、[Pi MCP](https://pi.dev/docs/latest/mcp)。
+## 手动配置
 
-视觉参考 [Windows 设计指南](https://learn.microsoft.com/zh-cn/windows/apps/design/guidelines-overview)，统一中性背景、少量强调色、4px 控件圆角与 8px 容器/弹层圆角。客户端图标来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，MIT 许可保存在 `src/assets/clients/LICENSE`。
+客户端需要支持 Streamable HTTP 和 `Authorization` 请求头。MCP 页面可复制当前服务的配置。以下为通用 `mcpServers` 格式示例；具体客户端可能使用不同字段，一键配置会选择对应格式。
 
-## 0.4.0 安全删除
+```json
+{
+  "mcpServers": {
+    "remote-ssh": {
+      "url": "http://127.0.0.1:18920/mcp",
+      "headers": {
+        "Authorization": "Bearer <当前服务 Token>"
+      }
+    }
+  }
+}
+```
 
-重新连接后新增 `remove_path(server_id, path, recursive?, missing_ok?)`，当前共 8 个工具。先在服务器权限中独立授予“安全删除文件 / 目录”，不需开启 exec 或关闭命令保护、桌面删除保护。旧 remove 授权不会转换为新权限。
+连接后先调用 `list_servers` 获取服务器 ID、逐项授权和安全策略。配置和凭据只在桌面端管理，MCP 不提供服务器管理或凭据读取接口。工具参数见 [MCP 工具参考](MCP_TOOLS.md)。
 
-默认 recursive=false，missing_ok=true；非空目录需显式递归，目标已不存在默认视为清理完成。文件路径须在授权 root 内，不跟随链接删除目标，不允许删除 root 或系统顶层目录。全局只读和审批继续生效，递归审批展示完整删除范围。失败时检查 details 中的部分进度和未知结果标志，再决定是否重试。
+## 从其他主机接入
 
-## 0.3.0 工具精简（0.4.0 在此基础上增加安全删除）
+1. 停止 MCP 服务，将「监听 IP」设为本机局域网 IP，或使用 `0.0.0.0` 监听全部 IPv4 网卡，再启动服务。也支持 IPv6。
+2. 在防火墙中放行所选 TCP 端口，默认 `18920`。
+3. 在「客户端连接 IP」填写另一台主机能访问的本机 IP，再复制配置。例如端点为 `http://192.168.1.10:18920/mcp`，请求仍需携带 Bearer Token。
 
-升级后重新连接以刷新工具清单。对外仅保留 `list_servers`、`exec`、`read_file`、`write_file`、`edit_file`、`preview_file`、`terminal`。
+`0.0.0.0` 和 `::` 仅用于监听，不能作为客户端目标地址。一键配置本机客户端时会选择本机可连接地址。服务校验 IP Host 并拒绝浏览器 Origin 请求，当前仅支持 IP 直连。
 
-原 list_files、mkdir、rename、remove、upload、download 不再可调用，相关操作改用已授权的 exec 命令；不会自动授予 exec 或放宽命令策略。桌面对应 SFTP 功能保留。原六个终端工具改为 `terminal` 的 list/open/read/write/resize/close 动作：例如 `terminal(action="read", server_id="...", session_id="...", cursor=0)`；list 只传 action。`list_servers.terminal_actions` 返回各服务器已授权的动作。
+HTTP 适用于可信局域网；跨不可信网络使用 VPN 或 HTTPS 代理，代理需保留受支持的 IP Host。不要公开 Token。访问控制的具体边界见 [安全控制](SECURITY_CONTROLS.md)。
 
-## 0.2.0 读取与编辑协议（0.3.0 沿用）
+## 无窗口服务
 
-升级后重新连接 MCP 以刷新工具 Schema。新增 `edit_file`，需要在服务器权限里明确授予精确编辑和读取文本；旧配置保持原授权。
+```text
+remote-desk-headless <data-directory> [port] [listen-ip]
+```
 
-`read_file` 的第一个文本块是原始文本和可选续读提示，不再是含 content 的 JSON 全文。元数据位于 `structuredContent`：根据 `has_more` 和 `next_offset` 续读。0.3.0 的完整字节传输和目录浏览改走 exec。
+默认端口为 `18920`，监听地址为 `127.0.0.1`。服务读取指定目录中的 SQLite 工作区，启动信息输出到标准错误；其中包含当前 Token，请妥善处理日志。构建命令见 [开发指南](DEVELOPMENT.md)。
 
-各工具拒绝无关参数，请仅发送对应 Schema 中的字段。`write_file` 的 `content` 必填，空字符串可写空文件；`mode` 默认 overwrite，可指定 create 防止覆盖。父目录必须存在。
+无窗口服务没有审批界面；启用人工审批后，敏感请求因无人处理会超时拒绝。

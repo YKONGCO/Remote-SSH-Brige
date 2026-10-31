@@ -1,12 +1,7 @@
-use crate::model::{Audit, Config, Server};
+use crate::model::{Audit, Server};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::{
-    fs,
-    io::{BufRead, BufReader},
-    path::Path,
-    time::Duration,
-};
+use std::{fs, path::Path, time::Duration};
 
 pub const DATABASE_FILE: &str = "remote-desk.sqlite3";
 const SERVER_COLUMNS: &str = "id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json";
@@ -40,89 +35,42 @@ impl Database {
     }
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
-        let mut connection =
-            Connection::open(dir.join(DATABASE_FILE)).context("无法打开 SQLite 数据库")?;
+        let database_path = dir.join(DATABASE_FILE);
+        let has_json_files = ["servers.json", "audit.previous.jsonl", "audit.jsonl"]
+            .iter()
+            .any(|name| dir.join(name).exists());
+        if !database_path.exists() && has_json_files {
+            bail!("不再支持 JSON/JSONL 工作区，请先使用旧版应用迁移为 SQLite")
+        }
+        let mut connection = Connection::open(database_path).context("无法打开 SQLite 数据库")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > 2 {
             bail!("数据库版本较新，请使用新版应用打开")
         }
+        if version != 0 && version != 2 {
+            bail!("不再支持此数据库版本，请先使用旧版应用升级至 SQLite 版本 2")
+        }
+        if version == 0 {
+            if has_json_files {
+                bail!("不再支持 JSON/JSONL 工作区，请先使用旧版应用迁移为 SQLite")
+            }
+            let tables: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            if tables != 0 {
+                bail!("数据库缺少版本信息，无法作为新工作区初始化")
+            }
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         let transaction = connection.transaction()?;
-        transaction.execute_batch("
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS servers (
-                position INTEGER PRIMARY KEY AUTOINCREMENT,
-                id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, host TEXT NOT NULL,
-                port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
-                username TEXT NOT NULL, auth TEXT NOT NULL CHECK(auth IN ('password','key','agent')),
-                key_path TEXT NOT NULL, fingerprint TEXT NOT NULL, group_name TEXT NOT NULL,
-                color TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
-                allow_exec INTEGER NOT NULL CHECK(allow_exec IN (0,1)),
-                allow_write INTEGER NOT NULL CHECK(allow_write IN (0,1)),
-                allow_terminal INTEGER NOT NULL CHECK(allow_terminal IN (0,1)), root TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_entries (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-                time TEXT NOT NULL, server_id TEXT NOT NULL, server_name TEXT NOT NULL,
-                source TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL,
-                success INTEGER NOT NULL CHECK(success IN (0,1)),
-                duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0), summary TEXT NOT NULL,
-                response_json TEXT
-            );
-            CREATE INDEX IF NOT EXISTS audit_server_sequence ON audit_entries(server_id,sequence DESC);
-            CREATE INDEX IF NOT EXISTS audit_kind_sequence ON audit_entries(kind,sequence DESC);
-        ")?;
-        if version < 2 {
-            transaction.execute_batch("ALTER TABLE servers ADD COLUMN mcp_enabled INTEGER NOT NULL DEFAULT 1 CHECK(mcp_enabled IN (0,1)); ALTER TABLE servers ADD COLUMN mcp_permissions_json TEXT;")?;
-        }
-        let migrated: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy_import_v1')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !migrated {
-            let config_path = dir.join("servers.json");
-            if config_path.exists() {
-                let bytes = fs::read(&config_path)?;
-                let config: Config = serde_json::from_slice(&bytes)
-                    .context("旧服务器配置损坏，自动导入未完成；原文件保持不变")?;
-                for server in config.servers {
-                    save_server(&transaction, &server)?;
-                }
-            }
-            // Archive is imported first; newer entries win if an ID appears in both files.
-            for filename in ["audit.previous.jsonl", "audit.jsonl"] {
-                let file_path = dir.join(filename);
-                if !file_path.exists() {
-                    continue;
-                }
-                for (index, line) in BufReader::new(fs::File::open(&file_path)?)
-                    .lines()
-                    .enumerate()
-                {
-                    let line = line?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let audit: Audit = serde_json::from_str(&line).with_context(|| {
-                        format!(
-                            "旧操作记录 {filename} 第 {} 行损坏，自动导入未完成；原文件保持不变",
-                            index + 1
-                        )
-                    })?;
-                    insert_audit(&transaction, &audit)?;
-                }
-            }
-            transaction.execute(
-                "INSERT INTO metadata(key,value) VALUES('legacy_import_v1',?1)",
-                [chrono::Utc::now().to_rfc3339()],
-            )?;
-        }
+        transaction.execute_batch(include_str!("schema.sql"))?;
         transaction.pragma_update(None, "user_version", 2)?;
-        transaction.commit().context("SQLite 数据迁移提交失败")?;
+        transaction.commit().context("SQLite 初始化提交失败")?;
         Ok(Self { connection })
     }
     pub fn servers(&self) -> Result<Vec<Server>> {

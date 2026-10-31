@@ -107,7 +107,6 @@ impl AppState {
     }
     pub fn save_server(&self, mut server: Server, secret: Option<String>) -> Result<Server> {
         if let Some(permissions) = &mut server.mcp_permissions {
-            permissions.retain(|kind| !RETIRED_MCP_OPERATIONS.contains(&kind.as_str()));
             anyhow::ensure!(
                 permissions
                     .iter()

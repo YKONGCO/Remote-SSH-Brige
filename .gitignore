@@ -6,3 +6,7 @@ src-tauri/gen/
 .artifacts/
 *.local
 *.tsbuildinfo
+
+# Local Windows toolchain, UI checks, and cleanup helpers
+/scripts/*.ps1
+/scripts/tauri.mjs

@@ -327,17 +327,11 @@ const configServer = {
   allow_write: true,
   allow_terminal: true,
   mcp_permissions: [
-    "list_files",
     "read_file",
     "preview_file",
-    "download",
     "write_file",
     "edit_file",
     "remove_path",
-    "upload",
-    "mkdir",
-    "rename",
-    "remove",
     "exec",
     "list_terminals",
     "terminal_open",
@@ -348,43 +342,62 @@ const configServer = {
   ],
   root: "/workspace",
 };
-await writeFile(
-  resolve(work, "servers.json"),
-  JSON.stringify({
-    servers: [
-      configServer,
-      {
-        ...configServer,
-        id: "limited-host",
-        name: "Limited host",
-        mcp_permissions: [
-          "list_files",
-          "read_file",
-          "upload",
-          "terminal_open",
-          "terminal_read",
-          "terminal_close",
-        ],
-      },
-      {
-        ...configServer,
-        id: "hidden-host",
-        name: "Hidden host",
-        mcp_enabled: false,
-      },
-      {
-        ...configServer,
-        id: "wrong-fingerprint",
-        name: "Wrong fingerprint",
-        fingerprint: "SHA256:wrong",
-      },
+const configServers = [
+  configServer,
+  {
+    ...configServer,
+    id: "limited-host",
+    name: "Limited host",
+    mcp_permissions: [
+      "read_file",
+      "terminal_open",
+      "terminal_read",
+      "terminal_close",
     ],
-  }),
-);
+  },
+  {
+    ...configServer,
+    id: "hidden-host",
+    name: "Hidden host",
+    mcp_enabled: false,
+  },
+  {
+    ...configServer,
+    id: "wrong-fingerprint",
+    name: "Wrong fingerprint",
+    fingerprint: "SHA256:wrong",
+  },
+];
 const settingsDB = new DatabaseSync(resolve(work, "remote-desk.sqlite3"));
 settingsDB.exec(
-  "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  await readFile(resolve(root, "src-tauri/src/schema.sql"), "utf8"),
 );
+settingsDB.exec("PRAGMA user_version=2");
+const insertServer = settingsDB.prepare(`INSERT INTO servers
+  (id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,
+   allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+for (const server of configServers) {
+  insertServer.run(
+    server.id,
+    server.name,
+    server.host,
+    server.port,
+    server.username,
+    server.auth,
+    server.key_path,
+    server.fingerprint,
+    server.group,
+    server.color,
+    Number(server.enabled),
+    Number(server.allow_exec),
+    Number(server.allow_write),
+    Number(server.allow_terminal),
+    server.root,
+    Number(server.mcp_enabled !== false),
+    JSON.stringify(server.mcp_permissions),
+  );
+}
 settingsDB
   .prepare("INSERT INTO metadata(key,value) VALUES('runtime_settings',?)")
   .run(
@@ -413,7 +426,14 @@ settingsDB
 settingsDB.close();
 const binary =
   process.env.REMOTE_DESK_TEST_BINARY ||
-  resolve(root, "src-tauri", "target", "debug", "remote-desk-headless.exe");
+  resolve(
+    root,
+    process.env.CARGO_TARGET_DIR || "src-tauri/target",
+    "debug",
+    process.platform === "win32"
+      ? "remote-desk-headless.exe"
+      : "remote-desk-headless",
+  );
 const proc = spawn(binary, [work, "18929"], {
   cwd: root,
   windowsHide: true,
@@ -675,7 +695,7 @@ try {
     path: "/workspace/limited.txt",
   });
   check(
-    "Legacy file grants do not imply shell permission",
+    "Limited file grants do not imply shell permission",
     limitedText.content === "limited read" && !limitedHost.allow_exec,
   );
   for (const [kind, args] of [

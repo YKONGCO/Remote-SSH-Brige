@@ -35,39 +35,18 @@ fn server() -> Server {
 }
 
 #[test]
-fn legacy_database_migrates_and_granular_permissions_persist() {
+fn granular_permissions_persist_and_invalid_grants_are_rejected() {
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
-    let legacy = state
-        .save_server(
-            Server {
-                allow_write: true,
-                ..server()
-            },
-            None,
-        )
-        .unwrap();
-    drop(state);
-    let database = rusqlite::Connection::open(dir.join("remote-desk.sqlite3")).unwrap();
-    database.execute_batch("ALTER TABLE servers DROP COLUMN mcp_enabled; ALTER TABLE servers DROP COLUMN mcp_permissions_json; PRAGMA user_version=1;").unwrap();
-    drop(database);
-    let state = AppState::open(dir.clone()).unwrap();
-    let mut migrated = state.server(&legacy.id).unwrap();
-    assert!(migrated.mcp_enabled);
-    assert!(migrated.mcp_permissions.is_none());
-    assert!(!migrated.permits_mcp("remove"));
-    assert!(!migrated.permits_mcp("download"));
-    assert!(migrated.permits_mcp("write_file"));
-    assert!(!migrated.permits_mcp("exec"));
-    migrated.mcp_permissions = Some(vec![
-        "upload".into(),
-        "read_file".into(),
-        "terminal_read".into(),
-    ]);
-    state.save_server(migrated, None).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
     drop(state);
     let state = AppState::open(dir.clone()).unwrap();
-    let mut saved = state.server(&legacy.id).unwrap();
+    let mut updated = state.server(&saved.id).unwrap();
+    updated.mcp_permissions = Some(vec!["read_file".into(), "terminal_read".into()]);
+    state.save_server(updated, None).unwrap();
+    drop(state);
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.server(&saved.id).unwrap();
     assert!(!saved.permits_mcp("upload"));
     assert!(!saved
         .mcp_permissions
@@ -87,15 +66,26 @@ fn legacy_database_migrates_and_granular_permissions_persist() {
     ] {
         assert!(!saved.permits_mcp(denied));
     }
-    saved.mcp_permissions = Some(vec!["invalid".into()]);
-    assert!(state.save_server(saved, None).is_err());
-    let mut saved = state.server(&legacy.id).unwrap();
+    for grant in [
+        "invalid",
+        "upload",
+        "remove",
+        "list_files",
+        "download",
+        "mkdir",
+        "rename",
+    ] {
+        let mut invalid = saved.clone();
+        invalid.mcp_permissions = Some(vec![grant.into()]);
+        assert!(state.save_server(invalid, None).is_err());
+    }
+    let mut saved = state.server(&saved.id).unwrap();
     saved.mcp_enabled = false;
-    state.save_server(saved, None).unwrap();
+    let saved = state.save_server(saved, None).unwrap();
     drop(state);
     let state = AppState::open(dir.clone()).unwrap();
     assert!(state
-        .server(&legacy.id)
+        .server(&saved.id)
         .unwrap()
         .effective_mcp_permissions()
         .is_empty());
@@ -235,39 +225,6 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
     drop(state);
     let state = AppState::open(dir.clone()).unwrap();
     assert_eq!(*state.settings.lock().unwrap(), settings);
-    drop(state);
-    cleanup(dir);
-}
-
-#[test]
-fn retired_file_grants_are_stripped_without_granting_shell_access() {
-    use remote_desk_lib::model::RETIRED_MCP_OPERATIONS;
-    let dir = workspace();
-    let state = AppState::open(dir.clone()).unwrap();
-    let saved = state
-        .save_server(
-            Server {
-                allow_exec: true,
-                allow_write: true,
-                mcp_permissions: Some(
-                    RETIRED_MCP_OPERATIONS
-                        .iter()
-                        .map(|name| name.to_string())
-                        .collect(),
-                ),
-                ..server()
-            },
-            None,
-        )
-        .unwrap();
-    assert_eq!(saved.mcp_permissions, Some(vec![]));
-    assert!(!saved.allow_exec);
-    assert!(!saved.allow_write);
-    assert!(saved.effective_mcp_permissions().is_empty());
-    assert!(saved.terminal_actions().is_empty());
-    drop(state);
-    let state = AppState::open(dir.clone()).unwrap();
-    assert!(!state.server(&saved.id).unwrap().permits_mcp("exec"));
     drop(state);
     cleanup(dir);
 }
@@ -513,7 +470,7 @@ fn password_is_stored_in_system_keyring_and_removed_with_host() {
 }
 
 #[test]
-fn audit_persists_output_without_polling_payload_and_loads_legacy_records() {
+fn audit_persists_output_without_polling_payload() {
     use serde_json::json;
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
@@ -652,86 +609,67 @@ fn audit_caps_multibyte_output_and_omits_file_and_input_payloads() {
 }
 
 #[test]
-fn legacy_import_is_atomic_idempotent_and_preserves_identity_and_files() {
-    use remote_desk_lib::model::{Audit, Config};
+fn json_workspaces_are_rejected_without_creating_a_database_or_changing_files() {
+    for filename in ["servers.json", "audit.previous.jsonl", "audit.jsonl"] {
+        for existing_empty_database in [false, true] {
+            let dir = workspace();
+            std::fs::create_dir_all(&dir).unwrap();
+            let database_path = dir.join("remote-desk.sqlite3");
+            if existing_empty_database {
+                std::fs::write(&database_path, []).unwrap();
+            }
+            let path = dir.join(filename);
+            let bytes = b"retained old workspace";
+            std::fs::write(&path, bytes).unwrap();
+            let error = AppState::open(dir.clone()).err().unwrap();
+            assert!(error.to_string().contains("JSON/JSONL"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            if existing_empty_database {
+                assert!(std::fs::read(&database_path).unwrap().is_empty());
+            } else {
+                assert!(!database_path.exists());
+            }
+            cleanup(dir);
+        }
+    }
+}
+
+#[test]
+fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
+    for version in [0, 1, 3] {
+        let dir = workspace();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-desk.sqlite3");
+        let database = rusqlite::Connection::open(&path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('keep');",
+            )
+            .unwrap();
+        database
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(database);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(AppState::open(dir.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        cleanup(dir);
+    }
+}
+
+#[test]
+fn current_sqlite_workspace_ignores_retained_json_files() {
     let dir = workspace();
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut saved = server();
-    saved.id = "existing-credential-id".into();
-    saved.fingerprint = "SHA256:trusted".into();
-    let config = serde_json::to_vec(&Config {
-        servers: vec![saved.clone()],
-    })
-    .unwrap();
-    std::fs::write(dir.join("servers.json"), &config).unwrap();
-    let entry = Audit {
-        id: "legacy-audit".into(),
-        time: chrono::Utc::now().to_rfc3339(),
-        server_id: saved.id.clone(),
-        server_name: saved.name.clone(),
-        source: "mcp".into(),
-        kind: "exec".into(),
-        detail: "pwd".into(),
-        success: true,
-        duration_ms: 1,
-        summary: "exit: 0".into(),
-        response: None,
-    };
-    let line = serde_json::to_string(&entry).unwrap();
-    let mut archived = entry.clone();
-    archived.id = "archive-only".into();
-    let archived_line = serde_json::to_string(&archived).unwrap();
-    std::fs::write(
-        dir.join("audit.previous.jsonl"),
-        format!("{archived_line}\n{line}\n"),
-    )
-    .unwrap();
-    std::fs::write(dir.join("audit.jsonl"), format!("{line}\nmalformed")).unwrap();
-    assert!(AppState::open(dir.clone()).is_err());
-    let connection = rusqlite::Connection::open(dir.join("remote-desk.sqlite3")).unwrap();
-    let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='servers'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 0);
-    drop(connection);
-    std::fs::write(dir.join("audit.jsonl"), format!("{line}\n")).unwrap();
     let state = AppState::open(dir.clone()).unwrap();
-    assert_eq!(
-        state.server(&saved.id).unwrap().fingerprint,
-        "SHA256:trusted"
-    );
-    assert_eq!(state.audit.lock().unwrap().len(), 2);
-    assert!(state.audit_details("archive-only").is_ok());
-    assert_eq!(std::fs::read(dir.join("servers.json")).unwrap(), config);
-    state
-        .log(
-            &saved,
-            "mcp",
-            &Operation {
-                kind: "exec".into(),
-                ..Default::default()
-            },
-            &Ok(serde_json::json!({"stdout":"new result","stderr":"","exit_code":0})),
-            0,
-        )
-        .unwrap();
-    // Deleting imported rows must not resurrect them from the retained JSON backup.
-    state.remove_server(&saved.id).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
     drop(state);
+    for filename in ["servers.json", "audit.previous.jsonl", "audit.jsonl"] {
+        std::fs::write(dir.join(filename), "unused backup").unwrap();
+    }
     let state = AppState::open(dir.clone()).unwrap();
-    assert!(state.config.lock().unwrap().servers.is_empty());
-    assert_eq!(state.audit.lock().unwrap().len(), 3);
-    assert!(state
-        .audit_details("legacy-audit")
-        .unwrap()
-        .response
-        .is_none());
-    // Corrupt old files after import are ignored; SQLite remains the source of persistence.
-    std::fs::write(dir.join("servers.json"), "changed backup").unwrap();
+    assert_eq!(state.server(&saved.id).unwrap().host, saved.host);
+    assert!(state.audit.lock().unwrap().is_empty());
+    state.remove_server(&saved.id).unwrap();
     drop(state);
     let state = AppState::open(dir.clone()).unwrap();
     assert!(state.config.lock().unwrap().servers.is_empty());

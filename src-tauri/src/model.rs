@@ -173,16 +173,6 @@ pub const MCP_OPERATIONS: &[&str] = &[
     "terminal_resize",
     "terminal_close",
 ];
-/// Retained only to recognize and strip old grants when a server is saved.
-/// Never translate these into shell access.
-pub const RETIRED_MCP_OPERATIONS: &[&str] = &[
-    "list_files",
-    "download",
-    "upload",
-    "mkdir",
-    "rename",
-    "remove",
-];
 impl Server {
     pub fn terminal_actions(&self) -> Vec<&'static str> {
         [
