@@ -124,6 +124,7 @@ export default function App() {
     [search, setSearch] = useState(""),
     [group, setGroup] = useState("全部服务器"),
     [selectedId, setSelectedId] = useState(""),
+    [fileServerId, setFileServerId] = useState(""),
     [modal, setModal] = useState<Server | null>(null),
     [menu, setMenu] = useState(""),
     [toast, setToast] = useState<{ message: string; error: boolean } | null>(
@@ -188,6 +189,7 @@ export default function App() {
     data.servers.find((s) => s.enabled) ||
     data.servers[0];
   const enabled = data.servers.filter((s) => s.enabled);
+  const fileServer = enabled.find((s) => s.id === fileServerId);
   const groups = Array.from(new Set(data.servers.map((s) => s.group)));
   const visible = data.servers.filter(
     (s) =>
@@ -258,6 +260,7 @@ export default function App() {
     }
   };
   const visit = (s: Server, p: Page) => {
+    if (p === "files") setFileServerId(s.id);
     setSelectedId(s.id);
     setPage(p);
     setMenu("");
@@ -289,12 +292,14 @@ export default function App() {
                 <ServerIcon size={15} />
                 <SelectField
                   aria-label="选择服务器"
-                  value={selected?.id || ""}
-                  onValueChange={setSelectedId}
+                  value={fileServer?.id || ""}
+                  onValueChange={setFileServerId}
                 >
-                  {!data.servers.length && <option value="">尚无服务器</option>}
+                  <option value="">
+                    {data.servers.length ? "请选择服务器" : "尚无服务器"}
+                  </option>
                   {data.servers.map((s) => (
-                    <option key={s.id} value={s.id}>
+                    <option key={s.id} value={s.id} disabled={!s.enabled}>
                       {s.name}
                       {!s.enabled ? "（已停用）" : ""}
                     </option>
@@ -352,7 +357,10 @@ export default function App() {
               aria-label={label}
               aria-current={page === id ? "page" : undefined}
               className={page === id ? "nav-item active" : "nav-item"}
-              onClick={() => setPage(id)}
+              onClick={() => {
+                if (id === "files" && page !== "files") setFileServerId("");
+                setPage(id);
+              }}
             >
               <Icon size={17} />
               <span>{label}</span>
@@ -638,8 +646,8 @@ export default function App() {
           )}
           {page === "files" && (
             <Files
-              key={selected?.id}
-              server={selected}
+              key={fileServer?.id}
+              server={fileServer}
               refresh={() => void refresh()}
               notify={notify}
             />

@@ -931,6 +931,10 @@
     flex-direction: column;
     overflow: hidden;
   }
+  .files-page > .empty-panel {
+    flex: 1;
+    min-height: 0;
+  }
   .files-page > .preview-banner,
   .files-page > .error-inline {
     flex-shrink: 0;

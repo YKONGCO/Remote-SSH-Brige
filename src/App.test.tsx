@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+import * as remoteApi from "./api";
 beforeAll(() => {
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
   vi.stubGlobal(
@@ -25,6 +26,44 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture = () => {};
 });
 afterEach(cleanup);
+test("remote files wait for server selection on each visit", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  const operations = vi.spyOn(remoteApi, "operate");
+  try {
+    render(<App />);
+    await screen.findByText("生产服务器");
+    await user.click(screen.getByRole("button", { name: "远程文件" }));
+    expect(screen.getByText("选择一台服务器")).toBeTruthy();
+    expect(operations).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("combobox", { name: "选择服务器" }));
+    expect(
+      screen.getByRole("option", { name: "测试服务器（已停用）" })
+        .getAttribute("aria-disabled"),
+    ).toBe("true");
+    await user.click(screen.getByRole("option", { name: "开发服务器" }));
+    await screen.findByRole("button", { name: "README.md" });
+    expect(operations).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "list_files", server_id: "demo-2" }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "服务器" }));
+    operations.mockClear();
+    await user.click(screen.getByRole("button", { name: "远程文件" }));
+    expect(screen.getByText("选择一台服务器")).toBeTruthy();
+    expect(operations).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "服务器" }));
+    await user.click(screen.getByRole("button", { name: "浏览文件 生产服务器" }));
+    await screen.findByRole("button", { name: "README.md" });
+    expect(operations).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "list_files", server_id: "demo-1" }),
+    );
+  } finally {
+    operations.mockRestore();
+  }
+});
 test("workspace supports filtering, server creation, file editing and audit navigation", async () => {
   const user = userEvent.setup();
   render(<App />);
@@ -58,6 +97,8 @@ test("workspace supports filtering, server creation, file editing and audit navi
     screen.queryByText("连接你的远程环境，让工具与工作流在这里相遇。"),
   ).toBeNull();
   await user.click(screen.getByRole("button", { name: "远程文件" }));
+  await user.click(screen.getByRole("combobox", { name: "选择服务器" }));
+  await user.click(screen.getByRole("option", { name: "生产服务器" }));
   const readme = await screen.findByRole("button", { name: "README.md" });
   await user.click(readme);
   const preview = await screen.findByRole("textbox", { name: "文件预览" });
@@ -259,6 +300,8 @@ test("Radix preferences persist and enforce the upload limit", async () => {
   ).toContain("13 px");
   expect(document.documentElement.dataset.density).toBe("comfortable");
   await user.click(screen.getByRole("button", { name: "远程文件" }));
+  await user.click(screen.getByRole("combobox", { name: "选择服务器" }));
+  await user.click(screen.getByRole("option", { name: "生产服务器" }));
   await screen.findByRole("button", { name: "README.md" });
   await user.upload(
     document.querySelector('input[type="file"]') as HTMLInputElement,

@@ -83,6 +83,7 @@ export function Files({
     setEntries([]);
     setEditor(null);
     setPreview(null);
+    if (!server) return;
     void api<RuntimeSettings>("runtime_settings")
       .then(setSecurity)
       .catch(() => {});
@@ -164,7 +165,7 @@ export function Files({
       <div className="empty-panel">
         <Folder size={38} />
         <h3>选择一台服务器</h3>
-        <p></p>
+        <p>请先在右上方选择服务器，再查看远程文件。</p>
       </div>
     );
   return (
