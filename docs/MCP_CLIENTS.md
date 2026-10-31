@@ -4,7 +4,7 @@
 
 在桌面端「MCP 服务」页启动服务后，选择 Claude Code、Codex、Gemini CLI、OpenCode、Cursor 或 Pi 的一键配置。写入后需在客户端重新连接或重载 MCP 服务。
 
-一键配置只更新 `remote-ssh` 条目，保留其非连接选项、其他服务和无关设置。修改已有文件前，会在同目录创建 `.remote-desk-<uuid>.bak` 备份。JSON / JSONC 使用语法树编辑，TOML 使用 `toml_edit`，保留无关注释；无效文件、错误类型的服务映射、非普通文件或超过 2 MiB 的配置会拒绝自动写入。
+一键配置只更新 `remote-ssh` 条目，保留其非连接选项、其他服务和无关设置。修改已有文件前，会在同目录创建 `.remote-ssh-brige-<uuid>.bak` 备份。JSON / JSONC 使用语法树编辑，TOML 使用 `toml_edit`，保留无关注释；无效文件、错误类型的服务映射、非普通文件或超过 2 MiB 的配置会拒绝自动写入。
 
 写入通过临时文件替换，并检查外部修改和重复写入。应用只在用户点击一键配置时修改配置文件。检测状态表示配置是否匹配，不代表客户端已安装、运行或连接成功。浏览器演示不会修改本机配置。
 
@@ -51,7 +51,7 @@ HTTP 适用于可信局域网；跨不可信网络使用 VPN 或 HTTPS 代理，
 ## 无窗口服务
 
 ```text
-remote-desk-headless <data-directory> [port] [listen-ip]
+remote-ssh-brige-headless <data-directory> [port] [listen-ip]
 ```
 
 默认端口为 `18920`，监听地址为 `127.0.0.1`。服务读取指定目录中的 SQLite 工作区，启动信息输出到标准错误；其中包含当前 Token，请妥善处理日志。构建命令见 [开发指南](DEVELOPMENT.md)。

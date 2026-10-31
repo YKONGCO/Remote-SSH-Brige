@@ -1,9 +1,9 @@
-use remote_desk_lib::{
+use remote_ssh_brige_lib::{
     model::{Operation, Server},
     state::{execute, AppState},
 };
 fn workspace() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("remote-desk-test-{}", uuid::Uuid::new_v4()))
+    std::env::temp_dir().join(format!("remote-ssh-brige-test-{}", uuid::Uuid::new_v4()))
 }
 
 fn cleanup(dir: std::path::PathBuf) {
@@ -14,12 +14,12 @@ fn cleanup(dir: std::path::PathBuf) {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .starts_with("remote-desk-test-"));
+        .starts_with("remote-ssh-brige-test-"));
     std::fs::remove_dir_all(target).unwrap();
 }
 
-fn persisted_audits(dir: &std::path::Path) -> Vec<remote_desk_lib::model::Audit> {
-    remote_desk_lib::database::Database::open(dir)
+fn persisted_audits(dir: &std::path::Path) -> Vec<remote_ssh_brige_lib::model::Audit> {
+    remote_ssh_brige_lib::database::Database::open(dir)
         .unwrap()
         .recent_audits(10000)
         .unwrap()
@@ -95,7 +95,7 @@ fn granular_permissions_persist_and_invalid_grants_are_rejected() {
 
 #[tokio::test]
 async fn granular_denials_are_enforced_before_network_and_survive_live_updates() {
-    use remote_desk_lib::model::MCP_OPERATIONS;
+    use remote_ssh_brige_lib::model::MCP_OPERATIONS;
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
     let mut saved = state
@@ -152,7 +152,7 @@ async fn granular_denials_are_enforced_before_network_and_survive_live_updates()
 }
 #[test]
 fn runtime_settings_persist_and_reject_invalid_updates() {
-    use remote_desk_lib::model::RuntimeSettings;
+    use remote_ssh_brige_lib::model::RuntimeSettings;
     let dir = workspace();
     let maximum = RuntimeSettings {
         upload_limit_mib: 256,
@@ -165,7 +165,7 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
     assert_eq!(*state.settings.lock().unwrap(), RuntimeSettings::default());
     let settings = RuntimeSettings {
         close_to_tray: false,
-        command_policy: Some(remote_desk_lib::model::CommandPolicy {
+        command_policy: Some(remote_ssh_brige_lib::model::CommandPolicy {
             allow_pipes: true,
             allow_redirection: true,
             ..Default::default()
@@ -232,7 +232,7 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
 #[tokio::test]
 async fn transfer_limits_apply_to_desktop_and_mcp_before_network_access() {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use remote_desk_lib::model::RuntimeSettings;
+    use remote_ssh_brige_lib::model::RuntimeSettings;
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
     let saved = state
@@ -382,13 +382,13 @@ async fn mcp_start_stop_and_restart_releases_listener() {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
-    let first = remote_desk_lib::mcp::start(state.clone(), port)
+    let first = remote_ssh_brige_lib::mcp::start(state.clone(), port)
         .await
         .unwrap();
     assert!(first.running);
     assert_eq!(first.host, "127.0.0.1");
     assert_eq!(first.token.len(), 64);
-    assert!(remote_desk_lib::mcp::start(state.clone(), port)
+    assert!(remote_ssh_brige_lib::mcp::start(state.clone(), port)
         .await
         .is_err());
     let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -399,15 +399,17 @@ async fn mcp_start_stop_and_restart_releases_listener() {
     client.read_to_string(&mut response).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 401"));
     drop(client);
-    remote_desk_lib::mcp::stop(state.clone()).await.unwrap();
+    remote_ssh_brige_lib::mcp::stop(state.clone())
+        .await
+        .unwrap();
     assert!(!state.mcp.lock().unwrap().running);
     assert!(
-        remote_desk_lib::mcp::start_on(state.clone(), port, "not-an-ip")
+        remote_ssh_brige_lib::mcp::start_on(state.clone(), port, "not-an-ip")
             .await
             .is_err()
     );
     assert!(!state.mcp.lock().unwrap().running);
-    let second = remote_desk_lib::mcp::start_on(state.clone(), port, "0.0.0.0")
+    let second = remote_ssh_brige_lib::mcp::start_on(state.clone(), port, "0.0.0.0")
         .await
         .unwrap();
     assert_eq!(second.host, "0.0.0.0");
@@ -438,7 +440,9 @@ async fn mcp_start_stop_and_restart_releases_listener() {
         );
     }
     // Session workers release their shared database after cancellation is observed.
-    remote_desk_lib::mcp::stop(state.clone()).await.unwrap();
+    remote_ssh_brige_lib::mcp::stop(state.clone())
+        .await
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while std::sync::Arc::strong_count(&state) > 1 {
             tokio::task::yield_now().await;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use remote_desk_lib::{
+use remote_ssh_brige_lib::{
     file_tools::{self, error, error_code},
     model::{FileRequest, Operation, RuntimeSettings, Server},
     safe_remove::{self, FileSystem, Kind, Metadata, MAX_DEPTH, MAX_ENTRIES},

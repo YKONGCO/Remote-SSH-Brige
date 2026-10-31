@@ -1,4 +1,4 @@
-use remote_desk_lib::{
+use remote_ssh_brige_lib::{
     model::{Operation, RuntimeSettings, Server},
     security::{self, ApprovalQueue},
     state::{self, AppState},
@@ -27,7 +27,7 @@ fn legacy_command_settings_keep_their_behavior_until_a_policy_is_saved() {
 
 #[test]
 fn shell_features_can_be_enabled_independently() {
-    use remote_desk_lib::model::CommandPolicy;
+    use remote_ssh_brige_lib::model::CommandPolicy;
     let mut policy = CommandPolicy::default();
     let accepts = |command: &str, policy: &CommandPolicy| {
         security::check_command_with_settings(
@@ -96,7 +96,7 @@ fn shell_features_can_be_enabled_independently() {
 
 #[test]
 fn known_dangerous_commands_remain_blocked_with_shell_features_enabled() {
-    use remote_desk_lib::model::CommandPolicy;
+    use remote_ssh_brige_lib::model::CommandPolicy;
     let mut settings = RuntimeSettings {
         command_policy: Some(CommandPolicy {
             diagnostic_only: false,
@@ -160,7 +160,7 @@ fn terminal_policy_is_independent_of_dangerous_command_protection() {
 
 #[test]
 fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations() {
-    use remote_desk_lib::model::MCP_OPERATIONS;
+    use remote_ssh_brige_lib::model::MCP_OPERATIONS;
     for granted in MCP_OPERATIONS {
         let mut server = Server {
             allow_exec: true,
@@ -216,7 +216,7 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
 
 #[test]
 fn preview_treats_markup_as_text_and_never_returns_binary_as_html() {
-    use remote_desk_lib::ssh::preview_content;
+    use remote_ssh_brige_lib::ssh::preview_content;
     let html = b"<script>alert(1)</script>".to_vec();
     let view = preview_content(html.clone(), None, false).unwrap();
     assert_eq!(view["kind"], "text");
@@ -340,7 +340,7 @@ async fn request(queue: &ApprovalQueue) -> security::ApprovalView {
 
 #[tokio::test]
 async fn edit_approval_previews_and_hashes_all_replacements_and_cancels_cleanly() {
-    use remote_desk_lib::model::{FileEdit, FileRequest};
+    use remote_ssh_brige_lib::model::{FileEdit, FileRequest};
     use sha2::{Digest, Sha256};
     let queue = std::sync::Arc::new(ApprovalQueue::default());
     let op = Operation {
@@ -414,7 +414,10 @@ async fn approval_is_single_use_cancellable_and_fails_closed_when_journaling_fai
 
 #[tokio::test]
 async fn changed_server_permissions_invalidate_an_approved_request_before_network_access() {
-    let dir = std::env::temp_dir().join(format!("remote-desk-security-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "remote-ssh-brige-security-{}",
+        uuid::Uuid::new_v4()
+    ));
     let state = AppState::open(dir.clone()).unwrap();
     state
         .save_settings(RuntimeSettings {
@@ -482,13 +485,16 @@ async fn changed_server_permissions_invalidate_an_approved_request_before_networ
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .starts_with("remote-desk-security-"));
+        .starts_with("remote-ssh-brige-security-"));
     std::fs::remove_dir_all(resolved).unwrap();
 }
 
 #[tokio::test]
 async fn rejection_metadata_survives_restart_without_persisting_file_bodies() {
-    let dir = std::env::temp_dir().join(format!("remote-desk-security-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "remote-ssh-brige-security-{}",
+        uuid::Uuid::new_v4()
+    ));
     let state = AppState::open(dir.clone()).unwrap();
     state
         .save_settings(RuntimeSettings {
@@ -563,6 +569,6 @@ async fn rejection_metadata_survives_restart_without_persisting_file_bodies() {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .starts_with("remote-desk-security-"));
+        .starts_with("remote-ssh-brige-security-"));
     std::fs::remove_dir_all(resolved).unwrap();
 }

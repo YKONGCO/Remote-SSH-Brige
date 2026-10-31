@@ -37,7 +37,7 @@ npm run build:headless
 npm run test:e2e
 ```
 
-测试在回环地址创建一次性 SSH / SFTP fixture，使用真实 MCP JS 客户端连接 Rust 服务，不访问用户服务器。远程命令和文件系统由内存服务实现，不能代替真实 Linux / OpenSSH 环境验收。输出位于 `.artifacts/integration-*/report.json`；程序路径识别平台可执行文件后缀并支持 `CARGO_TARGET_DIR`，也可用 `REMOTE_DESK_TEST_BINARY` 直接指定。
+测试在回环地址创建一次性 SSH / SFTP fixture，使用真实 MCP JS 客户端连接 Rust 服务，不访问用户服务器。远程命令和文件系统由内存服务实现，不能代替真实 Linux / OpenSSH 环境验收。输出位于 `.artifacts/integration-*/report.json`；程序路径识别平台可执行文件后缀并支持 `CARGO_TARGET_DIR`，也可用 `REMOTE_SSH_BRIGE_TEST_BINARY` 直接指定。
 
 ## 代码结构
 

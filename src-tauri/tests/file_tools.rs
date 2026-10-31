@@ -1,4 +1,4 @@
-use remote_desk_lib::{
+use remote_ssh_brige_lib::{
     file_tools::{self, edit_text, read_page, MAX_BYTES},
     model::{FileEdit, FileRequest, Operation, RuntimeSettings},
     security,

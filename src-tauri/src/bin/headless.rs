@@ -1,9 +1,9 @@
-use remote_desk_lib::{mcp, state::AppState};
+use remote_ssh_brige_lib::{mcp, state::AppState};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = args.next().ok_or_else(|| {
-        anyhow::anyhow!("Usage: remote-desk-headless <data-directory> [port] [listen-ip]")
+        anyhow::anyhow!("Usage: remote-ssh-brige-headless <data-directory> [port] [listen-ip]")
     })?;
     let port = args.next().unwrap_or_else(|| "18920".into()).parse()?;
     let host = args.next().unwrap_or_else(|| "127.0.0.1".into());

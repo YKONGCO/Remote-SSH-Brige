@@ -29,9 +29,9 @@ test("workspace supports filtering, server creation, file editing and audit navi
   const user = userEvent.setup();
   render(<App />);
   await screen.findByText("生产服务器");
-  expect(screen.getByTitle("Remote SSH MCP")).toBeTruthy();
+  expect(screen.getByTitle("Remote SSH Brige")).toBeTruthy();
   expect(screen.getByText("Remote SSH")).toBeTruthy();
-  expect(screen.queryByText("Bridge")).toBeNull();
+  expect(screen.getByText("Brige")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "命令执行" })).toBeNull();
   expect(screen.queryByText("本地工作空间")).toBeNull();
   expect(screen.getByRole("button", { name: "收起到托盘" })).toBeTruthy();

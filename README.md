@@ -1,4 +1,4 @@
-# Remote SSH MCP
+# Remote SSH Brige
 
 通过 MCP 将 SSH 服务器的命令执行、文件操作和持久终端提供给 AI Agent，并在桌面端统一管理连接、权限、审批和审计。
 
@@ -81,7 +81,7 @@ npm run test:ui
 npm test
 ```
 
-默认 Windows 程序位于 `src-tauri/target/release/remote-desk.exe`，安装包位于 `src-tauri/target/release/bundle/`。协议测试、无窗口服务和项目结构见 [开发指南](docs/DEVELOPMENT.md)。
+默认 Windows 程序位于 `src-tauri/target/release/remote-ssh-brige.exe`，安装包位于 `src-tauri/target/release/bundle/`。协议测试、无窗口服务和项目结构见 [开发指南](docs/DEVELOPMENT.md)。
 
 ## 文档
 

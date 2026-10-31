@@ -1,4 +1,4 @@
-use remote_desk_lib::{
+use remote_ssh_brige_lib::{
     clients::{self, ClientTarget},
     model::McpStatus,
 };

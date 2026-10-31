@@ -271,7 +271,7 @@ pub fn install(target: &ClientTarget, status: &McpStatus) -> Result<()> {
     );
     fs::create_dir_all(target.path.parent().context("无效配置路径")?)?;
     let lock = target.path.with_extension(format!(
-        "{}.remote-desk.lock",
+        "{}.remote-ssh-brige.lock",
         target
             .path
             .extension()
@@ -292,7 +292,7 @@ pub fn install(target: &ClientTarget, status: &McpStatus) -> Result<()> {
     private_write(&temp, next.as_bytes())?;
     if let Some(ref source) = old {
         let backup = target.path.with_extension(format!(
-            "{}.remote-desk-{}.bak",
+            "{}.remote-ssh-brige-{}.bak",
             target
                 .path
                 .extension()

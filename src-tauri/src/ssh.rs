@@ -587,7 +587,7 @@ fn atomic_write(
     let temp = path
         .parent()
         .context("Invalid remote path")?
-        .join(format!(".remote-desk-{}", uuid::Uuid::new_v4()));
+        .join(format!(".remote-ssh-brige-{}", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = sftp.open_mode(
             &temp,

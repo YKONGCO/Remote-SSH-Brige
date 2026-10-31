@@ -1,5 +1,5 @@
 {
-  "name": "remote-desk",
+  "name": "remote-ssh-brige",
   "version": "0.4.0",
   "description": "Permission-controlled remote server access for AI agents over MCP and SSH",
   "license": "MIT",
@@ -16,7 +16,7 @@
     "test": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
-    "build:headless": "cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --bin remote-desk-headless",
+    "build:headless": "cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --bin remote-ssh-brige-headless",
     "test:e2e": "node scripts/integration.mjs",
     "test:ui": "vitest run",
     "format": "prettier --write src scripts/integration.mjs vite.config.ts README.md docs"

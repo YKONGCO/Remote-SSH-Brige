@@ -341,7 +341,7 @@ export default function App() {
           />
           <span className="sidebar-brand-name" data-tauri-drag-region>
             <strong data-tauri-drag-region>Remote SSH</strong>
-            <small data-tauri-drag-region>MCP</small>
+            <small data-tauri-drag-region>Brige</small>
           </span>
         </div>
         <nav aria-label="主导航">

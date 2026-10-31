@@ -1,13 +1,13 @@
 [package]
-name = "remote-desk"
-default-run = "remote-desk"
+name = "remote-ssh-brige"
+default-run = "remote-ssh-brige"
 version = "0.4.0"
 license = "MIT"
 description = "Permission-controlled remote server access for AI agents over MCP and SSH"
 edition = "2021"
 
 [lib]
-name = "remote_desk_lib"
+name = "remote_ssh_brige_lib"
 crate-type = ["rlib"]
 
 [features]
@@ -46,10 +46,10 @@ unicode-normalization = "0.1"
 similar = "2"
 
 [[bin]]
-name = "remote-desk"
+name = "remote-ssh-brige"
 path = "src/main.rs"
 required-features = ["desktop"]
 
 [[bin]]
-name = "remote-desk-headless"
+name = "remote-ssh-brige-headless"
 path = "src/bin/headless.rs"

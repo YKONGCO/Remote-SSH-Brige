@@ -425,14 +425,14 @@ settingsDB
   );
 settingsDB.close();
 const binary =
-  process.env.REMOTE_DESK_TEST_BINARY ||
+  process.env.REMOTE_SSH_BRIGE_TEST_BINARY ||
   resolve(
     root,
     process.env.CARGO_TARGET_DIR || "src-tauri/target",
     "debug",
     process.platform === "win32"
-      ? "remote-desk-headless.exe"
-      : "remote-desk-headless",
+      ? "remote-ssh-brige-headless.exe"
+      : "remote-ssh-brige-headless",
   );
 const proc = spawn(binary, [work, "18929"], {
   cwd: root,
@@ -453,7 +453,10 @@ const status = JSON.parse(
   stderr.split("\n").find((l) => l.includes('"token"')),
 );
 const url = new URL("http://127.0.0.1:" + status.port + "/mcp");
-const mcp = new Client({ name: "remote-desk-integration", version: "1.0.0" });
+const mcp = new Client({
+  name: "remote-ssh-brige-integration",
+  version: "1.0.0",
+});
 const transport = new StreamableHTTPClientTransport(url, {
   requestInit: { headers: { Authorization: "Bearer " + status.token } },
 });
@@ -517,7 +520,7 @@ try {
   check(
     "MCP reports the new service name and title",
     mcp.getServerVersion()?.name === "remote-ssh" &&
-      mcp.getServerVersion()?.title === "Remote SSH MCP",
+      mcp.getServerVersion()?.title === "Remote SSH Brige",
   );
   const tools = await mcp.listTools();
   check(
@@ -902,7 +905,7 @@ try {
   );
   check(
     "Temporary files are cleaned up",
-    ![...entries.keys()].some((p) => p.includes(".remote-desk-")),
+    ![...entries.keys()].some((p) => p.includes(".remote-ssh-brige-")),
   );
   entries.set("/workspace/binary.bin", Buffer.from([0, 255, 16, 128]));
   check(
