@@ -1,4 +1,4 @@
-name: Build Windows packages
+name: Build desktop packages
 
 on:
   push:
@@ -138,3 +138,163 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            arch: x64
+            target: x86_64-apple-darwin
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Set up Rust and macOS build tools
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
+          xcode-select -p
+          clang --version
+          perl --version
+
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: macos-15-${{ matrix.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            macos-15-${{ matrix.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Create temporary test keychain
+        run: |
+          test_keychain="$RUNNER_TEMP/remote-ssh-brige-test.keychain-db"
+          password="$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$test_keychain"
+          security set-keychain-settings -lut 21600 "$test_keychain"
+          security unlock-keychain -p "$password" "$test_keychain"
+          security list-keychains -d user -s "$test_keychain"
+          security default-keychain -d user -s "$test_keychain"
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Test user interface
+        run: npm run test:ui
+
+      - name: Test Rust backend and Keychain
+        run: npm test -- --locked
+
+      - name: Build protocol test service
+        run: npm run build:headless -- --locked
+
+      - name: Test MCP and SSH protocol
+        run: npm run test:e2e
+
+      - name: Build macOS app and disk image
+        run: npm run desktop:build -- --ci --bundles app,dmg -- --locked
+
+      - name: Prepare downloadable macOS packages
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          output="$PWD/.artifacts/packages"
+          app='src-tauri/target/release/bundle/macos/Remote SSH Brige.app'
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/dmg/*.dmg)
+          if [ "${#images[@]}" -ne 1 ]; then
+            echo 'Expected exactly one DMG installer.' >&2
+            exit 1
+          fi
+          mkdir -p "$output"
+          cp "${images[0]}" "$output/"
+          cp LICENSE "$output/"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$output/remote-ssh-brige-$version-macos-$PACKAGE_ARCH.zip"
+          (
+            cd "$output"
+            shasum -a 256 ./*.dmg ./*.zip > SHA256SUMS.txt
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+          {
+            echo "## macOS $PACKAGE_ARCH packages"
+            echo
+            echo "Version: $version"
+            echo
+            echo '- DMG installer'
+            echo '- Application ZIP (preserves macOS permissions and metadata)'
+            echo '- SHA256SUMS.txt and LICENSE'
+            echo
+            echo 'Applications use ad-hoc signing and are not Apple-notarized.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remote-ssh-brige-macos-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            .artifacts/packages/*.dmg
+            .artifacts/packages/*.zip
+            .artifacts/packages/SHA256SUMS.txt
+            .artifacts/packages/LICENSE
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload macOS protocol test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: protocol-test-report-macos-${{ matrix.arch }}-${{ github.run_number }}
+          path: .artifacts/integration-*/report.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove temporary test keychain
+        if: always()
+        run: |
+          test_keychain="$RUNNER_TEMP/remote-ssh-brige-test.keychain-db"
+          if [ -f "$test_keychain" ]; then
+            security delete-keychain "$test_keychain"
+          fi

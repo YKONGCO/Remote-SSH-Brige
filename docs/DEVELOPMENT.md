@@ -2,24 +2,34 @@
 
 ## 环境与启动
 
-开发命令直接使用系统 PATH 中的 Node.js、Cargo 和本地 npm 依赖。Node.js 支持范围见 `package.json` 的 `engines`，推荐 24.15+ 的 24.x 版本；Rust 使用 stable。Windows 还需 Microsoft C++ Build Tools、WebView2 Runtime 和 Perl，推荐 Rust MSVC 工具链。其他平台的桌面构建与打包尚未验证。
+开发命令直接使用系统 PATH 中的 Node.js、Cargo 和本地 npm 依赖。Node.js 支持范围见 `package.json` 的 `engines`，推荐 24.15+ 的 24.x 版本；Rust 使用 stable。Windows 还需 Microsoft C++ Build Tools、WebView2 Runtime 和 Perl，推荐 Rust MSVC 工具链。macOS 需安装 Xcode Command Line Tools，可使用 `xcode-select --install`；Linux 构建尚未验证。
 
 ```sh
 npm ci
 npm run desktop
 ```
 
-`npm run dev` 启动浏览器演示，`npm run desktop` 通过 Tauri 启动桌面应用，`npm run desktop:build` 构建发行程序与 NSIS 安装包。
+`npm run dev` 启动浏览器演示，`npm run desktop` 通过 Tauri 启动桌面应用，`npm run desktop:build` 构建发行程序及平台安装包。macOS 自动合并 `src-tauri/tauri.macos.conf.json`，使用 ICNS 图标并生成 `.app` 和 `.dmg`；Windows 使用 NSIS。
 
 ## 验证
 
 ### GitHub Actions
 
-默认分支为 `main`。`.github/workflows/build.yml` 在推送 `main`、针对 `main` 的 Pull Request、`v*` 标签或手动触发时运行，使用 Windows 2022、Node.js 24 和 Rust stable MSVC。
+默认分支为 `main`。`.github/workflows/build.yml` 在推送 `main`、针对 `main` 的 Pull Request、`v*` 标签或手动触发时运行，使用 Node.js 24 和 Rust stable，包含以下独立构建：
 
-流程检查 Rust 格式、界面测试、后端测试和 MCP/SSH 协议测试，然后构建 NSIS 安装程序及便携 ZIP，生成 `SHA256SUMS.txt`。安装包、便携包和协议测试报告上传到对应运行的 Artifacts，保留 14 天。测试报告仅上传 `report.json`，不包含测试密钥和数据库。
+| 平台                | Runner           | Rust target              |
+| ------------------- | ---------------- | ------------------------ |
+| Windows x64         | `windows-2022`   | `x86_64-pc-windows-msvc` |
+| macOS Apple Silicon | `macos-15`       | `aarch64-apple-darwin`   |
+| macOS Intel         | `macos-15-intel` | `x86_64-apple-darwin`    |
 
-当前仅构建 Windows x64，产物未签名。便携程序需要 Microsoft WebView2 Runtime；流程不创建 GitHub Release。第三方 Actions 固定到提交 SHA，更新时同时核对对应版本。
+各平台检查 Rust 格式、界面测试、后端测试和 MCP/SSH 协议测试，再生成对应安装包、应用 ZIP 和 `SHA256SUMS.txt`。安装包、ZIP 和协议测试报告上传到对应运行的 Artifacts，保留 14 天。测试报告仅上传 `report.json`，不包含测试密钥和数据库。缓存按操作系统和架构隔离。
+
+Windows 产物未签名，便携程序需要 Microsoft WebView2 Runtime。macOS 使用 `signingIdentity: "-"` 进行 ad-hoc 签名，不依赖开发者证书，不进行 Apple 公证，不能视为受信任发布者签名；下载后仍可能受到 Gatekeeper 限制。应用 ZIP 使用 `ditto` 保留可执行权限和应用元数据，并在上传前验证应用签名和校验文件。
+
+macOS 测试在临时钥匙串中验证凭据保存、读取和删除，任务结束时删除该钥匙串。构建成功不替代真实 Mac 上的窗口、托盘、SSH Agent 和文件操作验收。
+
+流程不创建 GitHub Release。第三方 Actions 固定到提交 SHA，更新时同时核对对应版本。
 
 ### 本地验证
 

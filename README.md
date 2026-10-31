@@ -2,7 +2,7 @@
 
 通过 MCP 将 SSH 服务器的命令执行、文件操作和持久终端提供给 AI Agent，并在桌面端统一管理连接、权限、审批和审计。
 
-基于 Tauri 2、React、TypeScript 和 Rust 构建，使用 SQLite 保存配置，通过 SSH / SFTP 访问远程服务器。当前主要支持 Windows，其他平台的构建与打包尚未验证。
+基于 Tauri 2、React、TypeScript 和 Rust 构建，使用 SQLite 保存配置，通过 SSH / SFTP 访问远程服务器。提供 Windows x64，以及 macOS Apple Silicon（arm64）和 Intel（x64）的自动构建；macOS 桌面交互仍需实机验收。
 
 ## 功能
 
@@ -20,6 +20,7 @@
 - Node.js **24.15 或更高的 24.x 版本**，以及 npm。
 - Rust stable；Windows 推荐使用 MSVC 工具链。
 - Windows 开发环境：Microsoft C++ Build Tools、WebView2 Runtime，以及构建内置 OpenSSL 所需的 Perl。
+- macOS 开发环境：Xcode Command Line Tools（`xcode-select --install`）；构建时会自动使用 macOS 专用配置。
 
 ### 从源码运行
 
@@ -71,7 +72,12 @@ MCP 默认仅监听本机；远程接入需显式修改监听地址。跨不可�
 
 ## 构建与验证
 
-推送到 `main`、提交针对 `main` 的 Pull Request 或推送 `v*` 标签时，GitHub Actions 会自动测试并构建 Windows x64 安装包。也可在仓库的 [Actions 页面](https://github.com/YKONGCO/Remote-SSH-Brige/actions/workflows/build.yml) 手动运行；构建成功后，在对应运行的 Artifacts 中下载 NSIS 安装程序、便携 ZIP 和 SHA-256 校验文件。构建产物保留 14 天，当前未签名。
+推送到 `main`、提交针对 `main` 的 Pull Request 或推送 `v*` 标签时，GitHub Actions 会自动测试并构建桌面安装包。也可在仓库的 [Actions 页面](https://github.com/YKONGCO/Remote-SSH-Brige/actions/workflows/build.yml) 手动运行；产物在对应运行的 Artifacts 中保留 14 天。
+
+| 平台                        | 构建产物                                  | 签名状态                       |
+| --------------------------- | ----------------------------------------- | ------------------------------ |
+| Windows x64                 | NSIS 安装程序、便携 ZIP、SHA-256 校验文件 | 未签名                         |
+| macOS Apple Silicon / Intel | DMG、应用 ZIP、SHA-256 校验文件           | ad-hoc 签名，未进行 Apple 公证 |
 
 ```sh
 # 生成桌面程序和安装包
@@ -83,7 +89,7 @@ npm run test:ui
 npm test
 ```
 
-默认 Windows 程序位于 `src-tauri/target/release/remote-ssh-brige.exe`，安装包位于 `src-tauri/target/release/bundle/`。协议测试、无窗口服务和项目结构见 [开发指南](docs/DEVELOPMENT.md)。
+默认 Windows 程序位于 `src-tauri/target/release/remote-ssh-brige.exe`，macOS 应用位于 `src-tauri/target/release/bundle/macos/Remote SSH Brige.app`，安装包位于 `src-tauri/target/release/bundle/` 的对应子目录。协议测试、无窗口服务和项目结构见 [开发指南](docs/DEVELOPMENT.md)。
 
 ## 文档
 

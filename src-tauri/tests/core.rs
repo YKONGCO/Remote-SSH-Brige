@@ -454,7 +454,7 @@ async fn mcp_start_stop_and_restart_releases_listener() {
     cleanup(dir);
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[test]
 fn password_is_stored_in_system_keyring_and_removed_with_host() {
     let dir = workspace();
