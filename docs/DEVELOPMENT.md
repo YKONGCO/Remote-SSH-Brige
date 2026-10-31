@@ -29,6 +29,8 @@ Windows 产物未签名，便携程序需要 Microsoft WebView2 Runtime。macOS 
 
 macOS 测试在临时钥匙串中验证凭据保存、读取和删除，任务结束时删除该钥匙串。构建成功不替代真实 Mac 上的窗口、托盘、SSH Agent 和文件操作验收。
 
+macOS CI 先使用 Tauri 生成已做 ad-hoc 签名的 `.app`，再通过 `hdiutil create -srcfolder` 直接创建包含应用和 Applications 链接的 DMG，不使用需要手动挂载映像的 Finder 布局脚本。镜像生成失败时最多重试三次，并通过 `hdiutil verify` 检查；即使打包失败，也会尝试保存 Rust 构建缓存。
+
 流程不创建 GitHub Release。第三方 Actions 固定到提交 SHA，更新时同时核对对应版本。
 
 ### 本地验证

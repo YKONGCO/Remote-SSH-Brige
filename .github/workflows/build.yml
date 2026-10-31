@@ -187,8 +187,9 @@ jobs:
           clang --version
           perl --version
 
-      - name: Cache Rust dependencies and build output
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Rust dependencies and build output
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -227,8 +228,8 @@ jobs:
       - name: Test MCP and SSH protocol
         run: npm run test:e2e
 
-      - name: Build macOS app and disk image
-        run: npm run desktop:build -- --ci --bundles app,dmg -- --locked
+      - name: Build macOS application
+        run: npm run desktop:build -- --ci --bundles app -- --locked
 
       - name: Prepare downloadable macOS packages
         env:
@@ -240,15 +241,25 @@ jobs:
           app='src-tauri/target/release/bundle/macos/Remote SSH Brige.app'
           test -d "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          shopt -s nullglob
-          images=(src-tauri/target/release/bundle/dmg/*.dmg)
-          if [ "${#images[@]}" -ne 1 ]; then
-            echo 'Expected exactly one DMG installer.' >&2
-            exit 1
-          fi
           mkdir -p "$output"
-          cp "${images[0]}" "$output/"
           cp LICENSE "$output/"
+          image_source="$RUNNER_TEMP/remote-ssh-brige-dmg"
+          mkdir -p "$image_source"
+          ditto "$app" "$image_source/Remote SSH Brige.app"
+          cp LICENSE "$image_source/"
+          ln -s /Applications "$image_source/Applications"
+          image="$output/remote-ssh-brige-$version-macos-$PACKAGE_ARCH.dmg"
+          for attempt in 1 2 3; do
+            if hdiutil create -volname 'Remote SSH Brige' -srcfolder "$image_source" -ov -format UDZO "$image"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo 'DMG creation failed after three attempts.' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          hdiutil verify "$image"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$output/remote-ssh-brige-$version-macos-$PACKAGE_ARCH.zip"
           (
             cd "$output"
@@ -290,6 +301,16 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Save Rust build cache
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
       - name: Remove temporary test keychain
         if: always()
