@@ -13,6 +13,16 @@ npm run desktop
 
 ## 验证
 
+### GitHub Actions
+
+默认分支为 `main`。`.github/workflows/build.yml` 在推送 `main`、针对 `main` 的 Pull Request、`v*` 标签或手动触发时运行，使用 Windows 2022、Node.js 24 和 Rust stable MSVC。
+
+流程检查 Rust 格式、界面测试、后端测试和 MCP/SSH 协议测试，然后构建 NSIS 安装程序及便携 ZIP，生成 `SHA256SUMS.txt`。安装包、便携包和协议测试报告上传到对应运行的 Artifacts，保留 14 天。测试报告仅上传 `report.json`，不包含测试密钥和数据库。
+
+当前仅构建 Windows x64，产物未签名。便携程序需要 Microsoft WebView2 Runtime；流程不创建 GitHub Release。第三方 Actions 固定到提交 SHA，更新时同时核对对应版本。
+
+### 本地验证
+
 ```sh
 # TypeScript 检查与前端生产构建
 npm run build

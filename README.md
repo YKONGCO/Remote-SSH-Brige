@@ -71,6 +71,8 @@ MCP 默认仅监听本机；远程接入需显式修改监听地址。跨不可�
 
 ## 构建与验证
 
+推送到 `main`、提交针对 `main` 的 Pull Request 或推送 `v*` 标签时，GitHub Actions 会自动测试并构建 Windows x64 安装包。也可在仓库的 [Actions 页面](https://github.com/YKONGCO/Remote-SSH-Brige/actions/workflows/build.yml) 手动运行；构建成功后，在对应运行的 Artifacts 中下载 NSIS 安装程序、便携 ZIP 和 SHA-256 校验文件。构建产物保留 14 天，当前未签名。
+
 ```sh
 # 生成桌面程序和安装包
 npm run desktop:build

@@ -1,0 +1,140 @@
+name: Build Windows packages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Set up Rust MSVC
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup component add rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          perl --version
+
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: windows-msvc-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            windows-msvc-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Test user interface
+        run: npm run test:ui
+
+      - name: Test Rust backend
+        run: npm test -- --locked
+
+      - name: Build protocol test service
+        run: npm run build:headless -- --locked
+
+      - name: Test MCP and SSH protocol
+        run: npm run test:e2e
+
+      - name: Build desktop installer
+        run: npm run desktop:build -- --ci --bundles nsis -- --locked
+
+      - name: Prepare downloadable packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $output = Join-Path $PWD '.artifacts/packages'
+          $portable = Join-Path $output 'portable'
+          New-Item -ItemType Directory -Path $portable -Force | Out-Null
+
+          $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer.' }
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          Copy-Item -LiteralPath 'src-tauri/target/release/remote-ssh-brige.exe', 'LICENSE' -Destination $portable
+          @(
+            "Remote SSH Brige $version - Windows x64"
+            'Run remote-ssh-brige.exe. Microsoft WebView2 Runtime must be installed.'
+            'This build is unsigned. See LICENSE for the MIT license.'
+          ) | Set-Content -LiteralPath (Join-Path $portable 'README.txt') -Encoding utf8
+          Compress-Archive -Path "$portable/*" -DestinationPath (Join-Path $output "remote-ssh-brige-$version-windows-x64-portable.zip")
+
+          $checksums = Get-ChildItem -LiteralPath $output -File |
+            Sort-Object Name |
+            ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
+          [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), [string[]]$checksums, [Text.UTF8Encoding]::new($false))
+          @(
+            '## Windows x64 packages'
+            ''
+            "Version: $version"
+            ''
+            '- NSIS installer'
+            '- Portable ZIP (requires WebView2 Runtime)'
+            '- SHA256SUMS.txt'
+            ''
+            'Download these files from the workflow artifacts. Packages are unsigned.'
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remote-ssh-brige-windows-x64-${{ github.run_number }}
+          path: |
+            .artifacts/packages/*.exe
+            .artifacts/packages/*.zip
+            .artifacts/packages/SHA256SUMS.txt
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload protocol test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: protocol-test-report-${{ github.run_number }}
+          path: .artifacts/integration-*/report.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
