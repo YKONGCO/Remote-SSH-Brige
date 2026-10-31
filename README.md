@@ -71,7 +71,6 @@ Tauri 2 / Rust / React / TypeScript
 | 权限与审批 | 逐项授权、全局只读、命令策略，以及可选的敏感操作人工审批     |
 | 操作记录   | 本地 SQLite 审计，支持筛选、详情查看和 JSON 导出             |
 
-![MCP 服务与 Agent 客户端接入界面](assets/image2.png)
 
 ## 快速开始
 
