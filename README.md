@@ -20,7 +20,6 @@ Tauri 2 / Rust / React / TypeScript
 
 支持 **Claude Code、Codex、Gemini CLI、OpenCode、Cursor 和 Pi** 一键配置接入。
 
-![服务器管理界面](assets/image.png)
 
 ## 核心思想
 
