@@ -23,7 +23,8 @@ import {
   Search,
   Code2,
 } from "lucide-react";
-import { api, operate } from "../api";
+import { api, desktop, operate } from "../api";
+import { chooseBrowserSave } from "../save-file";
 import type { RuntimeSettings } from "../runtime-settings";
 import type { Server, FileEntry, FilePreview as Preview } from "../types";
 export function Files({
@@ -59,6 +60,7 @@ export function Files({
     entry?: FileEntry;
   } | null>(null);
   const upload = useRef<HTMLInputElement>(null);
+  const downloading = useRef(new Set<string>());
   const load = async (p = path) => {
     if (!server) return;
     setBusy(true);
@@ -137,22 +139,33 @@ export function Files({
     }
   };
   const download = async (entry: FileEntry) => {
+    if (downloading.current.has(entry.path)) return;
+    downloading.current.add(entry.path);
     try {
+      if (desktop) {
+        const saved = await api<boolean>("download_file", {
+          serverId: server!.id,
+          path: entry.path,
+          name: entry.name,
+        });
+        if (saved) notify("文件已保存");
+        return;
+      }
+      const save = await chooseBrowserSave(entry.name);
+      if (!save) return;
       const data = await operate<{ base64: string }>({
         kind: "download",
         server_id: server!.id,
         path: entry.path,
       });
       const bytes = Uint8Array.from(atob(data.base64), (c) => c.charCodeAt(0));
-      const url = URL.createObjectURL(new Blob([bytes]));
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = entry.name;
-      anchor.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      refresh();
+      await save(new Blob([bytes]));
+      notify("文件已保存");
     } catch (e) {
       notify(String(e), true);
+    } finally {
+      downloading.current.delete(entry.path);
+      refresh();
     }
   };
   const visibleEntries = entries.filter(

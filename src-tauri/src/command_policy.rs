@@ -5,12 +5,13 @@ use anyhow::{ensure, Context, Result};
 use tree_sitter::{Node, Parser};
 
 pub fn check(command: &str, settings: &RuntimeSettings) -> Result<()> {
-    inspect(
-        command,
-        &settings.effective_command_policy(),
-        settings.block_dangerous_commands,
-        0,
-    )
+    let policy = settings.effective_command_policy();
+    policy.validate()?;
+    ensure!(
+        policy.execution_mode.as_deref() != Some("disabled"),
+        "命令执行已禁止"
+    );
+    inspect(command, &policy, settings.block_dangerous_commands, 0)
 }
 
 fn inspect(
@@ -67,7 +68,8 @@ fn inspect(
             | "arithmetic_expansion"
             | "brace_expression" => {
                 ensure!(
-                    policy.allow_scripts && !policy.diagnostic_only,
+                    policy.allow_scripts
+                        && (!policy.diagnostic_only || policy.execution_mode.is_some()),
                     "命令保护：未允许脚本、变量或控制结构"
                 );
             }
@@ -133,7 +135,11 @@ fn inspect_command(
         .context("命令保护：无法确定命令名")?;
     if has_dynamic(name) {
         ensure!(
-            policy.allow_scripts && !policy.diagnostic_only && !block_dangerous,
+            policy.allow_scripts
+                && !policy.diagnostic_only
+                && !block_dangerous
+                && policy.execution_mode.as_deref() != Some("whitelist")
+                && policy.blocked_commands.is_empty(),
             "命令保护：无法静态确定命令名"
         );
     }
@@ -148,7 +154,7 @@ fn inspect_command(
             .unwrap_or_else(|| raw.to_string());
         words.push(value);
     }
-    if policy.diagnostic_only {
+    if policy.diagnostic_only && policy.execution_mode.is_none() {
         crate::security::check_diagnostic_words(&words)?;
     }
     inspect_words(&words, policy, block_dangerous, nesting)
@@ -171,7 +177,47 @@ fn inspect_words(
     let name = basename(first);
     let args = &words[1..];
     ensure!(
-        !(block_dangerous || policy.diagnostic_only)
+        !policy
+            .blocked_commands
+            .iter()
+            .any(|rule| if rule.contains('/') {
+                rule == first
+            } else {
+                rule == name
+            }),
+        "命令保护：黑名单已拦截「{name}」"
+    );
+    if policy.execution_mode.as_deref() == Some("whitelist") {
+        let system_name = !first.contains('/')
+            || ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
+                .iter()
+                .any(|prefix| {
+                    first
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| !rest.contains('/'))
+                });
+        ensure!(
+            policy
+                .allowed_commands
+                .iter()
+                .any(|rule| rule == first || (!rule.contains('/') && system_name && rule == name)),
+            "命令保护：「{name}」不在白名单中"
+        );
+        // Preserve parameter restrictions for built-in diagnostic commands.
+        if crate::model::default_allowed_commands()
+            .iter()
+            .any(|command| command == name)
+        {
+            let mut diagnostic = words.to_vec();
+            diagnostic[0] = name.to_owned();
+            crate::security::check_diagnostic_words(&diagnostic)?;
+        }
+    }
+    ensure!(
+        !(block_dangerous
+            || policy.diagnostic_only
+            || policy.execution_mode.as_deref() == Some("whitelist")
+            || !policy.blocked_commands.is_empty())
             || !first.chars().any(|c| "$`*?[]{}".contains(c)),
         "命令保护：无法静态确定命令名"
     );

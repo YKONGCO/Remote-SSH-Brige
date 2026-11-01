@@ -39,7 +39,7 @@ impl Default for RuntimeSettings {
 }
 impl RuntimeSettings {
     pub fn effective_command_policy(&self) -> CommandPolicy {
-        self.command_policy.clone().unwrap_or_else(|| {
+        let mut policy = self.command_policy.clone().unwrap_or_else(|| {
             if self.block_dangerous_commands {
                 CommandPolicy::default()
             } else {
@@ -51,11 +51,26 @@ impl RuntimeSettings {
                     allow_scripts: true,
                     allow_substitution: true,
                     allow_mcp_terminal: true,
+                    ..Default::default()
                 }
             }
-        })
+        });
+        if let Some(mode) = &policy.execution_mode {
+            policy.diagnostic_only = mode == "whitelist";
+        }
+        if let Some(advanced) = policy.allow_advanced_shell {
+            policy.allow_pipes = advanced;
+            policy.allow_redirection = advanced;
+            policy.allow_compound = advanced;
+            policy.allow_scripts = advanced;
+            policy.allow_substitution = advanced;
+        }
+        policy
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(policy) = &self.command_policy {
+            policy.validate()?;
+        }
         anyhow::ensure!(
             ["off", "mcp", "all"].contains(&self.approval_mode.as_str()),
             "无效的审批模式"
@@ -93,6 +108,12 @@ impl RuntimeSettings {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
+    pub allowed_commands: Vec<String>,
+    pub blocked_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_advanced_shell: Option<bool>,
     pub diagnostic_only: bool,
     pub allow_pipes: bool,
     pub allow_redirection: bool,
@@ -104,6 +125,10 @@ pub struct CommandPolicy {
 impl Default for CommandPolicy {
     fn default() -> Self {
         Self {
+            execution_mode: None,
+            allowed_commands: default_allowed_commands(),
+            blocked_commands: vec![],
+            allow_advanced_shell: None,
             diagnostic_only: true,
             allow_pipes: false,
             allow_redirection: false,
@@ -112,6 +137,47 @@ impl Default for CommandPolicy {
             allow_substitution: false,
             allow_mcp_terminal: false,
         }
+    }
+}
+
+pub fn default_allowed_commands() -> Vec<String> {
+    [
+        "pwd", "ls", "cat", "head", "tail", "stat", "file", "du", "df", "free", "uptime", "whoami",
+        "id", "uname", "date", "hostname", "ps", "ss", "netstat", "wc", "readlink", "realpath",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+impl CommandPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.execution_mode
+                .as_deref()
+                .is_none_or(|mode| matches!(mode, "disabled" | "whitelist" | "unrestricted")),
+            "无效的命令执行范围"
+        );
+        for list in [&self.allowed_commands, &self.blocked_commands] {
+            anyhow::ensure!(list.len() <= 256, "每个命令名单最多 256 项");
+            for name in list {
+                anyhow::ensure!(
+                    !name.is_empty()
+                        && name.chars().count() <= 512
+                        && name
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || "_.+-/".contains(c))
+                        && (!name.contains('/')
+                            || (name.starts_with('/')
+                                && name
+                                    .split('/')
+                                    .skip(1)
+                                    .all(|part| !part.is_empty() && part != "." && part != ".."))),
+                    "命令名单只能填写命令名称或完整路径，不能包含参数、通配符或 Shell 语法"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

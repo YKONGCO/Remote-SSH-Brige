@@ -37,6 +37,18 @@ export interface Session {
   created_at: string;
   alive: boolean;
 }
+export interface AuditQuery {
+  category: string;
+  search: string;
+  offset: number;
+  limit: number;
+  upper?: number;
+}
+export interface AuditPage {
+  entries: Audit[];
+  total: number;
+  upper: number;
+}
 export interface McpStatus {
   running: boolean;
   host?: string;

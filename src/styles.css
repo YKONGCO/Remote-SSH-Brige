@@ -2296,6 +2296,27 @@
     overflow: auto;
     overscroll-behavior: contain;
   }
+  .audit-load-status {
+    padding: 16px;
+    text-align: center;
+    color: var(--ink-tertiary);
+    font-size: 12px;
+  }
+  .command-list-editors {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .command-list-editors label {
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+  }
+  .audit-page .audit-spacer td {
+    padding: 0;
+    border: 0;
+  }
   .audit-page .audit-table thead th {
     position: sticky;
     top: 0;

@@ -4,8 +4,16 @@ import {
   MAX_TRANSFER_MIB,
   type RuntimeSettings,
 } from "./runtime-settings";
+import { defaultAllowedCommands, validCommandLists } from "./runtime-settings";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { Snapshot, Server, Operation, FileEntry } from "./types";
+import type {
+  Snapshot,
+  Server,
+  Operation,
+  FileEntry,
+  AuditQuery,
+} from "./types";
+import { chooseBrowserSave } from "./save-file";
 import { newServer } from "./types";
 import { clientNames } from "./mcp-clients";
 export const desktop = isTauri();
@@ -156,7 +164,14 @@ export async function api<T = unknown>(
     if (
       next.command_policy != null &&
       (Object.keys(next.command_policy).some(
-        (key) => !(key in defaultCommandPolicy),
+        (key) =>
+          !(key in defaultCommandPolicy) &&
+          ![
+            "execution_mode",
+            "allowed_commands",
+            "blocked_commands",
+            "allow_advanced_shell",
+          ].includes(key),
       ) ||
         Object.keys(defaultCommandPolicy).some(
           (key) =>
@@ -166,6 +181,20 @@ export async function api<T = unknown>(
         ))
     )
       throw new Error("命令权限设置无效");
+    if (
+      next.command_policy &&
+      ((next.command_policy.execution_mode !== undefined &&
+        !["disabled", "whitelist", "unrestricted"].includes(
+          next.command_policy.execution_mode,
+        )) ||
+        (next.command_policy.allow_advanced_shell !== undefined &&
+          typeof next.command_policy.allow_advanced_shell !== "boolean") ||
+        !validCommandLists(
+          next.command_policy.allowed_commands ?? defaultAllowedCommands,
+          next.command_policy.blocked_commands ?? [],
+        ))
+    )
+      throw new Error("命令名单或执行范围无效");
     for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
       if (
         !Number.isInteger(next[key]) ||
@@ -177,7 +206,57 @@ export async function api<T = unknown>(
     demoSettings = { ...next };
     return structuredClone(demoSettings) as T;
   }
-  if (command === "snapshot") return structuredClone(demo) as T;
+  if (command === "snapshot")
+    return structuredClone({ ...demo, audits: [] }) as T;
+  if (command === "audit_page" || command === "export_audits") {
+    const query = args.query as AuditQuery;
+    const upper = query.upper ?? demo.audits.length;
+    const entries = demo.audits
+      .slice(0, upper)
+      .reverse()
+      .filter(
+        (a) =>
+          (query.category === "all" ||
+            (query.category === "mcp" && a.source === "mcp") ||
+            (query.category === "error" &&
+              (!a.success || a.kind === "security_reject")) ||
+            (query.category === "exec" && a.kind === "exec") ||
+            (query.category === "files" &&
+              [
+                "list_files",
+                "read_file",
+                "preview_file",
+                "write_file",
+                "edit_file",
+                "remove_path",
+                "mkdir",
+                "remove",
+                "rename",
+                "upload",
+                "download",
+              ].includes(a.kind))) &&
+          (a.server_name + " " + a.detail + " " + a.kind)
+            .toLowerCase()
+            .includes(query.search.toLowerCase()),
+      );
+    if (command === "export_audits") {
+      const save = await chooseBrowserSave("操作记录.json");
+      if (!save) return false as T;
+      await save(
+        new Blob([JSON.stringify(entries, null, 2)], {
+          type: "application/json",
+        }),
+      );
+      return true as T;
+    }
+    return {
+      entries: entries
+        .slice(query.offset, query.offset + query.limit)
+        .map(({ response: _response, ...entry }) => entry),
+      total: entries.length,
+      upper,
+    } as T;
+  }
   if (command === "audit_details") {
     const entry = demo.audits.find((entry) => entry.id === args.id);
     if (!entry) throw new Error("记录不存在");

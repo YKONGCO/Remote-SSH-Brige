@@ -720,6 +720,99 @@ fn sqlite_retains_audit_history_beyond_recent_list_and_after_server_removal() {
     assert!(state.audit_details(&oldest).unwrap().success);
     let all = persisted_audits(&dir);
     assert_eq!(all.len(), 503);
+    use remote_ssh_brige_lib::database::AuditQuery;
+    let mut query = AuditQuery {
+        category: "all".into(),
+        limit: 50,
+        ..Default::default()
+    };
+    let first = state.audit_page(&query).unwrap();
+    assert_eq!(first.total, 503);
+    assert_eq!(first.entries.len(), 50);
+    assert!(first.entries.iter().all(|entry| entry.response.is_none()));
+    query.upper = Some(first.upper);
+    query.offset = 500;
+    let last = state.audit_page(&query).unwrap();
+    assert_eq!(last.entries.len(), 3);
+    assert_eq!(last.entries.last().unwrap().id, oldest);
+    let output = dir.join("export.json");
+    state.export_audits(&query, &output).unwrap();
+    let exported: Vec<remote_ssh_brige_lib::model::Audit> =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(exported.len(), 503); // Export ignores the visible page's offset/limit.
+    assert!(exported.iter().all(|entry| entry.response.is_some()));
+    assert!(state.snapshot_with_audits(false)["audits"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
+fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
+    use remote_ssh_brige_lib::database::AuditQuery;
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    for index in 0..120 {
+        state
+            .log(
+                &saved,
+                if index % 2 == 0 { "mcp" } else { "desktop" },
+                &Operation {
+                    kind: if index % 3 == 0 { "exec" } else { "download" }.into(),
+                    command: format!("echo Needle_{index}"),
+                    path: format!("/Needle_{index}"),
+                    ..Default::default()
+                },
+                &Ok(serde_json::json!({"exit_code": if index % 4 == 0 { 1 } else { 0 }})),
+                1,
+            )
+            .unwrap();
+    }
+    let mut query = AuditQuery {
+        category: "all".into(),
+        limit: 50,
+        ..Default::default()
+    };
+    let first = state.audit_page(&query).unwrap();
+    assert_eq!(first.total, 120);
+    state
+        .log(
+            &saved,
+            "desktop",
+            &Operation {
+                kind: "security_reject".into(),
+                ..Default::default()
+            },
+            &Ok(serde_json::json!({})),
+            0,
+        )
+        .unwrap();
+    query.upper = Some(first.upper);
+    query.offset = 50;
+    let second = state.audit_page(&query).unwrap();
+    assert_eq!(second.total, 120);
+    assert!(second
+        .entries
+        .iter()
+        .all(|entry| !first.entries.iter().any(|previous| previous.id == entry.id)));
+    query.offset = 0;
+    query.upper = None;
+    query.category = "error".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 31);
+    query.category = "exec".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 40);
+    query.category = "files".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 80);
+    query.category = "mcp".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 60);
+    query.category = "all".into();
+    query.search = "needle_119".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 1);
+    query.search = "%".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 0); // Search characters are literal.
     drop(state);
     cleanup(dir);
 }

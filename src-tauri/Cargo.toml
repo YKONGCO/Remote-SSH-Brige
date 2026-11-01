@@ -12,12 +12,13 @@ crate-type = ["rlib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance"]
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-dialog"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
+tauri-plugin-dialog = { version = "2", optional = true }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 tauri-plugin-single-instance = { version = "2", optional = true }
 tauri = { version = "2", features = ["tray-icon"], optional = true }

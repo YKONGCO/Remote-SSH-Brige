@@ -11,7 +11,104 @@ const AUDIT_COLUMNS: &str =
 pub struct Database {
     connection: Connection,
 }
+
+#[derive(Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct AuditQuery {
+    pub category: String,
+    pub search: String,
+    pub offset: u32,
+    pub limit: u32,
+    pub upper: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct AuditPage {
+    pub entries: Vec<Audit>,
+    pub total: u64,
+    pub upper: i64,
+}
+
+const AUDIT_FILTER: &str = "sequence <= ?1 AND
+    (?2 IN ('', 'all') OR (?2='mcp' AND source='mcp')
+    OR (?2='error' AND (success=0 OR kind='security_reject'))
+    OR (?2='exec' AND kind='exec')
+    OR (?2='files' AND kind IN ('list_files','read_file','preview_file','write_file','edit_file','remove_path','mkdir','remove','rename','upload','download')))
+    AND (?3='' OR instr(lower(server_name || ' ' || detail || ' ' || kind), lower(?3)) > 0)";
+
 impl Database {
+    pub fn open_reader(dir: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            dir.join(DATABASE_FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { connection })
+    }
+
+    pub fn audit_page(&self, query: &AuditQuery) -> Result<AuditPage> {
+        let upper = match query.upper {
+            Some(value) => value,
+            None => self.connection.query_row(
+                "SELECT coalesce(max(sequence),0) FROM audit_entries",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        let total: i64 = self.connection.query_row(
+            &format!("SELECT count(*) FROM audit_entries WHERE {AUDIT_FILTER}"),
+            params![upper, query.category, query.search],
+            |row| row.get(0),
+        )?;
+        // List pages never read or deserialize response payloads.
+        let columns = AUDIT_COLUMNS.replace("response_json", "NULL");
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {columns} FROM audit_entries WHERE {AUDIT_FILTER} ORDER BY sequence DESC LIMIT ?4 OFFSET ?5"
+        ))?;
+        let entries = statement
+            .query_map(
+                params![
+                    upper,
+                    query.category,
+                    query.search,
+                    query.limit.clamp(1, 100),
+                    query.offset
+                ],
+                audit_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(AuditPage {
+            entries,
+            total: total as u64,
+            upper,
+        })
+    }
+
+    pub fn export_audits(&self, query: &AuditQuery, writer: impl std::io::Write) -> Result<()> {
+        let mut writer = std::io::BufWriter::new(writer);
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {AUDIT_COLUMNS} FROM audit_entries WHERE {AUDIT_FILTER} ORDER BY sequence DESC"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                query.upper.unwrap_or(i64::MAX),
+                query.category,
+                query.search
+            ],
+            audit_row,
+        )?;
+        use std::io::Write;
+        writer.write_all(b"[\n")?;
+        for (index, row) in rows.enumerate() {
+            if index > 0 {
+                writer.write_all(b",\n")?;
+            }
+            serde_json::to_writer(&mut writer, &row?)?;
+        }
+        writer.write_all(b"\n]\n")?;
+        writer.flush()?;
+        Ok(())
+    }
     pub fn settings(&self) -> Result<crate::model::RuntimeSettings> {
         let json: Option<String> = self
             .connection

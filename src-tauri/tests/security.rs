@@ -6,6 +6,186 @@ use remote_ssh_brige_lib::{
 use std::sync::Arc;
 
 #[test]
+fn editable_command_lists_apply_to_nested_commands_and_preserve_blacklist_priority() {
+    use remote_ssh_brige_lib::model::CommandPolicy;
+    let mut settings = RuntimeSettings {
+        block_dangerous_commands: false,
+        command_policy: Some(CommandPolicy {
+            execution_mode: Some("whitelist".into()),
+            allowed_commands: [
+                "ls",
+                "grep",
+                "bash",
+                "echo",
+                "sudo",
+                "env",
+                "date",
+                "/opt/report",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            blocked_commands: vec!["grep".into(), "rm".into()],
+            allow_advanced_shell: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let check = |command: &str, settings: &RuntimeSettings| {
+        security::check_command_with_settings(command, settings)
+    };
+    for command in ["ls", "/usr/bin/ls", "echo hello && ls", "/opt/report"] {
+        assert!(check(command, &settings).is_ok(), "{command}");
+    }
+    for command in [
+        "grep error /tmp/log",
+        "ls | grep error",
+        "echo $(grep error /tmp/log)",
+        "bash -c 'grep error /tmp/log'",
+        "sudo grep error /tmp/log",
+        "env grep error /tmp/log",
+        "g''rep error /tmp/log",
+        "/tmp/grep error /tmp/log",
+    ] {
+        assert!(
+            check(command, &settings)
+                .unwrap_err()
+                .to_string()
+                .contains("黑名单"),
+            "{command}"
+        );
+    }
+    for command in [
+        "/tmp/ls",
+        "/opt/report-other",
+        "hostname",
+        "date -s tomorrow",
+    ] {
+        assert!(check(command, &settings).is_err(), "{command}");
+    }
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allowed_commands
+        .clear();
+    assert!(check("ls", &settings).is_err());
+    settings.command_policy.as_mut().unwrap().execution_mode = Some("unrestricted".into());
+    assert!(check("hostname", &settings).is_ok());
+    assert!(check("sudo rm /tmp/file", &settings).is_err());
+    assert!(check("/opt/rm /tmp/file", &settings).is_err());
+    assert!(check("bash -c 'rm /tmp/file'", &settings).is_err());
+    settings.command_policy.as_mut().unwrap().execution_mode = Some("disabled".into());
+    assert!(check("ls", &settings)
+        .unwrap_err()
+        .to_string()
+        .contains("已禁止"));
+}
+
+#[test]
+fn grouped_shell_permission_is_independent_of_mode_lists_and_terminal_access() {
+    use remote_ssh_brige_lib::model::CommandPolicy;
+    let mut settings = RuntimeSettings {
+        command_policy: Some(CommandPolicy {
+            execution_mode: Some("whitelist".into()),
+            allowed_commands: ["ls", "head", "echo", "bash", "pwd"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            allow_advanced_shell: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let commands = [
+        "ls | head",
+        "ls && pwd",
+        "ls > /tmp/output",
+        "echo $(pwd)",
+        "bash -c 'ls'",
+        "for x in a b; do echo $x; done",
+    ];
+    for command in commands {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_err(),
+            "{command}"
+        );
+    }
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allow_advanced_shell = Some(true);
+    for command in commands {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_ok(),
+            "{command}"
+        );
+    }
+    assert!(!settings.effective_command_policy().allow_mcp_terminal);
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .blocked_commands
+        .push("head".into());
+    assert!(security::check_command_with_settings("ls | head", &settings).is_err());
+}
+
+#[test]
+fn command_list_validation_and_persistence_preserve_explicit_empty_lists() {
+    use remote_ssh_brige_lib::model::CommandPolicy;
+    let mut settings = RuntimeSettings {
+        command_policy: Some(CommandPolicy {
+            execution_mode: Some("whitelist".into()),
+            allowed_commands: vec![],
+            blocked_commands: vec!["rm".into()],
+            allow_advanced_shell: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(settings.validate().is_ok());
+    let dir = std::env::temp_dir().join(format!("remote-command-policy-{}", uuid::Uuid::new_v4()));
+    let state = AppState::open(dir.clone()).unwrap();
+    state.save_settings(settings.clone()).unwrap();
+    drop(state);
+    let reopened = AppState::open(dir.clone()).unwrap();
+    assert_eq!(*reopened.settings.lock().unwrap(), settings);
+    assert!(
+        security::check_command_with_settings("ls", &reopened.settings.lock().unwrap()).is_err()
+    );
+    drop(reopened);
+    let resolved = dir.canonicalize().unwrap();
+    assert!(resolved.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(resolved
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("remote-command-policy-"));
+    std::fs::remove_dir_all(resolved).unwrap();
+    for invalid in [
+        "rm -rf",
+        "$(pwd)",
+        "ls*",
+        "../ls",
+        "/usr/bin/../bin/ls",
+        "/bin//ls",
+    ] {
+        settings.command_policy.as_mut().unwrap().allowed_commands = vec![invalid.into()];
+        assert!(settings.validate().is_err(), "{invalid}");
+    }
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allowed_commands
+        .clear();
+    settings.command_policy.as_mut().unwrap().execution_mode = Some("unknown".into());
+    assert!(settings.validate().is_err());
+}
+
+#[test]
 fn legacy_command_settings_keep_their_behavior_until_a_policy_is_saved() {
     let strict: RuntimeSettings =
         serde_json::from_str(r#"{"block_dangerous_commands":true}"#).unwrap();
@@ -106,6 +286,7 @@ fn known_dangerous_commands_remain_blocked_with_shell_features_enabled() {
             allow_scripts: true,
             allow_substitution: true,
             allow_mcp_terminal: false,
+            ..Default::default()
         }),
         ..Default::default()
     };

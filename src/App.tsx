@@ -23,9 +23,10 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useMemo,
+  useRef,
   useState,
 } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Server as ServerIcon,
   FolderOpen,
@@ -54,7 +55,7 @@ import {
 } from "lucide-react";
 import { api, desktop, operate } from "./api";
 import { newServer, labels } from "./types";
-import type { Server, Snapshot, Audit } from "./types";
+import type { Server, Snapshot, Audit, AuditQuery, AuditPage } from "./types";
 import { ServerModal } from "./components/ServerModal";
 import { mcpPermissionSummary } from "./mcp-permissions";
 import appIcon from "./assets/app-icon.svg";
@@ -198,32 +199,149 @@ export default function App() {
         .toLowerCase()
         .includes(search.toLowerCase()),
   );
-  const audits = useMemo(() => [...data.audits].reverse(), [data.audits]);
-  const filteredAudits = audits.filter(
-    (a) =>
-      (tab === "all" ||
-        (tab === "mcp" && a.source === "mcp") ||
-        (tab === "error" && !auditSucceeded(a)) ||
-        (tab === "files" &&
-          [
-            "list_files",
-            "read_file",
-            "preview_file",
-            "write_file",
-            "edit_file",
-            "remove_path",
-            "mkdir",
-            "remove",
-            "rename",
-            "upload",
-            "download",
-          ].includes(a.kind)) ||
-        (tab === "exec" && a.kind === "exec")) &&
-      (!auditSearch ||
-        (a.server_name + " " + a.detail + " " + a.kind)
-          .toLowerCase()
-          .includes(auditSearch.toLowerCase())),
+  const [auditQuery, setAuditQuery] = useState<AuditQuery>({
+    category: "all",
+    search: "",
+    offset: 0,
+    limit: 50,
+  });
+  const [auditPage, setAuditPage] = useState<AuditPage>({
+    entries: [],
+    total: 0,
+    upper: 0,
+  });
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const auditScroll = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const timer = setTimeout(
+      () =>
+        setAuditQuery((query) =>
+          query.search === auditSearch
+            ? query
+            : { ...query, search: auditSearch, offset: 0, upper: undefined },
+        ),
+      250,
+    );
+    return () => clearTimeout(timer);
+  }, [auditSearch]);
+  useEffect(() => {
+    if (page !== "audit") return;
+    let active = true;
+    let inFlight = false;
+    let loaded = false;
+    if (auditQuery.offset === 0) {
+      setAuditPage({ entries: [], total: 0, upper: 0 });
+      if (auditScroll.current) auditScroll.current.scrollTop = 0;
+    }
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      if (!loaded) setAuditLoading(true);
+      setAuditError("");
+      try {
+        const result = await api<AuditPage>("audit_page", {
+          query: auditQuery,
+        });
+        if (active)
+          setAuditPage((previous) => {
+            if (auditQuery.offset === 0) return result;
+            const existingIds = new Set(
+              previous.entries.map((entry) => entry.id),
+            );
+            return {
+              ...result,
+              entries: [
+                ...previous.entries,
+                ...result.entries.filter((entry) => !existingIds.has(entry.id)),
+              ],
+            };
+          });
+      } catch (error) {
+        if (active) setAuditError(String(error));
+      } finally {
+        inFlight = false;
+        loaded = true;
+        if (active) setAuditLoading(false);
+      }
+    };
+    void load();
+    const timer =
+      preferences.refreshSeconds === "0" || auditQuery.offset > 0
+        ? undefined
+        : setInterval(
+            () => void load(),
+            Number(preferences.refreshSeconds) * 1000,
+          );
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [page, auditQuery, preferences.refreshSeconds]);
+  const filteredAudits = auditPage.entries;
+  const auditItemKey = useCallback(
+    (index: number) => filteredAudits[index].id,
+    [filteredAudits],
   );
+  const auditRows = useVirtualizer({
+    count: filteredAudits.length,
+    getScrollElement: () => auditScroll.current,
+    getItemKey: auditItemKey,
+    estimateSize: () => 88,
+    measureElement: (element) => element.getBoundingClientRect().height || 88,
+    overscan: 8,
+    enabled: page === "audit",
+  });
+  const virtualAuditRows = auditRows.getVirtualItems();
+  const loadMoreAudits = useCallback(() => {
+    const container = auditScroll.current;
+    if (
+      !container ||
+      container.clientHeight === 0 ||
+      auditLoading ||
+      auditError ||
+      !auditPage.entries.length ||
+      auditPage.entries.length >= auditPage.total ||
+      container.scrollHeight - container.scrollTop - container.clientHeight >
+        200
+    )
+      return;
+    setAuditQuery((query) =>
+      query.offset > 0 && query.offset >= auditPage.entries.length
+        ? query
+        : {
+            ...query,
+            offset: auditPage.entries.length,
+            upper: auditPage.upper,
+          },
+    );
+  }, [auditLoading, auditError, auditPage]);
+  useEffect(() => {
+    if (page !== "audit" || !auditScroll.current) return;
+    const observer = new ResizeObserver(loadMoreAudits);
+    observer.observe(auditScroll.current);
+    loadMoreAudits();
+    return () => observer.disconnect();
+  }, [page, loadMoreAudits]);
+  const exportAudits = async () => {
+    setExporting(true);
+    try {
+      const saved = await api<boolean>("export_audits", {
+        query: {
+          ...auditQuery,
+          category: tab,
+          search: auditSearch,
+          upper: undefined,
+        },
+      });
+      if (saved) notify("操作记录已导出");
+    } catch (error) {
+      notify(String(error), true);
+    } finally {
+      setExporting(false);
+    }
+  };
   const save = async (s: Server, secret = "") => {
     await api("save_server", { server: s, secret: secret || null });
     await refresh();
@@ -314,7 +432,16 @@ export default function App() {
               className="icon-btn"
               title="刷新"
               aria-label="刷新"
-              onClick={() => void refresh()}
+              onClick={() => {
+                void refresh();
+                if (page === "audit") {
+                  setAuditQuery((query) => ({
+                    ...query,
+                    offset: 0,
+                    upper: undefined,
+                  }));
+                }
+              }}
             >
               <RefreshCw size={15} />
             </Button>
@@ -674,7 +801,15 @@ export default function App() {
                   <Tabs
                     className="audit-filters"
                     value={tab}
-                    onValueChange={setTab}
+                    onValueChange={(category) => {
+                      setTab(category);
+                      setAuditQuery((query) => ({
+                        ...query,
+                        category,
+                        offset: 0,
+                        upper: undefined,
+                      }));
+                    }}
                   >
                     <TabsList aria-label="记录类型">
                       {[
@@ -695,7 +830,7 @@ export default function App() {
                     role="status"
                     aria-label="记录条目数"
                   >
-                    {filteredAudits.length.toLocaleString()} 条
+                    {auditPage.total.toLocaleString()} 条
                   </span>
                 </div>
                 <div className="audit-search search-box">
@@ -711,25 +846,21 @@ export default function App() {
                   variant="outline"
                   size="sm"
                   className="btn"
-                  onClick={() => {
-                    const blob = new Blob(
-                      [JSON.stringify(filteredAudits, null, 2)],
-                      { type: "application/json" },
-                    );
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url;
-                    a.download = "操作记录.json";
-                    a.click();
-                    setTimeout(() => URL.revokeObjectURL(url), 1000);
-                  }}
+                  disabled={exporting || auditLoading || !!auditError}
+                  title="导出当前筛选条件下的全部记录"
+                  onClick={() => void exportAudits()}
                 >
                   <Download size={14} />
-                  导出
+                  {exporting ? "导出中…" : "导出"}
                 </Button>
               </div>
               <div className="panel">
-                <div className="table-scroll">
+                <div
+                  className="table-scroll"
+                  ref={auditScroll}
+                  onScroll={loadMoreAudits}
+                  aria-label="操作记录列表"
+                >
                   <table className="data-table audit-table">
                     <colgroup>
                       <col className="audit-col-operation" />
@@ -750,80 +881,141 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredAudits.map((a) => (
-                        <tr
-                          key={a.id}
-                          tabIndex={0}
-                          onClick={() => setAuditDetail(a)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") setAuditDetail(a);
-                          }}
-                        >
-                          <td>
-                            <strong>{labels[a.kind] || a.kind}</strong>
-                            <p className="mono" title={a.detail}>
-                              {a.detail || "—"}
-                            </p>
-                            <div className="audit-inline-context">
-                              <span title={a.server_name}>{a.server_name}</span>
-                              <span>
+                      {virtualAuditRows.length > 0 &&
+                        virtualAuditRows[0].start > 0 && (
+                          <tr aria-hidden="true" className="audit-spacer">
+                            <td
+                              colSpan={6}
+                              style={{ height: virtualAuditRows[0].start }}
+                            />
+                          </tr>
+                        )}
+                      {virtualAuditRows.map((virtualRow) => {
+                        const a = filteredAudits[virtualRow.index];
+                        return (
+                          <tr
+                            key={a.id}
+                            data-index={virtualRow.index}
+                            ref={auditRows.measureElement}
+                            tabIndex={0}
+                            onClick={() => setAuditDetail(a)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") setAuditDetail(a);
+                            }}
+                          >
+                            <td>
+                              <strong>{labels[a.kind] || a.kind}</strong>
+                              <p className="mono" title={a.detail}>
+                                {a.detail || "—"}
+                              </p>
+                              <div className="audit-inline-context">
+                                <span title={a.server_name}>
+                                  {a.server_name}
+                                </span>
+                                <span>
+                                  {a.source === "mcp" ? "MCP" : "手动操作"}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="audit-col-server">
+                              <span
+                                className="audit-server-name"
+                                title={a.server_name}
+                              >
+                                {a.server_name}
+                              </span>
+                              <span className="audit-server-source">
                                 {a.source === "mcp" ? "MCP" : "手动操作"}
                               </span>
-                            </div>
-                          </td>
-                          <td className="audit-col-server">
-                            <span
-                              className="audit-server-name"
-                              title={a.server_name}
-                            >
-                              {a.server_name}
-                            </span>
-                            <span className="audit-server-source">
+                            </td>
+                            <td className="audit-col-source">
                               {a.source === "mcp" ? "MCP" : "手动操作"}
-                            </span>
-                          </td>
-                          <td className="audit-col-source">
-                            {a.source === "mcp" ? "MCP" : "手动操作"}
-                          </td>
-                          <td>
-                            <span
-                              className={
-                                "audit-status " +
-                                (auditSucceeded(a) ? "success" : "failed")
-                              }
-                            >
+                            </td>
+                            <td>
                               <span
                                 className={
-                                  "status-dot " +
-                                  (auditSucceeded(a) ? "green" : "red")
+                                  "audit-status " +
+                                  (auditSucceeded(a) ? "success" : "failed")
                                 }
-                              />
-                              {a.kind === "security_approve"
-                                ? "已批准"
-                                : a.kind === "security_reject"
-                                  ? "已拒绝"
-                                  : a.success
-                                    ? "成功"
-                                    : "失败"}
-                            </span>
-                            <span className="audit-inline-duration">
+                              >
+                                <span
+                                  className={
+                                    "status-dot " +
+                                    (auditSucceeded(a) ? "green" : "red")
+                                  }
+                                />
+                                {a.kind === "security_approve"
+                                  ? "已批准"
+                                  : a.kind === "security_reject"
+                                    ? "已拒绝"
+                                    : a.success
+                                      ? "成功"
+                                      : "失败"}
+                              </span>
+                              <span className="audit-inline-duration">
+                                {a.duration_ms} 毫秒
+                              </span>
+                            </td>
+                            <td className="mono muted audit-col-duration">
                               {a.duration_ms} 毫秒
-                            </span>
-                          </td>
-                          <td className="mono muted audit-col-duration">
-                            {a.duration_ms} 毫秒
-                          </td>
-                          <td className="muted">
-                            <CompactTime value={a.time} />
-                          </td>
+                            </td>
+                            <td className="muted">
+                              <CompactTime value={a.time} />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {virtualAuditRows.length > 0 && (
+                        <tr aria-hidden="true" className="audit-spacer">
+                          <td
+                            colSpan={6}
+                            style={{
+                              height: Math.max(
+                                0,
+                                auditRows.getTotalSize() -
+                                  virtualAuditRows[virtualAuditRows.length - 1]
+                                    .end,
+                              ),
+                            }}
+                          />
                         </tr>
-                      ))}
+                      )}
                     </tbody>
                   </table>
+                  {auditLoading ? (
+                    <div className="audit-load-status" role="status">
+                      正在加载操作记录…
+                    </div>
+                  ) : auditError ? (
+                    <div className="empty-panel" role="alert">
+                      {auditError}
+                    </div>
+                  ) : (
+                    !filteredAudits.length && (
+                      <div className="empty-panel">暂无记录</div>
+                    )
+                  )}
+                  {!auditLoading &&
+                    !auditError &&
+                    filteredAudits.length > 0 && (
+                      <div className="audit-load-status" role="status">
+                        {filteredAudits.length >= auditPage.total
+                          ? "已加载全部记录"
+                          : `已加载 ${filteredAudits.length} 条，向下滚动加载更多`}
+                      </div>
+                    )}
+                  {auditError && (
+                    <div className="audit-load-status">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setAuditQuery((query) => ({ ...query }))}
+                      >
+                        重试加载
+                      </Button>
+                    </div>
+                  )}
                 </div>
-                {!filteredAudits.length && (
-                  <div className="empty-panel">暂无记录</div>
-                )}
               </div>
             </>
           )}

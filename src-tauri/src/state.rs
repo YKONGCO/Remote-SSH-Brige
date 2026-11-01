@@ -63,6 +63,9 @@ impl AppState {
         Ok(settings)
     }
     pub fn snapshot(&self) -> Value {
+        self.snapshot_with_audits(true)
+    }
+    pub fn snapshot_with_audits(&self, include_audits: bool) -> Value {
         let terminals: Vec<_> = self
             .terminals
             .lock()
@@ -75,6 +78,7 @@ impl AppState {
             .lock()
             .unwrap()
             .iter()
+            .filter(|_| include_audits)
             .map(|entry| {
                 let mut summary = entry.clone();
                 summary.response = None;
@@ -86,6 +90,21 @@ impl AppState {
     }
     pub fn audit_details(&self, id: &str) -> Result<Audit> {
         self.database.lock().unwrap().audit(id)
+    }
+    pub fn audit_page(
+        &self,
+        query: &crate::database::AuditQuery,
+    ) -> Result<crate::database::AuditPage> {
+        self.database.lock().unwrap().audit_page(query)
+    }
+    pub fn export_audits(
+        &self,
+        query: &crate::database::AuditQuery,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        // A separate WAL reader lets new operations keep writing while a large
+        // history is exported.
+        Database::open_reader(&self.dir)?.export_audits(query, std::fs::File::create(path)?)
     }
     pub fn resolve_approval(&self, id: &str, approved: bool) -> Result<()> {
         self.approvals.decide(id, approved, |view| {

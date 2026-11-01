@@ -60,7 +60,92 @@ mod desktop {
     }
     #[tauri::command]
     fn snapshot(state: Shared<'_>) -> serde_json::Value {
-        state.snapshot()
+        state.snapshot_with_audits(false)
+    }
+    #[tauri::command]
+    async fn audit_page(
+        state: Shared<'_>,
+        query: database::AuditQuery,
+    ) -> Result<database::AuditPage, String> {
+        let state = state.inner().clone();
+        tokio::task::spawn_blocking(move || state.audit_page(&query))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    async fn save_destination(
+        window: tauri::WebviewWindow,
+        name: String,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        use tauri_plugin_dialog::DialogExt;
+        tokio::task::spawn_blocking(move || {
+            window
+                .dialog()
+                .file()
+                .set_parent(&window)
+                .set_file_name(name)
+                .blocking_save_file()
+                .map(|path| path.into_path().map_err(|e| e.to_string()))
+                .transpose()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    async fn export_audits(
+        state: Shared<'_>,
+        window: tauri::WebviewWindow,
+        query: database::AuditQuery,
+    ) -> Result<bool, String> {
+        let Some(path) = save_destination(window, "操作记录.json".into()).await? else {
+            return Ok(false);
+        };
+        let state = state.inner().clone();
+        tokio::task::spawn_blocking(move || state.export_audits(&query, &path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(true)
+    }
+
+    #[tauri::command]
+    async fn download_file(
+        state: Shared<'_>,
+        window: tauri::WebviewWindow,
+        server_id: String,
+        path: String,
+        name: String,
+    ) -> Result<bool, String> {
+        let Some(destination) = save_destination(window, name).await? else {
+            return Ok(false);
+        };
+        let value = state::execute(
+            state.inner().clone(),
+            model::Operation {
+                kind: "download".into(),
+                server_id,
+                path,
+                ..Default::default()
+            },
+            "desktop",
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use base64::Engine;
+            let data = value["base64"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("下载结果缺少文件内容"))?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+            std::fs::write(destination, bytes)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(true)
     }
     #[tauri::command]
     fn runtime_settings(state: Shared<'_>) -> model::RuntimeSettings {
@@ -148,6 +233,7 @@ mod desktop {
     }
     pub fn run() {
         tauri::Builder::default()
+            .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
                 show_main(app);
             }))
@@ -205,6 +291,9 @@ mod desktop {
             })
             .invoke_handler(tauri::generate_handler![
                 snapshot,
+                audit_page,
+                export_audits,
+                download_file,
                 mcp_clients,
                 configure_mcp_client,
                 runtime_settings,

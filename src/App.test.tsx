@@ -2,6 +2,7 @@
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
   cleanup,
+  fireEvent,
   render,
   screen,
   within,
@@ -11,6 +12,13 @@ import userEvent from "@testing-library/user-event";
 import App from "./App";
 import * as remoteApi from "./api";
 beforeAll(() => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+    function (this: HTMLElement) {
+      return this.classList.contains("table-scroll") ? 600 : 88;
+    },
+  );
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1000);
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(4400);
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
   vi.stubGlobal(
     "ResizeObserver",
@@ -26,6 +34,167 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture = () => {};
 });
 afterEach(cleanup);
+test("audit loads on scroll, virtualizes rows and exports the full active filter", async () => {
+  localStorage.clear();
+  const realApi = remoteApi.api;
+  const requests = vi
+    .spyOn(remoteApi, "api")
+    .mockImplementation(async (command, args) => {
+      if (command === "export_audits") return false as never;
+      if (command !== "audit_page") return realApi(command, args);
+      const query = args!.query as { offset: number; search: string };
+      const entries = Array.from(
+        { length: query.offset === 100 ? 20 : 50 },
+        (_, index) => ({
+          id: `paged-${query.offset + index}`,
+          time: new Date().toISOString(),
+          server_id: "demo-1",
+          server_name: "分页服务器",
+          source: "desktop",
+          kind: "exec",
+          detail: `paged command ${query.offset + index}`,
+          success: true,
+          duration_ms: 1,
+          summary: "ok",
+        }),
+      );
+      return {
+        entries: query.search ? [] : entries,
+        total: query.search ? 0 : 120,
+        upper: 120,
+      } as never;
+    });
+  try {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("生产服务器");
+    expect(
+      requests.mock.calls.some(([command]) => command === "audit_page"),
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "操作记录" }));
+    await screen.findByText("paged command 0");
+    expect(
+      document.querySelectorAll(".audit-table tbody tr[data-index]").length,
+    ).toBeLessThan(50);
+    expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
+      "120 条",
+    );
+    expect(screen.queryByRole("button", { name: "下一页" })).toBeNull();
+    const scroller = screen.getByLabelText("操作记录列表");
+    Object.defineProperties(scroller, {
+      clientHeight: { configurable: true, value: 600 },
+      scrollHeight: {
+        configurable: true,
+        get: () =>
+          88 *
+          (requests.mock.calls.some(
+            ([command, args]) =>
+              command === "audit_page" &&
+              (args!.query as { offset: number }).offset === 50,
+          )
+            ? 100
+            : 50),
+      },
+    });
+    fireEvent.scroll(scroller, { target: { scrollTop: 3800 } });
+    fireEvent.scroll(scroller, { target: { scrollTop: 3801 } });
+    await screen.findByText("已加载 100 条，向下滚动加载更多");
+    await screen.findByText("paged command 50");
+    expect(screen.queryByText("paged command 0")).toBeNull();
+    expect(requests).toHaveBeenCalledWith("audit_page", {
+      query: expect.objectContaining({ offset: 50, limit: 50, upper: 120 }),
+    });
+    expect(
+      requests.mock.calls.filter(
+        ([command, args]) =>
+          command === "audit_page" &&
+          (args!.query as { offset: number }).offset === 50,
+      ),
+    ).toHaveLength(1);
+    fireEvent.scroll(scroller, { target: { scrollTop: 8200 } });
+    await screen.findByText("已加载全部记录");
+    await screen.findByText("paged command 100");
+    expect(
+      document.querySelectorAll(".audit-table tbody tr[data-index]").length,
+    ).toBeLessThan(40);
+    const loadedRequests = requests.mock.calls.filter(
+      ([command]) => command === "audit_page",
+    ).length;
+    fireEvent.scroll(scroller, { target: { scrollTop: 10000 } });
+    expect(
+      requests.mock.calls.filter(([command]) => command === "audit_page"),
+    ).toHaveLength(loadedRequests);
+    fireEvent.scroll(scroller, { target: { scrollTop: 0 } });
+    await screen.findByText("paged command 0");
+    await user.click(screen.getByRole("button", { name: "导出" }));
+    expect(requests).toHaveBeenCalledWith("export_audits", {
+      query: expect.objectContaining({
+        category: "all",
+        search: "",
+        upper: undefined,
+      }),
+    });
+    await user.type(
+      screen.getByRole("textbox", { name: "搜索操作记录" }),
+      "missing",
+    );
+    await screen.findByText("暂无记录");
+    expect(requests).toHaveBeenCalledWith("audit_page", {
+      query: expect.objectContaining({
+        offset: 0,
+        search: "missing",
+        upper: undefined,
+      }),
+    });
+  } finally {
+    requests.mockRestore();
+  }
+});
+
+test("file downloads wait for a save destination and cancellation skips the transfer", async () => {
+  localStorage.clear();
+  const picker = vi
+    .fn()
+    .mockRejectedValue(new DOMException("cancelled", "AbortError"));
+  Object.defineProperty(window, "showSaveFilePicker", {
+    configurable: true,
+    value: picker,
+  });
+  const operations = vi.spyOn(remoteApi, "operate");
+  try {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("生产服务器");
+    await user.click(
+      screen.getByRole("button", { name: "浏览文件 生产服务器" }),
+    );
+    const row = (
+      await screen.findByRole("button", { name: "README.md" })
+    ).closest("tr")!;
+    operations.mockClear();
+    await user.click(within(row).getByTitle("下载"));
+    expect(picker).toHaveBeenCalledWith({ suggestedName: "README.md" });
+    expect(operations).not.toHaveBeenCalled();
+    const write = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const createWritable = vi
+      .fn()
+      .mockResolvedValue({ write, close, abort: vi.fn() });
+    picker.mockResolvedValue({ createWritable });
+    await user.click(within(row).getByTitle("下载"));
+    await waitFor(() => expect(close).toHaveBeenCalled());
+    expect(operations).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "download", path: "/README.md" }),
+    );
+    expect(write.mock.calls[0][0]).toBeInstanceOf(Blob);
+    expect((write.mock.calls[0][0] as Blob).size).toBeGreaterThan(0);
+  } finally {
+    delete (window as Window & { showSaveFilePicker?: unknown })
+      .showSaveFilePicker;
+    operations.mockRestore();
+  }
+});
+
 test("remote files wait for server selection on each visit", async () => {
   localStorage.clear();
   const user = userEvent.setup();
@@ -39,7 +208,8 @@ test("remote files wait for server selection on each visit", async () => {
 
     await user.click(screen.getByRole("combobox", { name: "选择服务器" }));
     expect(
-      screen.getByRole("option", { name: "测试服务器（已停用）" })
+      screen
+        .getByRole("option", { name: "测试服务器（已停用）" })
         .getAttribute("aria-disabled"),
     ).toBe("true");
     await user.click(screen.getByRole("option", { name: "开发服务器" }));
@@ -55,7 +225,9 @@ test("remote files wait for server selection on each visit", async () => {
     expect(operations).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "服务器" }));
-    await user.click(screen.getByRole("button", { name: "浏览文件 生产服务器" }));
+    await user.click(
+      screen.getByRole("button", { name: "浏览文件 生产服务器" }),
+    );
     await screen.findByRole("button", { name: "README.md" });
     expect(operations).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "list_files", server_id: "demo-1" }),
@@ -116,7 +288,7 @@ test("workspace supports filtering, server creation, file editing and audit navi
   );
   await user.click(screen.getByRole("button", { name: "操作记录" }));
   await screen.findByRole("columnheader", { name: "操作" });
-  expect(screen.getAllByText("写入文件").length).toBeGreaterThan(0);
+  expect((await screen.findAllByText("写入文件")).length).toBeGreaterThan(0);
   await user.click(screen.getByRole("button", { name: "MCP 服务" }));
   await screen.findByText("客户端配置");
   expect(screen.getByText("服务器权限")).toBeTruthy();
@@ -166,16 +338,18 @@ test("audit dialog has bounded size and shows saved output or an explicit legacy
   const count = screen.getByRole("status", { name: "记录条目数" });
   await user.click(screen.getByRole("tab", { name: "命令" }));
   expect(count.textContent).toBe(
-    `${document.querySelectorAll(".audit-table tbody tr").length.toLocaleString()} 条`,
+    `${document.querySelectorAll(".audit-table tbody tr[data-index]").length.toLocaleString()} 条`,
   );
   const auditSearch = screen.getByRole("textbox", { name: "搜索操作记录" });
   await user.type(auditSearch, "no-matching-audit");
-  expect(count.textContent).toBe("0 条");
+  await waitFor(() => expect(count.textContent).toBe("0 条"));
   await user.clear(auditSearch);
   await user.click(screen.getByRole("tab", { name: "全部" }));
-  const row = screen
-    .getByText('docker ps --format "table {{.Names}}\\t{{.Status}}"')
-    .closest("tr")!;
+  const row = (
+    await screen.findByText(
+      'docker ps --format "table {{.Names}}\\t{{.Status}}"',
+    )
+  ).closest("tr")!;
   await user.click(row);
   const dialog = await screen.findByRole("dialog", { name: "操作详情" });
   expect(dialog.style.width).toBe("620px");
@@ -201,7 +375,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(13);
+  expect(screen.getAllByRole("combobox")).toHaveLength(14);
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");

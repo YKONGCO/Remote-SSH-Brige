@@ -4,7 +4,16 @@ import type {
   RuntimeSettings,
   NumericRuntimeSetting,
 } from "../runtime-settings";
-import { effectiveCommandPolicy } from "../runtime-settings";
+import {
+  effectiveCommandPolicy,
+  commandMode,
+  advancedShell,
+  defaultAllowedCommands,
+  validCommandLists,
+} from "../runtime-settings";
+import { ModalFrame, DialogTitle } from "./ModalFrame";
+import { Button } from "./ui/button";
+import { Textarea } from "./ui/textarea";
 import { SelectField } from "./SelectField";
 import { TransferLimitField } from "./TransferLimitField";
 import { useEffect, useState, type ReactNode } from "react";
@@ -40,6 +49,30 @@ export function Settings() {
   const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [listsOpen, setListsOpen] = useState(false);
+  const [allowedDraft, setAllowedDraft] = useState("");
+  const [blockedDraft, setBlockedDraft] = useState("");
+  const policy = runtime ? effectiveCommandPolicy(runtime) : undefined;
+  async function updateCommand(patch: Partial<CommandPolicy>) {
+    if (!policy) return false;
+    const next = {
+      ...policy,
+      execution_mode: commandMode(policy),
+      allowed_commands: policy.allowed_commands ?? [...defaultAllowedCommands],
+      blocked_commands: policy.blocked_commands ?? [],
+      ...patch,
+    };
+    if (next.allow_advanced_shell !== undefined) {
+      next.allow_pipes =
+        next.allow_redirection =
+        next.allow_compound =
+        next.allow_scripts =
+        next.allow_substitution =
+          next.allow_advanced_shell;
+    }
+    next.diagnostic_only = next.execution_mode === "whitelist";
+    return updateRuntime("command_policy", next);
+  }
   async function loadRuntime() {
     try {
       setRuntime(await api<RuntimeSettings>("runtime_settings"));
@@ -174,21 +207,27 @@ export function Settings() {
       </button>
     );
   }
-  function commandToggle(name: keyof CommandPolicy, label: string) {
-    const policy = runtime ? effectiveCommandPolicy(runtime) : undefined;
+  function commandToggle(
+    name: "allow_advanced_shell" | "allow_mcp_terminal",
+    label: string,
+  ) {
+    const checked = policy
+      ? name === "allow_advanced_shell"
+        ? advancedShell(policy)
+        : policy.allow_mcp_terminal
+      : false;
     return (
       <button
         type="button"
         className="setting-switch"
         role="switch"
         aria-label={label}
-        aria-checked={policy?.[name] ?? false}
+        aria-checked={checked}
         disabled={!runtime || saving}
         onClick={() =>
           policy &&
-          void updateRuntime("command_policy", {
-            ...policy,
-            [name]: !policy[name],
+          void updateCommand({
+            [name]: !checked,
           })
         }
       >
@@ -198,7 +237,7 @@ export function Settings() {
   }
   return (
     <div className="settings-layout" aria-busy={saving}>
-      {error && (
+      {error && !listsOpen && (
         <p role="alert" className="error-inline">
           {error}{" "}
           {loadFailed && (
@@ -327,46 +366,73 @@ export function Settings() {
         <h2 className="settings-group-title">命令与 Shell 权限</h2>
         <div className="settings-card">
           <Row
-            title="仅允许诊断命令"
-            description="限制每个命令为诊断白名单；关闭后允许其他程序，高危命令拦截仍独立生效。"
+            title="命令执行范围"
+            description="不限命令仍受黑名单和危险命令拦截限制。"
           >
-            {commandToggle("diagnostic_only", "仅允许诊断命令")}
+            <SelectField
+              className="setting-select"
+              aria-label="命令执行范围"
+              disabled={!runtime || saving}
+              value={policy ? commandMode(policy) : "whitelist"}
+              onValueChange={(execution_mode) =>
+                void updateCommand({
+                  execution_mode:
+                    execution_mode as CommandPolicy["execution_mode"],
+                })
+              }
+            >
+              <option value="disabled">禁止执行</option>
+              <option value="whitelist">仅允许白名单</option>
+              <option value="unrestricted">不限命令</option>
+            </SelectField>
           </Row>
           <Row
-            title="允许管道"
-            description="允许 ls | head 等管道；管道两侧命令分别检查。"
+            title="命令名单管理"
+            description="添加、修改或删除白名单和黑名单，黑名单优先。"
           >
-            {commandToggle("allow_pipes", "允许管道")}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!runtime || saving}
+              onClick={() => {
+                setAllowedDraft(
+                  (policy?.allowed_commands ?? defaultAllowedCommands).join(
+                    "\n",
+                  ),
+                );
+                setBlockedDraft((policy?.blocked_commands ?? []).join("\n"));
+                setListsOpen(true);
+                setError("");
+              }}
+            >
+              管理名单
+            </Button>
           </Row>
           <Row
-            title="允许重定向"
-            description="允许 >、>>、<、2>&1 等文件与文件描述符重定向。"
+            title="允许 Shell 高级功能"
+            description="统一控制管道、组合命令、重定向、命令替换和脚本执行。脚本内容无法完整检查。"
           >
-            {commandToggle("allow_redirection", "允许重定向")}
+            <div className="flex items-center gap-2">
+              {policy &&
+                policy.allow_advanced_shell === undefined &&
+                advancedShell(policy) &&
+                ![
+                  policy.allow_pipes,
+                  policy.allow_redirection,
+                  policy.allow_compound,
+                  policy.allow_scripts,
+                  policy.allow_substitution,
+                ].every(Boolean) && (
+                  <span className="muted">旧配置：部分开启</span>
+                )}
+              {commandToggle("allow_advanced_shell", "允许 Shell 高级功能")}
+            </div>
           </Row>
           <Row
-            title="允许组合命令"
-            description="允许分号、换行、&&、|| 和后台执行；逐条检查命令。"
+            title="允许 AI 交互终端"
+            description="允许 AI 打开终端和发送输入，仍需服务器授权；终端输入不经过命令名单检查。"
           >
-            {commandToggle("allow_compound", "允许组合命令")}
-          </Row>
-          <Row
-            title="允许脚本执行"
-            description="允许解释器、脚本文件、变量与控制结构；需关闭诊断白名单。脚本文件及任意解释器代码无法完整静态检查。"
-          >
-            {commandToggle("allow_scripts", "允许脚本执行")}
-          </Row>
-          <Row
-            title="允许命令替换"
-            description="允许 $(...)、反引号和进程替换；嵌套的 Shell 命令同样检查。"
-          >
-            {commandToggle("allow_substitution", "允许命令替换")}
-          </Row>
-          <Row
-            title="允许 MCP 交互终端"
-            description="允许 MCP 打开终端和发送输入，仍需服务器授权；分段输入不经过高危命令检查。"
-          >
-            {commandToggle("allow_mcp_terminal", "允许 MCP 交互终端")}
+            {commandToggle("allow_mcp_terminal", "允许 AI 交互终端")}
           </Row>
         </div>
       </section>
@@ -487,6 +553,109 @@ export function Settings() {
           </Row>
         </div>
       </section>
+      {listsOpen && (
+        <ModalFrame
+          onClose={() => {
+            if (!saving) {
+              setListsOpen(false);
+              setError("");
+            }
+          }}
+          width={640}
+        >
+          <form
+            className="modal-layout"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              const parse = (value: string) => [
+                ...new Set(
+                  value
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter(Boolean),
+                ),
+              ];
+              const allowed_commands = parse(allowedDraft),
+                blocked_commands = parse(blockedDraft);
+              if (!validCommandLists(allowed_commands, blocked_commands)) {
+                setError(
+                  "每个名单最多 256 项，仅填写命令名称或完整路径，不要填写参数、通配符或 Shell 语法。",
+                );
+                return;
+              }
+              if (await updateCommand({ allowed_commands, blocked_commands }))
+                setListsOpen(false);
+            }}
+          >
+            <div className="modal-head">
+              <DialogTitle>命令名单管理</DialogTitle>
+            </div>
+            <div className="modal-body">
+              <p>
+                每行一条命令名称或完整路径，例如 grep 或
+                /usr/local/bin/report。黑名单优先；仅白名单模式下，白名单留空会拒绝所有命令。
+              </p>
+              <div className="command-list-editors">
+                <label>
+                  白名单
+                  <Textarea
+                    aria-label="命令白名单"
+                    className="mono"
+                    rows={9}
+                    value={allowedDraft}
+                    disabled={saving}
+                    onChange={(event) => setAllowedDraft(event.target.value)}
+                  />
+                </label>
+                <label>
+                  黑名单
+                  <Textarea
+                    aria-label="命令黑名单"
+                    className="mono"
+                    rows={9}
+                    value={blockedDraft}
+                    disabled={saving}
+                    onChange={(event) => setBlockedDraft(event.target.value)}
+                  />
+                </label>
+              </div>
+              {error && (
+                <p className="error-inline" role="alert">
+                  {error}
+                </p>
+              )}
+            </div>
+            <div className="modal-foot flex gap-2 justify-end">
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={saving}
+                onClick={() => {
+                  setAllowedDraft(defaultAllowedCommands.join("\n"));
+                  setBlockedDraft("");
+                  setError("");
+                }}
+              >
+                恢复默认名单
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={saving}
+                onClick={() => {
+                  setListsOpen(false);
+                  setError("");
+                }}
+              >
+                取消
+              </Button>
+              <Button type="submit" disabled={saving}>
+                {saving ? "保存中…" : "保存名单"}
+              </Button>
+            </div>
+          </form>
+        </ModalFrame>
+      )}
       <footer className="settings-footer">
         <span role="status">
           {saving
