@@ -5,6 +5,7 @@ import { ApprovalCenter } from "./components/ApprovalCenter";
 import { readPreferences, usePreferences } from "./preferences";
 import { CompactTime } from "./components/CompactTime";
 import { AuditDetails } from "./components/AuditDetails";
+import { AuditTimeFilter } from "./components/AuditTimeFilter";
 import { Badge } from "./components/ui/badge";
 import {
   DropdownMenu,
@@ -52,6 +53,7 @@ import {
   Pencil,
   Trash2,
   Download,
+  LoaderCircle,
 } from "lucide-react";
 import { api, desktop, operate } from "./api";
 import { newServer, labels } from "./types";
@@ -60,22 +62,36 @@ import { ServerModal } from "./components/ServerModal";
 import { mcpPermissionSummary } from "./mcp-permissions";
 import appIcon from "./assets/app-icon.svg";
 import { Files } from "./components/Files";
+import { Jobs } from "./components/Jobs";
+import { PortForwards } from "./components/PortForwards";
 const Terminals = lazy(() =>
   import("./components/Terminal").then((m) => ({ default: m.Terminals })),
 );
 import { WindowBar } from "./components/WindowBar";
 
-type Page = "servers" | "files" | "terminals" | "audit" | "mcp" | "settings";
+type Page =
+  | "servers"
+  | "files"
+  | "terminals"
+  | "jobs"
+  | "tunnels"
+  | "audit"
+  | "mcp"
+  | "settings";
 const navigation = [
   { id: "servers", label: "服务器", icon: ServerIcon },
   { id: "files", label: "远程文件", icon: FolderOpen },
   { id: "terminals", label: "终端会话", icon: TerminalSquare },
+  { id: "tunnels", label: "端口转发", icon: Plug },
+  { id: "jobs", label: "后台任务", icon: Play },
   { id: "audit", label: "操作记录", icon: Activity },
 ] as const;
 const titles: Record<Page, string> = {
   servers: "服务器",
   files: "远程文件",
   terminals: "终端会话",
+  jobs: "后台任务",
+  tunnels: "端口转发",
   audit: "操作记录",
   mcp: "MCP 服务",
   settings: "设置",
@@ -231,10 +247,6 @@ export default function App() {
     let active = true;
     let inFlight = false;
     let loaded = false;
-    if (auditQuery.offset === 0) {
-      setAuditPage({ entries: [], total: 0, upper: 0 });
-      if (auditScroll.current) auditScroll.current.scrollTop = 0;
-    }
     const load = async () => {
       if (inFlight) return;
       inFlight = true;
@@ -244,7 +256,11 @@ export default function App() {
         const result = await api<AuditPage>("audit_page", {
           query: auditQuery,
         });
-        if (active)
+        if (active) {
+          // Keep the previous rows visible until the replacement is ready.
+          if (!loaded && auditQuery.offset === 0 && auditScroll.current) {
+            auditScroll.current.scrollTop = 0;
+          }
           setAuditPage((previous) => {
             if (auditQuery.offset === 0) return result;
             const existingIds = new Set(
@@ -258,6 +274,7 @@ export default function App() {
               ],
             };
           });
+        }
       } catch (error) {
         if (active) setAuditError(String(error));
       } finally {
@@ -426,36 +443,6 @@ export default function App() {
                 <ChevronDown size={13} />
               </div>
             )}
-            <Button
-              variant="ghost"
-              size="icon"
-              className="icon-btn"
-              title="刷新"
-              aria-label="刷新"
-              onClick={() => {
-                void refresh();
-                if (page === "audit") {
-                  setAuditQuery((query) => ({
-                    ...query,
-                    offset: 0,
-                    upper: undefined,
-                  }));
-                }
-              }}
-            >
-              <RefreshCw size={15} />
-            </Button>
-            {page === "servers" && (
-              <Button
-                variant="default"
-                size="sm"
-                className="btn primary"
-                onClick={() => setModal(newServer())}
-              >
-                <Plus size={15} />
-                添加服务器
-              </Button>
-            )}
           </div>
         )}
       </WindowBar>
@@ -541,7 +528,7 @@ export default function App() {
         <main
           className={
             "page-content " +
-            (page === "audit"
+            (page === "audit" || page === "jobs" || page === "tunnels"
               ? "audit-page"
               : page === "terminals"
                 ? "terminal-page"
@@ -596,6 +583,15 @@ export default function App() {
                   </SelectField>
                   <ChevronDown size={13} />
                 </div>
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="btn primary server-add-button"
+                  onClick={() => setModal(newServer())}
+                >
+                  <Plus size={15} />
+                  添加服务器
+                </Button>
               </div>
               <div className="server-list">
                 {visible.map((s) => {
@@ -794,6 +790,10 @@ export default function App() {
               />
             </Suspense>
           )}
+          {page === "jobs" && <Jobs notify={notify} />}
+          {page === "tunnels" && (
+            <PortForwards servers={data.servers} notify={notify} />
+          )}
           {page === "audit" && (
             <>
               <div className="audit-toolbar">
@@ -833,26 +833,44 @@ export default function App() {
                     {auditPage.total.toLocaleString()} 条
                   </span>
                 </div>
-                <div className="audit-search search-box">
-                  <Search size={14} />
-                  <Input
-                    placeholder="搜索操作记录"
-                    aria-label="搜索操作记录"
-                    value={auditSearch}
-                    onChange={(e) => setAuditSearch(e.target.value)}
+                <div className="audit-toolbar-controls">
+                  <AuditTimeFilter
+                    query={auditQuery}
+                    onChange={(range) =>
+                      setAuditQuery((query) => ({
+                        ...query,
+                        ...range,
+                        offset: 0,
+                        upper: undefined,
+                      }))
+                    }
                   />
+                  <div className="audit-search search-box">
+                    <Search size={14} />
+                    <Input
+                      placeholder="搜索操作记录"
+                      aria-label="搜索操作记录"
+                      value={auditSearch}
+                      onChange={(e) => setAuditSearch(e.target.value)}
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="audit-export-button"
+                    disabled={exporting || auditLoading || !!auditError}
+                    aria-busy={exporting}
+                    title="导出当前筛选条件下的全部记录"
+                    onClick={() => void exportAudits()}
+                  >
+                    {exporting ? (
+                      <LoaderCircle size={15} className="spinning" />
+                    ) : (
+                      <Download size={15} />
+                    )}
+                    <span>{exporting ? "导出中…" : "导出"}</span>
+                  </Button>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="btn"
-                  disabled={exporting || auditLoading || !!auditError}
-                  title="导出当前筛选条件下的全部记录"
-                  onClick={() => void exportAudits()}
-                >
-                  <Download size={14} />
-                  {exporting ? "导出中…" : "导出"}
-                </Button>
               </div>
               <div className="panel">
                 <div
@@ -860,6 +878,7 @@ export default function App() {
                   ref={auditScroll}
                   onScroll={loadMoreAudits}
                   aria-label="操作记录列表"
+                  aria-busy={auditLoading}
                 >
                   <table className="data-table audit-table">
                     <colgroup>
@@ -1040,6 +1059,15 @@ export default function App() {
         <ServerModal
           initial={modal}
           groups={groups}
+          onOpenSettings={() => {
+            setModal(null);
+            setPage("settings");
+            requestAnimationFrame(() =>
+              document
+                .getElementById("security-settings")
+                ?.scrollIntoView({ block: "start" }),
+            );
+          }}
           onClose={() => setModal(null)}
           onSave={save}
         />

@@ -13,6 +13,9 @@ pub struct AppState {
     database: Mutex<Database>,
     pub config: Mutex<Config>,
     pub settings: Mutex<RuntimeSettings>,
+    pub jobs: crate::jobs::JobManager,
+    pub tunnels: crate::tunnels::TunnelManager,
+    pub transfers: crate::transfers::TransferManager,
     pub approvals: crate::security::ApprovalQueue,
     pub audit: Mutex<Vec<Audit>>,
     pub terminals: Mutex<HashMap<String, Arc<TerminalHandle>>>,
@@ -30,11 +33,14 @@ impl AppState {
         };
         let audit = database.recent_audits(500)?;
         let settings = database.settings()?;
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             dir,
             database: Mutex::new(database),
             config: Mutex::new(config),
             settings: Mutex::new(settings),
+            jobs: crate::jobs::JobManager::default(),
+            tunnels: crate::tunnels::TunnelManager::default(),
+            transfers: crate::transfers::TransferManager::default(),
             approvals: crate::security::ApprovalQueue::default(),
             audit: Mutex::new(audit),
             terminals: Mutex::new(HashMap::new()),
@@ -43,7 +49,17 @@ impl AppState {
             mcp: Mutex::new(McpStatus::default()),
             cancel: Mutex::new(None),
             service_lock: tokio::sync::Mutex::new(()),
-        }))
+        });
+        let weak = Arc::downgrade(&state);
+        std::thread::Builder::new()
+            .name("job-cleanup".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let Some(state) = weak.upgrade() else { break };
+                state.jobs.prune_expired();
+                state.transfers.prune();
+            })?;
+        Ok(state)
     }
     pub fn server(&self, id: &str) -> Result<Server> {
         self.config
@@ -53,13 +69,22 @@ impl AppState {
             .iter()
             .find(|s| s.id == id)
             .cloned()
-            .context("服务器不存在")
+            .ok_or_else(|| {
+                crate::operation_error::error_with_details(
+                    "SERVER_NOT_FOUND",
+                    "Server not found; use a server_id from list_servers",
+                    json!({"field":"server_id","server_id":id}),
+                )
+            })
     }
     pub fn save_settings(&self, settings: RuntimeSettings) -> Result<RuntimeSettings> {
         settings.validate()?;
         let mut current = self.settings.lock().unwrap();
         self.database.lock().unwrap().save_settings(&settings)?;
         *current = settings.clone();
+        if settings.remote_read_only {
+            self.tunnels.stop_all();
+        }
         Ok(settings)
     }
     pub fn snapshot(&self) -> Value {
@@ -118,7 +143,7 @@ impl AppState {
                 "approved":approved,"kind":view.kind,"request_source":view.source,"decision_by":"desktop",
                 "server_name":view.server_name,"host":view.host,"username":view.username,
                 "path":view.path,"target":view.target,"command":view.command,
-                "recursive":view.recursive,"missing_ok":view.missing_ok,
+                "recursive":view.recursive,"missing_ok":view.missing_ok,"create_parents":view.create_parents,
                 "requested_at":view.created_at,"decided_at":chrono::Utc::now().to_rfc3339(),"expires_at":view.expires_at,
                 "content_bytes":view.content_bytes,"content_sha256":view.content_sha256
             }})), 0)
@@ -130,7 +155,7 @@ impl AppState {
                 permissions
                     .iter()
                     .all(|kind| MCP_OPERATIONS.contains(&kind.as_str())),
-                "无效的 MCP 操作权限"
+                "Unknown MCP permission"
             );
             permissions.sort();
             permissions.dedup();
@@ -149,16 +174,16 @@ impl AppState {
             || server.username.trim().is_empty()
             || server.port == 0
         {
-            bail!("请填写名称、地址、用户名和有效端口")
+            bail!("Server name, host, username and a valid port are required")
         }
         if !["password", "key", "agent"].contains(&server.auth.as_str()) {
-            bail!("不支持的认证方式")
+            bail!("Unsupported authentication method")
         }
         if server.auth == "key" && server.key_path.is_empty() {
-            bail!("请填写本地私钥绝对路径")
+            bail!("Private key path must be absolute")
         }
         if !server.root.starts_with('/') || server.root.split('/').any(|p| p == "..") {
-            bail!("文件根目录必须是绝对路径且不含 ..")
+            bail!("File root must be absolute and must not contain ..")
         }
         if server.id.is_empty() {
             server.id = uuid::Uuid::new_v4().to_string();
@@ -169,12 +194,12 @@ impl AppState {
                 server.fingerprint.clear();
             }
         } else if !server.fingerprint.is_empty() {
-            bail!("新增服务器请先留空指纹，再核验主机")
+            bail!("Leave the fingerprint empty for a new server, then verify the host")
         }
         if let Some(secret) = secret.filter(|s| !s.is_empty()) {
             keyring::Entry::new("dev.remotedesk.ssh", &server.id)?
                 .set_password(&secret)
-                .context("保存系统凭据失败")?;
+                .context("Cannot save system credentials")?;
         }
         let mut next = config.clone();
         if let Some(s) = next.servers.iter_mut().find(|s| s.id == server.id) {
@@ -183,6 +208,14 @@ impl AppState {
             next.servers.push(server.clone());
         }
         self.database.lock().unwrap().save_server(&server)?;
+        if config
+            .servers
+            .iter()
+            .find(|s| s.id == server.id)
+            .is_some_and(|old| serde_json::to_value(old).ok() != serde_json::to_value(&server).ok())
+        {
+            self.tunnels.stop_server(&server.id);
+        }
         *config = next;
         Ok(server)
     }
@@ -194,12 +227,13 @@ impl AppState {
             .values()
             .any(|t| t.info().server_id == id && t.info().alive)
         {
-            bail!("请先关闭此服务器的终端会话")
+            bail!("Close this server's terminal sessions first")
         }
         let mut config = self.config.lock().unwrap();
         let mut next = config.clone();
         next.servers.retain(|s| s.id != id);
         self.database.lock().unwrap().remove_server(id)?;
+        self.tunnels.stop_server(id);
         *config = next;
         match keyring::Entry::new("dev.remotedesk.ssh", id)?.delete_credential() {
             Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -214,20 +248,43 @@ impl AppState {
         result: &Result<Value>,
         elapsed: u64,
     ) -> Result<()> {
-        let detail = if op.kind.starts_with("terminal") {
+        let detail = if op.kind.starts_with("port_forward_") {
+            if op.kind == "port_forward_open" {
+                format!(
+                    "127.0.0.1:{} → {}:{}",
+                    op.local_port, op.remote_host, op.remote_port
+                )
+            } else {
+                op.tunnel_id.clone()
+            }
+        } else if op.kind.starts_with("terminal") {
             op.session_id.clone()
         } else if op.kind == "exec" || (op.kind.starts_with("security_") && !op.command.is_empty())
         {
             op.command.chars().take(1000).collect()
         } else {
-            op.path.clone()
+            if op.kind == "job" {
+                op.job_id.clone()
+            } else {
+                op.path.clone()
+            }
         };
         let summary = match result {
             Ok(_) if op.kind == "security_approve" => "审批已批准".into(),
             Ok(_) if op.kind == "security_reject" => "审批已拒绝，操作未执行".into(),
+            Ok(v) if op.kind == "exec" && v.get("job_id").is_some() => {
+                format!("已转入 Job: {}", v["job_id"])
+            }
+            Ok(v) if op.kind == "job" => format!("Job {}: {}", op.job_id, v["status"]),
+            Ok(v) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
+                format!("{}: {}", op.transfer_id, v["status"])
+            }
             Ok(v) if op.kind == "exec" => format!("exit: {}", v["exit_code"]),
             Ok(_) => "完成".into(),
-            Err(e) => e.to_string().chars().take(1000).collect(),
+            Err(e) => crate::operation_error::error_message(e)
+                .chars()
+                .take(1000)
+                .collect(),
         };
         let entry = Audit {
             id: uuid::Uuid::new_v4().to_string(),
@@ -237,15 +294,24 @@ impl AppState {
             source: source.into(),
             kind: op.kind.clone(),
             detail,
-            success: op.kind != "security_reject"
-                && result.is_ok()
-                && result
-                    .as_ref()
-                    .ok()
-                    .and_then(|v| v.get("exit_code"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    == 0,
+            success: result
+                .as_ref()
+                .ok()
+                .is_some_and(|v| op.kind == "exec" && v.get("job_id").is_some())
+                || (!result.as_ref().ok().is_some_and(|v| {
+                    matches!(
+                        v["status"].as_str(),
+                        Some("disconnected" | "closed" | "failed" | "cancelled")
+                    )
+                }) && op.kind != "security_reject"
+                    && result.is_ok()
+                    && result
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("exit_code"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        == 0),
             duration_ms: elapsed,
             summary,
             response: Some(audit_response(op, result)),
@@ -255,7 +321,7 @@ impl AppState {
             .lock()
             .unwrap()
             .insert_audit(&entry)
-            .context("操作记录写入 SQLite 失败")?;
+            .context("Cannot write audit record to SQLite")?;
         audits.push(entry);
         if audits.len() > 500 {
             audits.remove(0);
@@ -265,13 +331,47 @@ impl AppState {
 }
 
 pub async fn execute(state: Arc<AppState>, op: Operation, source: &'static str) -> Result<Value> {
+    execute_with_progress(state, op, source, None).await
+}
+
+pub async fn execute_with_progress(
+    state: Arc<AppState>,
+    mut op: Operation,
+    source: &'static str,
+    progress: crate::jobs::Progress,
+) -> Result<Value> {
+    if op.kind == "port_forward_open" {
+        op.path = format!("127.0.0.1:{}", op.local_port);
+        op.target = format!("{}:{}", op.remote_host, op.remote_port);
+    }
+    if matches!(op.kind.as_str(), "upload_file" | "download_file") {
+        return crate::transfers::start(state, op, source).await;
+    }
+    if op.kind == "transfer" {
+        let start = std::time::Instant::now();
+        let result = state.transfers.operate(&state, &op, source).await;
+        if source == "mcp" {
+            state.log(
+                &state.server(&op.server_id)?,
+                source,
+                &op,
+                &result,
+                start.elapsed().as_millis() as u64,
+            )?;
+        }
+        return result;
+    }
     let start = std::time::Instant::now();
     let server = state.server(&op.server_id)?;
     let approval = async {
         let settings = validate_operation(&state, &server, &op, source)?;
         let needed = crate::security::needs_approval(&settings, &op, source);
         if needed {
-            state.approvals.wait(&server, &op, source).await?;
+            state
+                .approvals
+                .wait_with_timeout(&server, &op, source, settings.approval_timeout_secs)
+                .await
+                .map_err(|e| crate::operation_error::with_stage(e, "approval"))?;
         }
         Ok::<bool, anyhow::Error>(needed)
     }
@@ -297,19 +397,33 @@ pub async fn execute(state: Arc<AppState>, op: Operation, source: &'static str) 
             let _guard = file_lock.as_ref().map(|lock| lock.lock().unwrap());
             let live = state.server(&op.server_id)?;
             if approved && serde_json::to_value(&live)? != serde_json::to_value(&server)? {
-                bail!("服务器配置已变更，审批失效，请重新发起操作")
+                bail!("Server configuration changed; approval is invalid")
             }
             let settings = validate_operation(&state, &live, &op, source)?;
             if !approved && crate::security::needs_approval(&settings, &op, source) {
-                bail!("审批策略已变更，请重新发起操作")
+                bail!("Approval policy changed; submit the operation again")
             }
-            if op.kind.starts_with("terminal_") {
+            if op.kind.starts_with("port_forward_") {
+                crate::tunnels::operate(&state, &live, &op, source)
+            } else if op.kind == "exec" {
+                crate::jobs::execute(&state, &live, &op, &settings, source, &progress)
+            } else if op.kind == "job" {
+                state.jobs.operate(&op, &progress)
+            } else if op.kind.starts_with("terminal_") {
                 crate::terminal::operate(&state, &live, &op)
             } else {
                 crate::ssh::operate_with_settings(&live, &op, &settings)
             }
         });
-        if op.kind != "terminal_read" && op.kind != "terminal_resize" {
+        if (source == "mcp"
+            || (op.kind != "terminal_read"
+                && op.kind != "terminal_resize"
+                && !(op.kind == "job" && op.job_action != "close" && result.is_ok())))
+            && !result
+                .as_ref()
+                .ok()
+                .is_some_and(|v| v.get("job_id").is_some() && op.kind == "exec")
+        {
             state
                 .log(
                     &server,
@@ -318,7 +432,7 @@ pub async fn execute(state: Arc<AppState>, op: Operation, source: &'static str) 
                     &result,
                     start.elapsed().as_millis() as u64,
                 )
-                .context("操作已处理，但审计日志写入失败；请检查数据目录")?;
+                .context("Operation processed, but audit write failed; check the data directory")?;
         }
         result
     })
@@ -331,14 +445,28 @@ fn validate_operation(
     op: &Operation,
     source: &str,
 ) -> Result<RuntimeSettings> {
-    if !server.enabled && !(source == "desktop" && op.kind == "terminal_close") {
-        bail!("服务器已停用")
-    }
-    if source == "mcp" && !server.permits_mcp(&op.kind) {
-        return Err(crate::file_tools::error(
-            "PERMISSION_DENIED",
-            "此服务器未授权 MCP 操作",
+    if !server.enabled
+        && !(source == "desktop"
+            && matches!(
+                op.kind.as_str(),
+                "terminal_close" | "port_forward_close" | "port_forward_read" | "port_forward_list"
+            ))
+    {
+        return Err(crate::operation_error::error(
+            "SERVER_DISABLED",
+            "Server is disabled",
         ));
+    }
+    if source == "mcp" {
+        let mut required = vec![op.kind.as_str()];
+        if op.kind == "edit_file" {
+            required.push("read_file");
+        }
+        crate::file_tools::require_mcp_permissions(server, &required)
+            .map_err(|e| crate::operation_error::with_stage(e, "authorization"))?;
+    }
+    if op.kind.starts_with("port_forward_") {
+        crate::tunnels::validate(op)?;
     }
     if source == "mcp" {
         anyhow::ensure!(
@@ -351,7 +479,7 @@ fn validate_operation(
                 | "write_file"
                 | "edit_file"
                 | "list_files"
-                | "preview_file"
+                | "stat_file"
                 | "download"
                 | "upload"
                 | "remove"
@@ -391,11 +519,22 @@ fn validate_operation(
             && op.target.len() <= 8192
             && op.command.len() <= 16384
             && op.session_id.len() <= 128,
-        "操作参数过长"
+        "Operation arguments exceed size limits"
     );
+    if op.kind == "job" {
+        anyhow::ensure!(
+            matches!(op.job_action.as_str(), "list" | "read" | "close") && op.wait_secs <= 30,
+            "INVALID_ARGUMENT: job action must be list/read/close; wait_secs must be 0-30"
+        );
+        anyhow::ensure!(
+            op.job_action == "list" || (!op.job_id.is_empty() && op.job_id.len() <= 128),
+            "INVALID_ARGUMENT: job_id is required (max 128 bytes)"
+        );
+    }
     let settings = state.settings.lock().unwrap().clone();
     crate::ssh::validate_payload(op, &settings)?;
-    crate::security::check(&settings, op, source)?;
+    crate::security::check(&settings, op, source)
+        .map_err(|e| crate::operation_error::with_stage(e, "policy"))?;
     Ok(settings)
 }
 
@@ -414,13 +553,32 @@ fn clip_text(text: &str, max_bytes: usize, truncated: &mut bool) -> String {
 fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
     let mut truncated = false;
     let data = match result {
-        Err(error) => {
-            let details = error
-                .downcast_ref::<crate::file_tools::FileError>()
-                .and_then(|e| e.details.clone());
-            json!({"error": clip_text(&format!("{error:#}"), 16384, &mut truncated),"details":details})
+        Err(e) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
+            let spec = op.transfer_request.as_ref();
+            json!({"transfer_id":op.transfer_id,"server_id":op.server_id,"direction":if op.kind == "upload_file" {"upload"} else {"download"},"local_path":spec.map(|s| &s.local_path),"remote_path":spec.map(|s| &s.remote_path),"overwrite":spec.map(|s| s.overwrite),"status":"failed","transferred_bytes":0,"error":crate::operation_error::error_response(e, op)})
         }
-        Ok(value) if op.kind == "exec" => {
+        Ok(value) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
+            json!({"transfer_id":value["transfer_id"],"direction":value["direction"],"server_id":op.server_id,"local_path":value["local_path"],"remote_path":value["remote_path"],"overwrite":value["overwrite"],"status":value["status"],"total_bytes":value["total_bytes"],"transferred_bytes":value["transferred_bytes"],"created_at":value["created_at"],"finished_at":value["finished_at"],"elapsed_ms":value["elapsed_ms"],"error":value["error"]})
+        }
+        Err(error) => {
+            let mut response = crate::operation_error::error_response(error, op);
+            response["message"] = json!(clip_text(
+                response["message"].as_str().unwrap_or(""),
+                16384,
+                &mut truncated
+            ));
+            response
+        }
+        Ok(value) if op.kind == "terminal_read" => {
+            let stdout = clip_text(
+                value["stdout"].as_str().unwrap_or(""),
+                16384,
+                &mut truncated,
+            );
+            truncated |= value["truncated"].as_bool().unwrap_or(false);
+            json!({"stdout":stdout,"cursor":value["cursor"],"alive":value["alive"],"truncated":value["truncated"],"has_more":value["has_more"]})
+        }
+        Ok(value) if op.kind == "exec" || (op.kind == "job" && op.job_action != "list") => {
             let stdout = clip_text(
                 value["stdout"].as_str().unwrap_or(""),
                 16384,
@@ -432,10 +590,9 @@ fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
                 &mut truncated,
             );
             truncated |= value["truncated"].as_bool().unwrap_or(false);
-            json!({"stdout": stdout, "stderr": stderr, "exit_code":value["exit_code"]})
-        }
-        Ok(value) if op.kind == "preview_file" => {
-            json!({"bytes": value["bytes"], "kind": value["kind"], "truncated":value["truncated"], "message":"预览完成，文件正文不写入操作记录"})
+            truncated |= value["stdout_has_more"].as_bool().unwrap_or(false)
+                || value["stderr_has_more"].as_bool().unwrap_or(false);
+            json!({"stdout": stdout, "stderr": stderr, "exit_code":value["exit_code"],"status":value["status"],"job_id":value["job_id"],"action":op.job_action,"error":value["error"],"next_stdout_cursor":value["next_stdout_cursor"],"next_stderr_cursor":value["next_stderr_cursor"],"stdout_truncated":value["stdout_truncated"],"stderr_truncated":value["stderr_truncated"]})
         }
         Ok(value) if op.kind == "read_file" => {
             json!({"bytes": value["content"].as_str().unwrap_or("").len(), "message":"读取完成，文件正文不写入操作记录"})
@@ -459,5 +616,9 @@ fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
     } else {
         data
     };
-    AuditResponse { data, truncated }
+    AuditResponse {
+        data,
+        truncated,
+        input: Some(crate::audit_input::capture(op)),
+    }
 }

@@ -21,7 +21,16 @@ export function readPreferences(): Preferences {
     const choices: Record<string, string[]> = {
       theme: ["system", "light", "dark"],
       density: ["comfortable", "compact"],
-      startPage: ["servers", "files", "terminals", "audit", "mcp", "settings"],
+      startPage: [
+        "servers",
+        "files",
+        "terminals",
+        "jobs",
+        "tunnels",
+        "audit",
+        "mcp",
+        "settings",
+      ],
       refreshSeconds: ["0", "3", "5", "10", "30"],
       terminalFontSize: ["12", "13", "14", "15", "16"],
       terminalTheme: ["dark", "light", "app"],

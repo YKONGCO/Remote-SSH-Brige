@@ -16,9 +16,42 @@ import type {
 import { chooseBrowserSave } from "./save-file";
 import { newServer } from "./types";
 import { clientNames } from "./mcp-clients";
+import type { JobInfo } from "./jobs";
+import type { TunnelInfo } from "./tunnels";
+const demoTunnels: TunnelInfo[] = [];
 export const desktop = isTauri();
 let demoSettings = { ...defaultRuntimeSettings };
 const now = Date.now();
+const demoJobs: JobInfo[] = [
+  {
+    job_id: "job_demo_running",
+    server_id: "demo-1",
+    server_name: "生产服务器",
+    command: "tail -f /var/log/app.log",
+    source: "mcp",
+    created_at: new Date(now - 60000).toISOString(),
+    status: "running",
+    exit_code: null,
+    error: null,
+    duration_ms: 60000,
+    stdout_end_cursor: 44,
+    stderr_end_cursor: 0,
+  },
+  {
+    job_id: "job_demo_exited",
+    server_id: "demo-2",
+    server_name: "开发服务器",
+    command: "sleep 40 && echo completed",
+    source: "mcp",
+    created_at: new Date(now - 180000).toISOString(),
+    status: "exited",
+    exit_code: 0,
+    error: null,
+    duration_ms: 40000,
+    stdout_end_cursor: 10,
+    stderr_end_cursor: 0,
+  },
+];
 let demo: Snapshot = {
   servers: [
     {
@@ -127,6 +160,115 @@ export async function api<T = unknown>(
   args: Record<string, unknown> = {},
 ): Promise<T> {
   if (desktop) return invoke<T>(command, args);
+  if (command === "list_port_forwards")
+    return { tunnels: demoTunnels.map((t) => ({ ...t })) } as T;
+  if (command === "port_forward") {
+    const request = args.args as {
+      action: string;
+      server_id: string;
+      tunnel_id?: string;
+      local_port?: number;
+      remote_port?: number;
+      remote_host?: string;
+    };
+    const server = demo.servers.find((s) => s.id === request.server_id);
+    if (!server) throw new Error("服务器不存在");
+    if (request.action === "open") {
+      if (demoSettings.remote_read_only)
+        throw new Error("只读模式禁止创建端口转发");
+      if (!server.enabled) throw new Error("服务器已停用");
+      if (
+        !request.remote_port ||
+        !Number.isInteger(request.remote_port) ||
+        request.remote_port < 1 ||
+        request.remote_port > 65535 ||
+        !Number.isInteger(request.local_port ?? 0) ||
+        (request.local_port ?? 0) < 0 ||
+        (request.local_port ?? 0) > 65535
+      )
+        throw new Error("端口无效");
+      if (!["127.0.0.1", "::1"].includes(request.remote_host ?? "127.0.0.1"))
+        throw new Error("远端地址无效");
+      let port = request.local_port || 18080;
+      if (!request.local_port)
+        while (
+          demoTunnels.some(
+            (t) => t.local_port === port && t.status === "running",
+          )
+        )
+          port++;
+      if (
+        demoTunnels.some((t) => t.local_port === port && t.status === "running")
+      )
+        throw new Error("端口已被占用");
+      const item: TunnelInfo = {
+        tunnel_id: crypto.randomUUID(),
+        server_id: server.id,
+        server_name: server.name,
+        source: "desktop",
+        local_host: "127.0.0.1",
+        local_port: port,
+        remote_host: request.remote_host || "127.0.0.1",
+        remote_port: request.remote_port,
+        status: "running",
+        created_at: new Date().toISOString(),
+        connections: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        error: null,
+      };
+      demoTunnels.unshift(item);
+      return { ...item } as T;
+    }
+    const item = demoTunnels.find(
+      (t) => t.tunnel_id === request.tunnel_id && t.server_id === server.id,
+    );
+    if (!item) throw new Error("转发不存在");
+    if (request.action === "close") item.status = "closed";
+    return { ...item } as T;
+  }
+  if (command === "list_jobs")
+    return {
+      jobs: demoJobs.map((job) => ({
+        ...job,
+        duration_ms:
+          job.status === "running"
+            ? Date.now() - Date.parse(job.created_at)
+            : job.duration_ms,
+      })),
+    } as T;
+  if (command === "job") {
+    const job = demoJobs.find(
+      (item) => item.job_id === args.jobId && item.server_id === args.serverId,
+    );
+    if (!job) throw new Error("Job 不存在或已过期");
+    if (args.action === "close" && job.status === "running") {
+      job.status = "closed";
+      job.duration_ms = Date.now() - Date.parse(job.created_at);
+    }
+    const stdout = new TextEncoder().encode(
+      job.job_id === "job_demo_exited"
+        ? "completed\n"
+        : "Worker started.\nWaiting for output...\n",
+    );
+    return {
+      job_id: job.job_id,
+      server_id: job.server_id,
+      status: job.status,
+      exit_code: job.exit_code,
+      error: null,
+      stdout: new TextDecoder().decode(
+        stdout.slice(Number(args.stdoutCursor || 0)),
+      ),
+      stderr: "",
+      next_stdout_cursor: stdout.length,
+      next_stderr_cursor: 0,
+      stdout_truncated: false,
+      stderr_truncated: false,
+      stdout_has_more: false,
+      stderr_has_more: false,
+    } as T;
+  }
   if (command === "mcp_clients")
     return Object.entries(clientNames).map(([id, name]) => ({
       id,
@@ -136,6 +278,11 @@ export async function api<T = unknown>(
     })) as T;
   if (command === "configure_mcp_client")
     throw new Error("一键配置需要在桌面应用中使用。");
+  if (command === "transfer") return { transfers: [] } as T;
+  if (command === "upload_file")
+    throw new Error("File streaming requires the desktop app.");
+  if (command === "pick_local_directories")
+    throw new Error("请选择桌面应用中的文件夹，浏览器预览支持手动填写目录。");
   if (command === "runtime_settings") return structuredClone(demoSettings) as T;
   if (command === "pending_approvals") return [] as T;
   if (command === "resolve_approval")
@@ -143,8 +290,9 @@ export async function api<T = unknown>(
   if (command === "save_runtime_settings") {
     const next = args.settings as RuntimeSettings;
     const ranges = {
-      upload_limit_mib: [1, MAX_TRANSFER_MIB],
-      download_limit_mib: [1, MAX_TRANSFER_MIB],
+      approval_timeout_secs: [1, 120],
+      upload_limit_mib: [0, MAX_TRANSFER_MIB],
+      download_limit_mib: [0, MAX_TRANSFER_MIB],
       connect_timeout_secs: [1, 120],
       io_timeout_secs: [1, 300],
       command_timeout_secs: [1, 300],
@@ -225,7 +373,6 @@ export async function api<T = unknown>(
               [
                 "list_files",
                 "read_file",
-                "preview_file",
                 "write_file",
                 "edit_file",
                 "remove_path",
@@ -234,7 +381,13 @@ export async function api<T = unknown>(
                 "rename",
                 "upload",
                 "download",
+                "upload_file",
+                "download_file",
               ].includes(a.kind))) &&
+          (!query.start_time ||
+            Date.parse(a.time) >= Date.parse(query.start_time)) &&
+          (!query.end_time ||
+            Date.parse(a.time) < Date.parse(query.end_time)) &&
           (a.server_name + " " + a.detail + " " + a.kind)
             .toLowerCase()
             .includes(query.search.toLowerCase()),
@@ -302,7 +455,10 @@ export async function operate<T = Record<string, unknown>>(
   ].includes(op.kind);
   if (demoSettings.remote_read_only && sensitive)
     throw new Error("只读保护已开启");
-  if (demoSettings.deletion_protection && op.kind === "remove")
+  if (
+    demoSettings.deletion_protection &&
+    ["remove", "remove_path"].includes(op.kind)
+  )
     throw new Error("删除保护已开启，请在设置中关闭后再删除");
   if (demoSettings.approval_mode === "all" && sensitive)
     throw new Error("操作审批需要在桌面应用中使用。");
@@ -335,15 +491,6 @@ export async function operate<T = Record<string, unknown>>(
       result = { path: p, entries };
       break;
     }
-    case "preview_file":
-      if (typeof files[p] !== "string") throw new Error("文件不存在");
-      result = {
-        kind: "text",
-        content: files[p],
-        bytes: new TextEncoder().encode(files[p]).length,
-        truncated: false,
-      };
-      break;
     case "read_file":
       if (typeof files[p] !== "string") throw new Error("文件不存在");
       result = { content: files[p] };
@@ -407,11 +554,9 @@ export async function operate<T = Record<string, unknown>>(
     }
     case "terminal_read":
       result = {
-        base64: op.cursor
+        stdout: op.cursor
           ? ""
-          : btoa(
-              "\r\nRemote SSH Brige - browser preview\r\nPermission-controlled SSH access for AI agents over MCP.\r\nUse the desktop app for a real SSH shell.\r\n\r\n$ ",
-            ),
+          : "\r\nRemote SSH Brige - browser preview\r\nPermission-controlled SSH access for AI agents over MCP.\r\nUse the desktop app for a real SSH shell.\r\n\r\n$ ",
         cursor: 1,
         alive: true,
       };
@@ -439,7 +584,7 @@ export async function operate<T = Record<string, unknown>>(
       summary: "演示操作",
       response: {
         data:
-          op.kind === "read_file" || op.kind === "preview_file"
+          op.kind === "read_file"
             ? { message: "读取完成，文件正文不写入操作记录" }
             : op.kind === "download"
               ? { message: "下载完成" }

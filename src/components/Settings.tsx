@@ -10,7 +10,11 @@ import {
   advancedShell,
   defaultAllowedCommands,
   validCommandLists,
+  parseCommandList,
+  MAX_COMMAND_RULES,
 } from "../runtime-settings";
+import { CommandPresets } from "./CommandPresets";
+import { X, RotateCcw, Check, ShieldBan, FolderOpen } from "lucide-react";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
@@ -50,9 +54,50 @@ export function Settings() {
   const [saving, setSaving] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [listsOpen, setListsOpen] = useState(false);
+  const [rootsEditor, setRootsEditor] = useState<
+    "local_upload_roots" | "local_download_roots" | null
+  >(null);
+  const [rootsDraft, setRootsDraft] = useState("");
+  const [pickingDirectories, setPickingDirectories] = useState(false);
   const [allowedDraft, setAllowedDraft] = useState("");
   const [blockedDraft, setBlockedDraft] = useState("");
   const policy = runtime ? effectiveCommandPolicy(runtime) : undefined;
+  async function pickDirectories() {
+    if (pickingDirectories || saving) return;
+    setPickingDirectories(true);
+    setError("");
+    try {
+      const selected = await api<string[]>("pick_local_directories");
+      if (!selected.length) return;
+      const paths = rootsDraft
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const key = (path: string) => {
+        const windows = /^[a-z]:[\\/]|^\\\\/i.test(path);
+        const normalized = windows
+          ? path.replaceAll("\\", "/").toLowerCase()
+          : path;
+        return normalized.replace(/\/+$/, "") || "/";
+      };
+      const seen = new Set(paths.map(key));
+      for (const path of selected) {
+        if (!seen.has(key(path))) {
+          paths.push(path);
+          seen.add(key(path));
+        }
+      }
+      if (paths.length > 64) {
+        setError("最多授权 64 个目录，请先移除部分目录。");
+        return;
+      }
+      setRootsDraft(paths.join("\n"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPickingDirectories(false);
+    }
+  }
   async function updateCommand(patch: Partial<CommandPolicy>) {
     if (!policy) return false;
     const next = {
@@ -237,7 +282,7 @@ export function Settings() {
   }
   return (
     <div className="settings-layout" aria-busy={saving}>
-      {error && !listsOpen && (
+      {error && !listsOpen && !rootsEditor && (
         <p role="alert" className="error-inline">
           {error}{" "}
           {loadFailed && (
@@ -250,20 +295,19 @@ export function Settings() {
       <section className="settings-section">
         <h2 className="settings-group-title">常规</h2>
         <div className="settings-card">
-          <Row title="启动页面" description="下次打开应用时默认显示的页面。">
+          <Row title="启动页面" description="打开应用时显示的页面。">
             {select("startPage", "启动页面", [
               ["servers", "服务器"],
               ["files", "远程文件"],
               ["terminals", "终端会话"],
+              ["jobs", "后台任务"],
+              ["tunnels", "端口转发"],
               ["audit", "操作记录"],
               ["mcp", "MCP 服务"],
               ["settings", "设置"],
             ])}
           </Row>
-          <Row
-            title="关闭窗口时"
-            description="选择退出应用，或保持后台运行并收起到托盘。"
-          >
+          <Row title="关闭窗口时" description="收起到托盘可保持后台运行。">
             <SelectField
               className="setting-select"
               aria-label="关闭窗口时"
@@ -282,7 +326,7 @@ export function Settings() {
           </Row>
           <Row
             title="状态刷新频率"
-            description="更新服务器、会话与操作记录；不影响终端输出。"
+            description="列表自动刷新间隔，不影响终端输出。"
           >
             {select("refreshSeconds", "状态刷新频率", [
               ["3", "每 3 秒"],
@@ -297,23 +341,20 @@ export function Settings() {
       <section className="settings-section">
         <h2 className="settings-group-title">外观与体验</h2>
         <div className="settings-card">
-          <Row
-            title="主题外观"
-            description="选择喜欢的色调，或跟随系统自动切换。"
-          >
+          <Row title="主题外观" description="浅色、深色或跟随系统。">
             {select("theme", "主题外观", [
               ["light", "浅色"],
               ["dark", "深色"],
               ["system", "跟随系统"],
             ])}
           </Row>
-          <Row title="界面密度" description="调整服务器列表的行间距。">
+          <Row title="界面密度" description="调整列表行距。">
             {select("density", "界面密度", [
               ["comfortable", "舒适"],
               ["compact", "紧凑"],
             ])}
           </Row>
-          <Row title="界面动效" description="启用按钮与面板的轻量过渡。">
+          <Row title="界面动效" description="按钮与面板的过渡效果。">
             {toggle("motion", "界面动效")}
           </Row>
         </div>
@@ -322,26 +363,26 @@ export function Settings() {
         <h2 className="settings-group-title">安全控制</h2>
         <div className="settings-card">
           <Row
-            title="桌面删除保护"
-            description="阻止桌面文件管理中的删除；MCP 安全删除由服务器的独立授权控制。"
-          >
-            {securityToggle("deletion_protection", "桌面删除保护")}
-          </Row>
-          <Row
-            title="危险命令拦截"
-            description="拦截可解析 Shell 命令中的 rm、磁盘破坏、关机等已知高危操作。"
-          >
-            {securityToggle("block_dangerous_commands", "危险命令拦截")}
-          </Row>
-          <Row
             title="只读保护"
-            description="禁止修改文件、执行命令和终端输入；查看与下载仍可使用。"
+            description="禁止文件修改、命令和终端交互，允许查看与下载。"
           >
             {securityToggle("remote_read_only", "只读保护")}
           </Row>
           <Row
+            title="删除保护"
+            description="禁止桌面和 MCP 文件删除，不限制 Shell 和终端。"
+          >
+            {securityToggle("deletion_protection", "删除保护")}
+          </Row>
+          <Row
+            title="危险命令拦截"
+            description="拦截 rm、磁盘破坏、关机等高危命令。"
+          >
+            {securityToggle("block_dangerous_commands", "危险命令拦截")}
+          </Row>
+          <Row
             title="审批模式"
-            description="修改文件、执行命令或打开终端前审批；请求 2 分钟后自动失效。"
+            description="敏感操作需确认，超过等待时间则自动拒绝。"
           >
             <SelectField
               className="setting-select"
@@ -360,6 +401,17 @@ export function Settings() {
               <option value="all">所有来源的敏感操作</option>
             </SelectField>
           </Row>
+          <Row
+            title="审批等待时间"
+            description="超时自动拒绝。修改对新请求生效，待审批请求保留原截止时间。"
+          >
+            {runtimeSelect(
+              "approval_timeout_secs",
+              "审批等待时间",
+              [1, 5, 10, 15, 30, 60, 120],
+              "秒",
+            )}
+          </Row>
         </div>
       </section>
       <section className="settings-section">
@@ -367,7 +419,7 @@ export function Settings() {
         <div className="settings-card">
           <Row
             title="命令执行范围"
-            description="不限命令仍受黑名单和危险命令拦截限制。"
+            description="“不限命令”仍受黑名单和高危拦截限制。"
           >
             <SelectField
               className="setting-select"
@@ -388,7 +440,7 @@ export function Settings() {
           </Row>
           <Row
             title="命令名单管理"
-            description="添加、修改或删除白名单和黑名单，黑名单优先。"
+            description="配置白名单和黑名单，黑名单优先。"
           >
             <Button
               variant="outline"
@@ -410,7 +462,7 @@ export function Settings() {
           </Row>
           <Row
             title="允许 Shell 高级功能"
-            description="统一控制管道、组合命令、重定向、命令替换和脚本执行。脚本内容无法完整检查。"
+            description="允许管道、重定向、组合命令与脚本；脚本内容无法完整检查。"
           >
             <div className="flex items-center gap-2">
               {policy &&
@@ -430,7 +482,7 @@ export function Settings() {
           </Row>
           <Row
             title="允许 AI 交互终端"
-            description="允许 AI 打开终端和发送输入，仍需服务器授权；终端输入不经过命令名单检查。"
+            description="需服务器授权；终端输入不受命令名单检查。"
           >
             {commandToggle("allow_mcp_terminal", "允许 AI 交互终端")}
           </Row>
@@ -439,10 +491,7 @@ export function Settings() {
       <section className="settings-section">
         <h2 className="settings-group-title">连接与命令</h2>
         <div className="settings-card">
-          <Row
-            title="连接超时"
-            description="每个服务器地址建立 TCP 连接的最长等待时间。"
-          >
+          <Row title="连接超时" description="建立服务器连接的最长等待时间。">
             {runtimeSelect(
               "connect_timeout_secs",
               "连接超时",
@@ -450,10 +499,7 @@ export function Settings() {
               "秒",
             )}
           </Row>
-          <Row
-            title="读写超时"
-            description="SSH 握手、认证和文件传输的单次阻塞等待时间。"
-          >
+          <Row title="读写超时" description="SSH 连接与传输的单次等待上限。">
             {runtimeSelect(
               "io_timeout_secs",
               "读写超时",
@@ -463,7 +509,7 @@ export function Settings() {
           </Row>
           <Row
             title="默认命令超时"
-            description="MCP 未指定执行时限时使用，可单次覆盖，最长 300 秒。"
+            description="MCP 命令的默认时限，单次可覆盖，最长 300 秒。"
           >
             {runtimeSelect(
               "command_timeout_secs",
@@ -472,20 +518,38 @@ export function Settings() {
               "秒",
             )}
           </Row>
+          <Row
+            title="命令超时后保留为后台任务"
+            description="超时后继续运行，需服务器授权后台任务。"
+          >
+            <button
+              type="button"
+              className="setting-switch"
+              role="switch"
+              aria-label="命令超时后保留为后台任务"
+              aria-checked={runtime?.exec_timeout_to_job ?? false}
+              disabled={!runtime || saving}
+              onClick={() =>
+                void updateRuntime(
+                  "exec_timeout_to_job",
+                  !runtime?.exec_timeout_to_job,
+                )
+              }
+            >
+              <span />
+            </button>
+          </Row>
         </div>
       </section>
       <section className="settings-section">
         <h2 className="settings-group-title">远程文件</h2>
         <div className="settings-card">
-          <Row
-            title="显示隐藏文件"
-            description="显示以点开头的文件与文件夹，例如 .ssh。"
-          >
+          <Row title="显示隐藏文件" description="显示 .ssh 等以点开头的文件。">
             {toggle("showHidden", "显示隐藏文件")}
           </Row>
           <Row
             title="单文件上传上限"
-            description="支持 1–256 MiB，离开输入框或按回车保存；同时限制文本写入。"
+            description="单个上传文件的大小上限，0 表示不限。"
           >
             <TransferLimitField
               label="单文件上传上限"
@@ -496,7 +560,7 @@ export function Settings() {
           </Row>
           <Row
             title="单文件下载上限"
-            description="支持 1–256 MiB，离开输入框或按回车保存；同时限制文本读取。"
+            description="单个下载文件的大小上限，0 表示不限。"
           >
             <TransferLimitField
               label="单文件下载上限"
@@ -505,12 +569,64 @@ export function Settings() {
               onSave={(value) => updateRuntime("download_limit_mib", value)}
             />
           </Row>
+          <Row
+            title="MCP 本地上传目录"
+            description="AI 可上传的本机目录，留空禁用。"
+          >
+            <div className="transfer-roots-summary">
+              <span className="muted">
+                {runtime?.local_upload_roots?.length
+                  ? `已授权 ${runtime.local_upload_roots.length} 个目录`
+                  : "未开放"}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="管理 MCP 本地上传目录"
+                disabled={!runtime || saving}
+                onClick={() => {
+                  setRootsDraft((runtime?.local_upload_roots ?? []).join("\n"));
+                  setRootsEditor("local_upload_roots");
+                  setError("");
+                }}
+              >
+                管理目录
+              </Button>
+            </div>
+          </Row>
+          <Row
+            title="MCP 本地下载目录"
+            description="AI 下载的本机保存目录，留空禁用。"
+          >
+            <div className="transfer-roots-summary">
+              <span className="muted">
+                {runtime?.local_download_roots?.length
+                  ? `已授权 ${runtime.local_download_roots.length} 个目录`
+                  : "未开放"}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="管理 MCP 本地下载目录"
+                disabled={!runtime || saving}
+                onClick={() => {
+                  setRootsDraft(
+                    (runtime?.local_download_roots ?? []).join("\n"),
+                  );
+                  setRootsEditor("local_download_roots");
+                  setError("");
+                }}
+              >
+                管理目录
+              </Button>
+            </div>
+          </Row>
         </div>
       </section>
       <section className="settings-section">
         <h2 className="settings-group-title">终端</h2>
         <div className="settings-card">
-          <Row title="终端配色" description="独立设置终端背景，默认使用深色。">
+          <Row title="终端配色" description="独立于界面主题，默认深色。">
             {select("terminalTheme", "终端配色", [
               ["dark", "深色"],
               ["light", "浅色"],
@@ -524,12 +640,12 @@ export function Settings() {
               [12, 13, 14, 15, 16].map((n) => [String(n), `${n} px`]),
             )}
           </Row>
-          <Row title="光标闪烁" description="让当前输入位置更容易识别。">
+          <Row title="光标闪烁" description="输入光标的闪烁效果。">
             {toggle("cursorBlink", "光标闪烁")}
           </Row>
           <Row
             title="回滚行数"
-            description="终端视图保留的历史行数，不改变服务端输出缓冲上限。"
+            description="界面保留的历史行数，不影响后端输出缓存。"
           >
             {select(
               "terminalScrollback",
@@ -542,7 +658,7 @@ export function Settings() {
           </Row>
           <Row
             title="终端会话上限"
-            description="限制新建会话数量；降低上限不会关闭已有会话。"
+            description="限制新建会话，不关闭已有会话。"
           >
             {runtimeSelect(
               "max_terminals",
@@ -553,33 +669,155 @@ export function Settings() {
           </Row>
         </div>
       </section>
+      {rootsEditor && (
+        <ModalFrame
+          className="settings-editor-dialog directory-roots-modal"
+          width={640}
+          onClose={() => {
+            if (!saving && !pickingDirectories) {
+              setRootsEditor(null);
+              setError("");
+            }
+          }}
+        >
+          <form
+            className="modal-layout"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (pickingDirectories) return;
+              const paths = [
+                ...new Set(
+                  rootsDraft
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter(Boolean),
+                ),
+              ];
+              if (await updateRuntime(rootsEditor, paths)) setRootsEditor(null);
+            }}
+          >
+            <div className="modal-head settings-editor-head">
+              <DialogTitle>
+                {rootsEditor === "local_upload_roots"
+                  ? "MCP 本地上传目录"
+                  : "MCP 本地下载目录"}
+              </DialogTitle>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="关闭目录管理"
+                disabled={saving || pickingDirectories}
+                onClick={() => {
+                  setRootsEditor(null);
+                  setError("");
+                }}
+              >
+                <X size={16} />
+              </Button>
+            </div>
+            <div className="modal-body">
+              <div className="directory-roots-toolbar">
+                <label htmlFor="local-roots-editor">
+                  授权目录{" "}
+                  <span>
+                    {
+                      new Set(
+                        rootsDraft
+                          .split(/\r?\n/)
+                          .map((line) => line.trim())
+                          .filter(Boolean),
+                      ).size
+                    }{" "}
+                    / 64
+                  </span>
+                </label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!desktop || saving || pickingDirectories}
+                  title={
+                    desktop
+                      ? "可一次选择多个文件夹"
+                      : "仅桌面端支持选择，浏览器请手动填写"
+                  }
+                  onClick={() => void pickDirectories()}
+                >
+                  <FolderOpen size={14} />
+                  {pickingDirectories ? "选择中…" : "选择文件夹"}
+                </Button>
+              </div>
+              <Textarea
+                id="local-roots-editor"
+                autoFocus
+                className="mono"
+                aria-label="本地授权目录"
+                rows={12}
+                placeholder={
+                  "每行一个本地绝对路径，留空禁用\n例如 D:/files 或 /home/user/files"
+                }
+                title="目录位于运行此应用的电脑，保存后生效"
+                value={rootsDraft}
+                disabled={saving || pickingDirectories}
+                onChange={(event) => setRootsDraft(event.target.value)}
+              />
+              {error && (
+                <p className="error-inline" role="alert">
+                  {error}
+                </p>
+              )}
+            </div>
+            <div className="modal-foot flex gap-2 justify-end">
+              <Button
+                type="button"
+                variant="ghost"
+                className="settings-editor-reset"
+                disabled={saving || pickingDirectories}
+                onClick={() => {
+                  setRootsDraft("");
+                  setError("");
+                }}
+              >
+                清空目录
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={saving || pickingDirectories}
+                onClick={() => {
+                  setRootsEditor(null);
+                  setError("");
+                }}
+              >
+                取消
+              </Button>
+              <Button type="submit" disabled={saving || pickingDirectories}>
+                {saving ? "保存中…" : "保存目录"}
+              </Button>
+            </div>
+          </form>
+        </ModalFrame>
+      )}
       {listsOpen && (
         <ModalFrame
+          className="settings-editor-dialog command-list-modal"
           onClose={() => {
             if (!saving) {
               setListsOpen(false);
               setError("");
             }
           }}
-          width={640}
+          width={940}
         >
           <form
             className="modal-layout"
             onSubmit={async (event) => {
               event.preventDefault();
-              const parse = (value: string) => [
-                ...new Set(
-                  value
-                    .split(/\r?\n/)
-                    .map((line) => line.trim())
-                    .filter(Boolean),
-                ),
-              ];
-              const allowed_commands = parse(allowedDraft),
-                blocked_commands = parse(blockedDraft);
+              const allowed_commands = parseCommandList(allowedDraft),
+                blocked_commands = parseCommandList(blockedDraft);
               if (!validCommandLists(allowed_commands, blocked_commands)) {
                 setError(
-                  "每个名单最多 256 项，仅填写命令名称或完整路径，不要填写参数、通配符或 Shell 语法。",
+                  `每份名单最多 ${MAX_COMMAND_RULES} 项；不要填写参数、通配符或 Shell 语法。`,
                 );
                 return;
               }
@@ -587,32 +825,71 @@ export function Settings() {
                 setListsOpen(false);
             }}
           >
-            <div className="modal-head">
+            <div className="modal-head settings-editor-head">
               <DialogTitle>命令名单管理</DialogTitle>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="command-modal-close"
+                aria-label="关闭命令名单管理"
+                disabled={saving}
+                onClick={() => {
+                  setListsOpen(false);
+                  setError("");
+                }}
+              >
+                <X size={18} />
+              </Button>
             </div>
             <div className="modal-body">
-              <p>
-                每行一条命令名称或完整路径，例如 grep 或
-                /usr/local/bin/report。黑名单优先；仅白名单模式下，白名单留空会拒绝所有命令。
-              </p>
-              <div className="command-list-editors">
+              <CommandPresets
+                value={allowedDraft}
+                disabled={saving}
+                onChange={setAllowedDraft}
+                onError={setError}
+              />
+              <div
+                className="command-list-editors"
+                title="拖动右下角可调整名单输入区高度"
+              >
                 <label>
-                  白名单
+                  <span className="command-editor-label">
+                    <span>
+                      <Check size={14} />
+                      允许执行
+                    </span>
+                    <small>
+                      {parseCommandList(allowedDraft).length}
+                      <em> / {MAX_COMMAND_RULES}</em>
+                    </small>
+                  </span>
                   <Textarea
                     aria-label="命令白名单"
                     className="mono"
-                    rows={9}
+                    rows={10}
+                    placeholder="命令名或绝对路径，如 python3、/opt/venv/bin/python"
                     value={allowedDraft}
                     disabled={saving}
                     onChange={(event) => setAllowedDraft(event.target.value)}
                   />
                 </label>
                 <label>
-                  黑名单
+                  <span className="command-editor-label">
+                    <span>
+                      <ShieldBan size={14} />
+                      禁止执行<span className="command-priority-tag">优先</span>
+                    </span>
+                    <small>
+                      {parseCommandList(blockedDraft).length}
+                      <em> / {MAX_COMMAND_RULES}</em>
+                    </small>
+                  </span>
                   <Textarea
                     aria-label="命令黑名单"
                     className="mono"
-                    rows={9}
+                    rows={10}
+                    placeholder="添加需要始终拦截的命令"
                     value={blockedDraft}
                     disabled={saving}
                     onChange={(event) => setBlockedDraft(event.target.value)}
@@ -629,6 +906,7 @@ export function Settings() {
               <Button
                 type="button"
                 variant="ghost"
+                className="settings-editor-reset"
                 disabled={saving}
                 onClick={() => {
                   setAllowedDraft(defaultAllowedCommands.join("\n"));
@@ -636,6 +914,7 @@ export function Settings() {
                   setError("");
                 }}
               >
+                <RotateCcw size={13} />
                 恢复默认名单
               </Button>
               <Button
@@ -649,7 +928,12 @@ export function Settings() {
               >
                 取消
               </Button>
-              <Button type="submit" disabled={saving}>
+              <Button
+                type="submit"
+                className="command-save-button"
+                disabled={saving}
+              >
+                <Check size={15} />
                 {saving ? "保存中…" : "保存名单"}
               </Button>
             </div>

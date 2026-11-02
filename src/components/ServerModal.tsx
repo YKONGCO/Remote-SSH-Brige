@@ -11,7 +11,7 @@ import { Checkbox } from "./ui/checkbox";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   X,
   Server as ServerIcon,
@@ -24,7 +24,12 @@ import {
   permissionGroups,
   selectedMcpPermissions,
   withMcpPermissions,
+  permissionGroupState,
+  togglePermissionGroup,
 } from "../mcp-permissions";
+
+import { api } from "../api";
+import type { RuntimeSettings } from "../runtime-settings";
 
 const serverColors = [
   { value: "blue", label: "雾蓝", swatch: "var(--direct-text)" },
@@ -42,7 +47,9 @@ export function ServerModal({
   groups = [],
   onClose,
   onSave,
+  onOpenSettings,
 }: {
+  onOpenSettings?: () => void;
   initial: Server;
   groups?: string[];
   onClose: () => void;
@@ -54,6 +61,24 @@ export function ServerModal({
     [error, setError] = useState("");
   const set = (key: keyof Server, value: unknown) =>
     setServer((s) => ({ ...s, [key]: value }));
+  const [deletionProtection, setDeletionProtection] = useState<boolean | null>(
+    null,
+  );
+  const [settingsError, setSettingsError] = useState("");
+  useEffect(() => {
+    let active = true;
+    api<RuntimeSettings>("runtime_settings")
+      .then((settings) => {
+        if (active) setDeletionProtection(settings.deletion_protection);
+      })
+      .catch(() => {
+        if (active)
+          setSettingsError("无法读取删除保护设置，请关闭窗口后重试。");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   const selectedPermissions = selectedMcpPermissions(server);
   const mcpEnabled = server.mcp_enabled !== false;
   return (
@@ -253,51 +278,108 @@ export function ServerModal({
             />
           </label>
           <div className="mcp-permission-groups">
-            {permissionGroups.map((group) => (
-              <fieldset key={group.title} disabled={!mcpEnabled || busy}>
-                <legend>{group.title}</legend>
+            <fieldset disabled={!mcpEnabled || busy}>
+              <legend>MCP 操作权限</legend>
+              <div className="permission-group-content permission-categories">
+                <button
+                  type="button"
+                  className="permission-select-all"
+                  disabled={!mcpEnabled || busy}
+                  onClick={() =>
+                    setServer((current) => {
+                      const available = permissionGroups.filter(
+                        (group) =>
+                          group.id !== "delete" || deletionProtection === false,
+                      );
+                      const allSelected = available.every(
+                        (group) =>
+                          permissionGroupState(
+                            selectedMcpPermissions(current),
+                            group,
+                          ) === true,
+                      );
+                      return available.reduce(
+                        (next, group) =>
+                          togglePermissionGroup(next, group, !allSelected),
+                        current,
+                      );
+                    })
+                  }
+                >
+                  {permissionGroups
+                    .filter(
+                      (group) =>
+                        group.id !== "delete" || deletionProtection === false,
+                    )
+                    .every(
+                      (group) =>
+                        permissionGroupState(selectedPermissions, group) ===
+                        true,
+                    )
+                    ? "取消全选"
+                    : "全选"}
+                </button>
                 <div className="permissions">
-                  {group.operations.map(([kind, label]) => (
-                    <label key={kind}>
-                      <Checkbox
-                        checked={selectedPermissions.includes(kind)}
-                        disabled={
-                          !mcpEnabled ||
-                          busy ||
-                          (kind === "edit_file" &&
-                            !selectedPermissions.includes("read_file"))
-                        }
-                        onCheckedChange={(checked) =>
-                          setServer((current) => {
-                            const permissions = selectedMcpPermissions(current);
-                            return withMcpPermissions(
-                              current,
-                              checked === true
-                                ? [
-                                    ...permissions.filter(
-                                      (value) => value !== kind,
-                                    ),
-                                    kind,
-                                  ]
-                                : permissions.filter((value) => value !== kind),
-                            );
-                          })
-                        }
-                      />
-                      {label}
-                    </label>
-                  ))}
+                  {permissionGroups.map((group) => {
+                    const state = permissionGroupState(
+                      selectedPermissions,
+                      group,
+                    );
+                    const protectedDelete =
+                      group.id === "delete" && deletionProtection !== false;
+                    return (
+                      <div key={group.id} className="permission-option">
+                        <label title={group.description}>
+                          <Checkbox
+                            aria-label={group.title}
+                            checked={state}
+                            disabled={!mcpEnabled || busy || protectedDelete}
+                            onCheckedChange={(checked) =>
+                              setServer((current) =>
+                                togglePermissionGroup(
+                                  current,
+                                  group,
+                                  checked === true,
+                                ),
+                              )
+                            }
+                          />
+                          <span className="permission-option-text">
+                            <span>{group.title}</span>
+                            {state === "indeterminate" && (
+                              <span className="field-help">部分授权</span>
+                            )}
+                            {protectedDelete && (
+                              <span className="field-help">
+                                {deletionProtection === null
+                                  ? "删除保护状态未就绪"
+                                  : (state ? "已授权，" : "") +
+                                    "受全局删除保护限制"}
+                              </span>
+                            )}
+                          </span>
+                        </label>
+                      </div>
+                    );
+                  })}
                 </div>
-              </fieldset>
-            ))}
+                {deletionProtection && onOpenSettings && (
+                  <button
+                    type="button"
+                    className="text-btn"
+                    onClick={onOpenSettings}
+                  >
+                    前往删除保护设置
+                  </button>
+                )}
+                {settingsError && (
+                  <p role="alert" className="error-inline">
+                    {settingsError}
+                  </p>
+                )}
+              </div>
+            </fieldset>
           </div>
-          <p className="field-help">
-            仅影响 MCP
-            调用，保存后立即生效。文件根目录仅限制文件操作；命令与终端使用 SSH
-            账号权限。全局只读与审批仍然生效。目录浏览、移动通过 exec 执行；
-            安全删除单独授权，不需关闭命令保护或桌面删除保护。终端授权对应
-            terminal 的 action。
-          </p>
           {error && <div className="error-inline">{error}</div>}
         </div>
         <div className="modal-foot">

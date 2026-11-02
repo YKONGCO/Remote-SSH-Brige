@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 pub const MCP_SERVER_NAME: &str = "remote-ssh";
 pub const MCP_SERVER_TITLE: &str = "Remote SSH Brige";
-pub const MAX_TRANSFER_MIB: u64 = 256;
+pub const MAX_TRANSFER_MIB: u64 = 8_589_934_591; // Exact byte counts in JavaScript; 0 means unlimited.
+pub const MAX_INLINE_TRANSFER_MIB: u64 = 256; // Text, Base64 and MCP payloads.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
+pub const MAX_COMMAND_RULES: usize = 4096;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -12,11 +15,15 @@ pub struct RuntimeSettings {
     pub command_policy: Option<CommandPolicy>,
     pub remote_read_only: bool,
     pub approval_mode: String,
+    pub approval_timeout_secs: u64,
     pub upload_limit_mib: u64,
     pub download_limit_mib: u64,
+    pub local_upload_roots: Vec<String>,
+    pub local_download_roots: Vec<String>,
     pub connect_timeout_secs: u64,
     pub io_timeout_secs: u64,
     pub command_timeout_secs: u64,
+    pub exec_timeout_to_job: bool,
     pub max_terminals: usize,
 }
 impl Default for RuntimeSettings {
@@ -28,11 +35,15 @@ impl Default for RuntimeSettings {
             command_policy: None,
             remote_read_only: false,
             approval_mode: "off".into(),
+            approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             upload_limit_mib: 128,
             download_limit_mib: 128,
+            local_upload_roots: vec![],
+            local_download_roots: vec![],
             connect_timeout_secs: 8,
             io_timeout_secs: 15,
             command_timeout_secs: 30,
+            exec_timeout_to_job: false,
             max_terminals: 32,
         }
     }
@@ -73,35 +84,65 @@ impl RuntimeSettings {
         }
         anyhow::ensure!(
             ["off", "mcp", "all"].contains(&self.approval_mode.as_str()),
-            "无效的审批模式"
+            "Invalid approval mode"
         );
         anyhow::ensure!(
-            (1..=MAX_TRANSFER_MIB).contains(&self.upload_limit_mib)
-                && (1..=MAX_TRANSFER_MIB).contains(&self.download_limit_mib),
-            "单文件限制须为 1–{MAX_TRANSFER_MIB} MiB"
+            (1..=120).contains(&self.approval_timeout_secs),
+            "Approval timeout must be 1-120 seconds"
         );
+        anyhow::ensure!(
+            self.upload_limit_mib <= MAX_TRANSFER_MIB
+                && self.download_limit_mib <= MAX_TRANSFER_MIB,
+            "File size limit must be 0-{MAX_TRANSFER_MIB} MiB; 0 means unlimited"
+        );
+        for roots in [&self.local_upload_roots, &self.local_download_roots] {
+            anyhow::ensure!(
+                roots.len() <= 64,
+                "Each transfer direction supports at most 64 local roots"
+            );
+            for root in roots {
+                anyhow::ensure!(
+                    root.len() <= 8192
+                        && std::path::Path::new(root).is_absolute()
+                        && !root.contains('\0')
+                        && !std::path::Path::new(root)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir)),
+                    "Local transfer roots must be absolute paths without .."
+                );
+            }
+        }
         anyhow::ensure!(
             (1..=120).contains(&self.connect_timeout_secs),
-            "连接超时须为 1–120 秒"
+            "Connection timeout must be 1-120 seconds"
         );
         anyhow::ensure!(
             (1..=300).contains(&self.io_timeout_secs)
                 && (1..=300).contains(&self.command_timeout_secs),
-            "读写与命令超时须为 1–300 秒"
+            "I/O and command timeouts must be 1-300 seconds"
         );
         anyhow::ensure!(
             (1..=64).contains(&self.max_terminals),
-            "终端会话上限须为 1–64"
+            "Terminal session limit must be 1-64"
         );
         Ok(())
     }
     pub fn transfer_limit(&self, kind: &str) -> u64 {
-        (if matches!(kind, "upload" | "write_file") {
+        let limit = if matches!(kind, "upload" | "upload_file" | "write_file") {
             self.upload_limit_mib
         } else {
             self.download_limit_mib
-        }) * 1024
-            * 1024
+        };
+        let bytes = if limit == 0 {
+            u64::MAX
+        } else {
+            limit * 1024 * 1024
+        };
+        if matches!(kind, "upload_file" | "download_file") {
+            bytes
+        } else {
+            bytes.min(MAX_INLINE_TRANSFER_MIB * 1024 * 1024)
+        }
     }
 }
 
@@ -141,13 +182,21 @@ impl Default for CommandPolicy {
 }
 
 pub fn default_allowed_commands() -> Vec<String> {
-    [
-        "pwd", "ls", "cat", "head", "tail", "stat", "file", "du", "df", "free", "uptime", "whoami",
-        "id", "uname", "date", "hostname", "ps", "ss", "netstat", "wc", "readlink", "realpath",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+    #[derive(Deserialize)]
+    struct Preset {
+        commands: Vec<String>,
+    }
+    let presets: Vec<Preset> = serde_json::from_str(include_str!("../../src/command-presets.json"))
+        .expect("bundled command presets must be valid JSON");
+    let mut commands = Vec::new();
+    for preset in presets {
+        for command in preset.commands {
+            if !commands.contains(&command) {
+                commands.push(command);
+            }
+        }
+    }
+    commands
 }
 
 impl CommandPolicy {
@@ -156,10 +205,13 @@ impl CommandPolicy {
             self.execution_mode
                 .as_deref()
                 .is_none_or(|mode| matches!(mode, "disabled" | "whitelist" | "unrestricted")),
-            "无效的命令执行范围"
+            "Invalid command execution mode"
         );
         for list in [&self.allowed_commands, &self.blocked_commands] {
-            anyhow::ensure!(list.len() <= 256, "每个命令名单最多 256 项");
+            anyhow::ensure!(
+                list.len() <= MAX_COMMAND_RULES,
+                "Each command list supports at most {MAX_COMMAND_RULES} entries"
+            );
             for name in list {
                 anyhow::ensure!(
                     !name.is_empty()
@@ -173,7 +225,7 @@ impl CommandPolicy {
                                     .split('/')
                                     .skip(1)
                                     .all(|part| !part.is_empty() && part != "." && part != ".."))),
-                    "命令名单只能填写命令名称或完整路径，不能包含参数、通配符或 Shell 语法"
+                    "Command rules must be names or absolute paths without arguments, wildcards or shell syntax"
                 );
             }
         }
@@ -226,12 +278,21 @@ impl Default for Server {
     }
 }
 pub const MCP_OPERATIONS: &[&str] = &[
+    "port_forward_open",
+    "port_forward_list",
+    "port_forward_read",
+    "port_forward_close",
     "read_file",
-    "preview_file",
+    "list_files",
+    "stat_file",
     "write_file",
     "edit_file",
     "remove_path",
     "exec",
+    "job",
+    "upload_file",
+    "download_file",
+    "transfer",
     "list_terminals",
     "terminal_open",
     "terminal_read",
@@ -266,7 +327,7 @@ impl Server {
             "write_file" => self.allow_write,
             "list_terminals" | "terminal_open" | "terminal_read" | "terminal_write"
             | "terminal_resize" | "terminal_close" => self.allow_terminal,
-            "read_file" | "preview_file" => true,
+            "read_file" | "list_files" | "stat_file" => true,
             _ => false,
         }
     }
@@ -301,10 +362,21 @@ pub struct Audit {
 pub struct AuditResponse {
     pub data: serde_json::Value,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<AuditInput>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AuditInput {
+    pub data: serde_json::Value,
+    pub truncated: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 #[serde(default)]
 pub struct Operation {
+    pub tunnel_id: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub remote_host: String,
     pub kind: String,
     pub server_id: String,
     pub path: String,
@@ -316,6 +388,17 @@ pub struct Operation {
     pub cols: u32,
     pub rows: u32,
     pub timeout_secs: u64,
+    pub job_action: String,
+    pub job_id: String,
+    pub stdout_cursor: u64,
+    pub stderr_cursor: u64,
+    pub wait_secs: u64,
+    /// Set by native pickers or validated MCP arguments, never by raw Operation IPC.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub transfer_request: Option<crate::transfers::TransferSpec>,
+    pub transfer_id: String,
+    pub transfer_action: String,
+    pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_request: Option<FileRequest>,
 }
@@ -323,11 +406,26 @@ pub struct Operation {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileRequest {
-    Remove { recursive: bool, missing_ok: bool },
-    Read { offset: u64, limit: u64 },
-    List { offset: u64, limit: u64 },
-    Write { mode: WriteMode },
-    Edit { edits: Vec<FileEdit> },
+    Remove {
+        recursive: bool,
+        missing_ok: bool,
+    },
+    Read {
+        offset: u64,
+        limit: u64,
+    },
+    List {
+        offset: u64,
+        limit: u64,
+    },
+    Write {
+        mode: WriteMode,
+        #[serde(default)]
+        create_parents: bool,
+    },
+    Edit {
+        edits: Vec<FileEdit>,
+    },
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, schemars::JsonSchema, PartialEq)]

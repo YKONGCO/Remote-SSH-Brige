@@ -11,6 +11,9 @@ async fn main() -> anyhow::Result<()> {
     let status = mcp::start_on(state.clone(), port, &host).await?;
     eprintln!("{}", serde_json::to_string(&status)?);
     tokio::signal::ctrl_c().await?;
+    state.jobs.close_all();
+    state.transfers.cancel_all();
+    state.tunnels.stop_all();
     mcp::stop(state).await?;
     Ok(())
 }

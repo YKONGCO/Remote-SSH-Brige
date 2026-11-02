@@ -1,23 +1,20 @@
 import { createPortal } from "react-dom";
 import { usePreferences } from "../preferences";
 import { SelectField } from "./SelectField";
-import { terminalTheme } from "../terminal-theme";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
-import { useEffect, useRef, useState } from "react";
-import { Terminal as XTerminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import "@xterm/xterm/css/xterm.css";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Plus,
   TerminalSquare,
   X,
   Maximize2,
-  RefreshCw,
   Server as ServerIcon,
 } from "lucide-react";
 import type { Server, Session } from "../types";
-import { operate, desktop } from "../api";
+import { operate } from "../api";
+import { TerminalSession, type TerminalState } from "./TerminalSession";
+
 export function Terminals({
   server,
   servers,
@@ -33,182 +30,121 @@ export function Terminals({
   onServerChange: (id: string) => void;
   sessions: Session[];
   refresh: () => Promise<void>;
-  notify: (s: string, error?: boolean) => void;
+  notify: (message: string, error?: boolean) => void;
 }) {
   const preferences = usePreferences();
-  const [appearance, setAppearance] = useState(() =>
-    preferences.terminalTheme === "app"
-      ? document.documentElement.dataset.theme || "light"
-      : preferences.terminalTheme,
-  );
+  const [appearance, setAppearance] = useState("light");
   const frame = useRef<HTMLDivElement>(null);
-  const [active, setActive] = useState(""),
-    [busy, setBusy] = useState(false),
-    [closing, setClosing] = useState<Session | null>(null);
+  const [activeByServer, setActiveByServer] = useState<Record<string, string>>(
+    {},
+  );
+  const [visited, setVisited] = useState<Set<string>>(() => new Set());
+  const [states, setStates] = useState<Record<string, TerminalState>>({});
+  const [busy, setBusy] = useState(false);
+  const [closing, setClosing] = useState<Session | null>(null);
+  const [closingId, setClosingId] = useState("");
+  const opening = useRef(false);
+  const removing = useRef(false);
   const list = sessions.filter((s) => !server || s.server_id === server.id);
-  const selected = list.find((s) => s.id === active) || list[0];
-  const host = useRef<HTMLDivElement>(null),
-    term = useRef<XTerminal | null>(null);
+  const selected =
+    list.find((s) => s.id === activeByServer[server?.id || ""]) ||
+    list.find((s) => s.alive) ||
+    list[0];
+  const callbacks = useRef({ refresh, notify });
+  callbacks.current = { refresh, notify };
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    const apply = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        const next =
-          preferences.terminalTheme === "app"
-            ? document.documentElement.dataset.theme || "light"
-            : preferences.terminalTheme;
-        setAppearance(next);
-        if (frame.current) frame.current.dataset.terminalTheme = next;
-        if (!term.current) return;
-        term.current.options.theme = terminalTheme(frame.current || undefined);
-        const dark = next === "dark";
-        term.current.options.fontWeight = dark ? 360 : 400;
-        term.current.options.fontWeightBold = dark ? 560 : 600;
-      }, 0);
-    };
+    void callbacks.current.refresh();
+  }, []);
+  useEffect(() => {
+    if (selected)
+      setVisited((previous) =>
+        previous.has(selected.id)
+          ? previous
+          : new Set([...previous, selected.id]),
+      );
+  }, [selected?.id]);
+  useEffect(() => {
+    const apply = () =>
+      setAppearance(
+        preferences.terminalTheme === "app"
+          ? document.documentElement.dataset.theme || "light"
+          : preferences.terminalTheme,
+      );
     apply();
-    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
-    media?.addEventListener("change", apply);
-    return () => {
-      clearTimeout(timer);
-      media?.removeEventListener("change", apply);
-    };
-  }, [preferences.theme, preferences.terminalTheme, selected?.id]);
-  useEffect(() => {
-    if (!term.current) return;
-    term.current.options.fontSize = Number(preferences.terminalFontSize);
-    term.current.options.scrollback = Number(preferences.terminalScrollback);
-    term.current.options.cursorBlink = preferences.cursorBlink;
-    window.dispatchEvent(new Event("resize"));
-  }, [
-    preferences.terminalFontSize,
-    preferences.terminalScrollback,
-    preferences.cursorBlink,
-  ]);
+    const observer = new MutationObserver(apply);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+    return () => observer.disconnect();
+  }, [preferences.terminalTheme, preferences.theme]);
+  const onStateChange = useCallback((id: string, state: TerminalState) => {
+    setStates((previous) =>
+      previous[id] === state ? previous : { ...previous, [id]: state },
+    );
+  }, []);
+  const select = (session: Session) =>
+    setActiveByServer((previous) => ({
+      ...previous,
+      [session.server_id]: session.id,
+    }));
   const open = async () => {
-    if (!server) return;
+    if (!server?.enabled || opening.current) return;
+    opening.current = true;
     setBusy(true);
     try {
-      const r = await operate<{ session_id: string }>({
+      const result = await operate<{ session_id: string }>({
         kind: "terminal_open",
         server_id: server.id,
         cols: 100,
         rows: 28,
       });
-      setActive(r.session_id);
+      setActiveByServer((previous) => ({
+        ...previous,
+        [server.id]: result.session_id,
+      }));
       await refresh();
     } catch (e) {
       notify(String(e), true);
     } finally {
+      opening.current = false;
       setBusy(false);
     }
   };
-  useEffect(() => {
-    if (!host.current || !selected) return;
-    const terminal = new XTerminal({
-      fontSize: Number(preferences.terminalFontSize),
-      fontWeight: appearance === "dark" ? 360 : 400,
-      fontWeightBold: appearance === "dark" ? 560 : 600,
-      fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
-      cursorBlink: preferences.cursorBlink,
-      scrollback: Number(preferences.terminalScrollback),
-      theme: terminalTheme(frame.current || undefined),
-    });
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
-    terminal.open(host.current);
-    fit.fit();
-    term.current = terminal;
-    let cursor = 0,
-      stopped = false,
-      working = false;
-    let writeQueue = Promise.resolve();
-    const sub = terminal.onData((content) => {
-      if (!desktop) {
-        terminal.write(content === "\r" ? "\r\n$ " : content);
-        return;
-      }
-      writeQueue = writeQueue
-        .then(() =>
-          operate({
-            kind: "terminal_write",
-            server_id: selected.server_id,
-            session_id: selected.id,
-            content,
-          }),
-        )
-        .then(() => {})
-        .catch((e) => notify(String(e), true));
-    });
-    const poll = async () => {
-      if (working || stopped) return;
-      working = true;
-      try {
-        const r = await operate<{
-          base64: string;
-          cursor: number;
-          alive: boolean;
-          truncated: boolean;
-        }>({
-          kind: "terminal_read",
-          server_id: selected.server_id,
-          session_id: selected.id,
-          cursor,
-        });
-        if (stopped) return;
-        if (r.truncated) terminal.write("\r\n[较早输出已被缓冲区清理]\r\n");
-        if (r.base64)
-          terminal.write(
-            Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0)),
-          );
-        cursor = r.cursor;
-        if (!r.alive) {
-          terminal.write("\r\n[终端连接已结束]\r\n");
-          stopped = true;
-          void refresh();
-        }
-      } catch (e) {
-        if (!stopped) {
-          terminal.write("\r\n[" + String(e) + "]\r\n");
-          stopped = true;
-        }
-      } finally {
-        working = false;
-      }
-    };
-    void poll();
-    const timer = setInterval(() => void poll(), 180);
-    let resizeTimer: ReturnType<typeof setTimeout>;
-    const refit = () => {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        fit.fit();
-        if (desktop)
-          void operate({
-            kind: "terminal_resize",
-            server_id: selected.server_id,
-            session_id: selected.id,
-            cols: terminal.cols,
-            rows: terminal.rows,
-          }).catch(() => {});
-      }, 100);
-    };
-    const observer = new ResizeObserver(refit);
-    window.addEventListener("resize", refit);
-    observer.observe(host.current);
-    terminal.focus();
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-      clearTimeout(resizeTimer);
-      observer.disconnect();
-      window.removeEventListener("resize", refit);
-      sub.dispose();
-      terminal.dispose();
-      term.current = null;
-    };
-  }, [selected?.id]);
+  const close = async (session: Session) => {
+    if (removing.current) return;
+    removing.current = true;
+    setClosingId(session.id);
+    try {
+      await operate({
+        kind: "terminal_close",
+        server_id: session.server_id,
+        session_id: session.id,
+      });
+      const siblings = sessions.filter(
+        (s) => s.server_id === session.server_id,
+      );
+      const index = siblings.findIndex((s) => s.id === session.id);
+      const next = siblings[index + 1] || siblings[index - 1];
+      setActiveByServer((previous) =>
+        previous[session.server_id] === session.id ||
+        selected?.id === session.id
+          ? { ...previous, [session.server_id]: next?.id || "" }
+          : previous,
+      );
+      setClosing(null);
+      await refresh();
+    } catch (e) {
+      notify(String(e), true);
+    } finally {
+      removing.current = false;
+      setClosingId("");
+    }
+  };
+  const requestClose = (session: Session) => {
+    if (!session.alive || states[session.id] === "ended") void close(session);
+    else setClosing(session);
+  };
   const toolbar = (
     <div className="terminal-heading-actions">
       <div className="server-select">
@@ -230,16 +166,6 @@ export function Terminals({
           )}
         </SelectField>
       </div>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="icon-btn"
-        aria-label="刷新会话"
-        title="刷新会话"
-        onClick={() => void refresh()}
-      >
-        <RefreshCw size={14} />
-      </Button>
       <Button
         size="sm"
         className="btn primary"
@@ -287,11 +213,28 @@ export function Terminals({
                     <button
                       role="tab"
                       aria-selected={session.id === selected?.id}
-                      aria-controls="terminal-output"
+                      aria-controls={`terminal-output-${session.id}`}
                       id={"terminal-tab-" + session.id}
                       className="terminal-tab"
-                      title={session.name}
-                      onClick={() => setActive(session.id)}
+                      title={`${session.name} · ${!session.alive || states[session.id] === "ended" ? "已结束" : states[session.id] === "error" ? "读取失败" : "运行中"}`}
+                      tabIndex={session.id === selected?.id ? 0 : -1}
+                      onClick={() => select(session)}
+                      onKeyDown={(event) => {
+                        let next: Session | undefined;
+                        if (event.key === "ArrowRight")
+                          next = list[(index + 1) % list.length];
+                        if (event.key === "ArrowLeft")
+                          next = list[(index + list.length - 1) % list.length];
+                        if (event.key === "Home") next = list[0];
+                        if (event.key === "End") next = list[list.length - 1];
+                        if (next) {
+                          event.preventDefault();
+                          select(next);
+                          document
+                            .getElementById(`terminal-tab-${next.id}`)
+                            ?.focus();
+                        }
+                      }}
                     >
                       <TerminalSquare size={13} />
                       <span className="terminal-tab-label">
@@ -299,15 +242,24 @@ export function Terminals({
                       </span>
                       <span
                         className={
-                          "status-dot " + (session.alive ? "green" : "gray")
+                          "status-dot " +
+                          (session.alive &&
+                          !["ended", "error"].includes(states[session.id])
+                            ? "green"
+                            : "gray")
                         }
                       />
                     </button>
                     <button
                       className="terminal-tab-close"
-                      aria-label={"关闭终端 " + (index + 1)}
-                      title="关闭终端"
-                      onClick={() => setClosing(session)}
+                      aria-label={`${session.alive && states[session.id] !== "ended" ? "关闭" : "移除"}终端 ${index + 1}`}
+                      title={
+                        session.alive && states[session.id] !== "ended"
+                          ? "关闭终端"
+                          : "移除已结束会话"
+                      }
+                      disabled={!!closingId}
+                      onClick={() => requestClose(session)}
                     >
                       <X size={12} />
                     </button>
@@ -319,7 +271,7 @@ export function Terminals({
                 title="终端全屏"
                 aria-label="终端全屏"
                 onClick={() => {
-                  const element = host.current?.parentElement;
+                  const element = frame.current;
                   if (element) {
                     if (document.fullscreenElement)
                       void document.exitFullscreen();
@@ -334,15 +286,28 @@ export function Terminals({
               </button>
             </div>
           )}
-          {selected ? (
-            <div
-              className="terminal-host"
-              id="terminal-output"
-              role="tabpanel"
-              aria-labelledby={"terminal-tab-" + selected.id}
-              ref={host}
-            />
-          ) : (
+          {sessions
+            .filter(
+              (session) =>
+                visited.has(session.id) || session.id === selected?.id,
+            )
+            .map((session) => (
+              <TerminalSession
+                key={session.id}
+                session={session}
+                active={session.id === selected?.id}
+                enabled={
+                  servers.find((item) => item.id === session.server_id)
+                    ?.enabled ?? false
+                }
+                appearance={appearance}
+                refresh={refresh}
+                notify={notify}
+                onStateChange={onStateChange}
+                onNew={() => void open()}
+              />
+            ))}
+          {!selected && (
             <div className="terminal-empty">
               <TerminalSquare size={29} />
               <h3>尚无终端会话</h3>
@@ -351,7 +316,12 @@ export function Terminals({
         </div>
       </section>
       {closing && (
-        <ModalFrame onClose={() => setClosing(null)} className="compact-modal">
+        <ModalFrame
+          onClose={() => {
+            if (!closingId) setClosing(null);
+          }}
+          className="compact-modal"
+        >
           <div className="modal-layout">
             <div className="modal-head">
               <DialogTitle asChild>
@@ -368,6 +338,7 @@ export function Terminals({
                 variant="outline"
                 size="sm"
                 className="btn"
+                disabled={!!closingId}
                 onClick={() => setClosing(null)}
               >
                 取消
@@ -376,21 +347,10 @@ export function Terminals({
                 variant="destructive"
                 size="sm"
                 className="btn danger-fill"
-                onClick={async () => {
-                  try {
-                    await operate({
-                      kind: "terminal_close",
-                      server_id: closing.server_id,
-                      session_id: closing.id,
-                    });
-                    await refresh();
-                    setClosing(null);
-                  } catch (e) {
-                    notify(String(e), true);
-                  }
-                }}
+                disabled={!!closingId}
+                onClick={() => void close(closing)}
               >
-                关闭会话
+                {closingId ? "正在关闭…" : "关闭会话"}
               </Button>
             </div>
           </div>

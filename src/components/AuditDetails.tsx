@@ -38,6 +38,13 @@ export function AuditDetails({
   }, [entry.id]);
   const response = detail.response;
   const data = response?.data;
+  // New records use message; legacy records may have a string error.
+  const failureMessage =
+    typeof data?.code === "string" && typeof data?.message === "string"
+      ? data.message
+      : typeof data?.error === "string"
+        ? data.error
+        : null;
   const approval =
     data && typeof data.approval === "object" && data.approval !== null
       ? (data.approval as Record<string, unknown>)
@@ -110,7 +117,15 @@ export function AuditDetails({
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(
-        JSON.stringify({ operation: detail.detail, response }, null, 2),
+        JSON.stringify(
+          {
+            input: response?.input ?? null,
+            operation: detail.detail,
+            response,
+          },
+          null,
+          2,
+        ),
       );
       notify("已复制");
     } catch (e) {
@@ -161,17 +176,40 @@ export function AuditDetails({
               {new Date(detail.time).toLocaleString("zh-CN", { hour12: false })}
             </time>
           </div>
+          {(!response?.input || approval) && (
+            <section className="audit-section">
+              <h3>
+                {detail.kind === "exec" || approval?.command
+                  ? "命令"
+                  : "操作目标"}
+              </h3>
+              <pre className="audit-code">
+                {String(
+                  approval?.command || approval?.path || detail.detail || "—",
+                )}
+              </pre>
+            </section>
+          )}
           <section className="audit-section">
-            <h3>
-              {detail.kind === "exec" || approval?.command
-                ? "命令"
-                : "操作目标"}
-            </h3>
-            <pre className="audit-code">
-              {String(
-                approval?.command || approval?.path || detail.detail || "—",
-              )}
-            </pre>
+            <h3>输入参数</h3>
+            {response?.input ? (
+              <>
+                <pre className="audit-code audit-output" tabIndex={0}>
+                  {JSON.stringify(response.input.data, null, 2)}
+                </pre>
+                {response.input.truncated && (
+                  <p className="audit-message">输入参数较长，仅保留预览。</p>
+                )}
+              </>
+            ) : (
+              <p className="audit-message">
+                {loading
+                  ? "正在读取…"
+                  : error
+                    ? "输入参数加载失败，请重试。"
+                    : "这条记录未保存输入参数。"}
+              </p>
+            )}
           </section>
           <section className="audit-section">
             <div className="audit-section-heading">
@@ -225,8 +263,20 @@ export function AuditDetails({
                   </div>
                 ))}
               </dl>
-            ) : detail.kind === "exec" && data && !("error" in data) ? (
+            ) : (detail.kind === "exec" ||
+                detail.kind === "job" ||
+                detail.kind === "terminal_read") &&
+              data &&
+              typeof data.stdout === "string" ? (
               <>
+                {typeof data.job_id === "string" && (
+                  <p className="audit-message">
+                    后台任务：{data.job_id} · {String(data.status || "—")}
+                  </p>
+                )}
+                {failureMessage && (
+                  <p className="error-inline">{failureMessage}</p>
+                )}
                 <div className="audit-output-label">标准输出</div>
                 <pre className="audit-code audit-output" tabIndex={0}>
                   {String(data.stdout || "（无输出）")}
@@ -247,12 +297,12 @@ export function AuditDetails({
               <pre
                 className={
                   "audit-code audit-output " +
-                  (data && "error" in data ? "audit-stderr" : "")
+                  (failureMessage ? "audit-stderr" : "")
                 }
                 tabIndex={0}
               >
-                {data && typeof data.error === "string"
-                  ? data.error
+                {failureMessage && !data?.code
+                  ? failureMessage
                   : JSON.stringify(data, null, 2)}
               </pre>
             )}

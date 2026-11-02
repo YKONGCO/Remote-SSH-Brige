@@ -17,6 +17,8 @@ pub struct Database {
 pub struct AuditQuery {
     pub category: String,
     pub search: String,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
     pub offset: u32,
     pub limit: u32,
     pub upper: Option<i64>,
@@ -32,9 +34,11 @@ pub struct AuditPage {
 const AUDIT_FILTER: &str = "sequence <= ?1 AND
     (?2 IN ('', 'all') OR (?2='mcp' AND source='mcp')
     OR (?2='error' AND (success=0 OR kind='security_reject'))
-    OR (?2='exec' AND kind='exec')
-    OR (?2='files' AND kind IN ('list_files','read_file','preview_file','write_file','edit_file','remove_path','mkdir','remove','rename','upload','download')))
-    AND (?3='' OR instr(lower(server_name || ' ' || detail || ' ' || kind), lower(?3)) > 0)";
+    OR (?2='exec' AND kind IN ('exec','job'))
+    OR (?2='files' AND kind IN ('list_files','read_file','preview_file','write_file','edit_file','remove_path','mkdir','remove','rename','upload','download','upload_file','download_file','transfer')))
+    AND (?3='' OR instr(lower(server_name || ' ' || detail || ' ' || kind), lower(?3)) > 0)
+    AND (?4 IS NULL OR julianday(time) >= julianday(?4))
+    AND (?5 IS NULL OR julianday(time) < julianday(?5))";
 
 impl Database {
     pub fn open_reader(dir: &Path) -> Result<Self> {
@@ -57,13 +61,19 @@ impl Database {
         };
         let total: i64 = self.connection.query_row(
             &format!("SELECT count(*) FROM audit_entries WHERE {AUDIT_FILTER}"),
-            params![upper, query.category, query.search],
+            params![
+                upper,
+                query.category,
+                query.search,
+                query.start_time,
+                query.end_time
+            ],
             |row| row.get(0),
         )?;
         // List pages never read or deserialize response payloads.
         let columns = AUDIT_COLUMNS.replace("response_json", "NULL");
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {columns} FROM audit_entries WHERE {AUDIT_FILTER} ORDER BY sequence DESC LIMIT ?4 OFFSET ?5"
+            "SELECT {columns} FROM audit_entries WHERE {AUDIT_FILTER} ORDER BY sequence DESC LIMIT ?6 OFFSET ?7"
         ))?;
         let entries = statement
             .query_map(
@@ -71,6 +81,8 @@ impl Database {
                     upper,
                     query.category,
                     query.search,
+                    query.start_time,
+                    query.end_time,
                     query.limit.clamp(1, 100),
                     query.offset
                 ],
@@ -93,7 +105,9 @@ impl Database {
             params![
                 query.upper.unwrap_or(i64::MAX),
                 query.category,
-                query.search
+                query.search,
+                query.start_time,
+                query.end_time
             ],
             audit_row,
         )?;
@@ -217,13 +231,19 @@ fn server_row(row: &Row<'_>) -> rusqlite::Result<Server> {
     let permissions: Option<String> = row.get(16)?;
     let mcp_permissions = permissions
         .map(|json| {
-            serde_json::from_str::<Vec<String>>(&json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    16,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
+            serde_json::from_str::<Vec<String>>(&json)
+                .map(|mut permissions| {
+                    // Retire this grant without broadening existing read permissions.
+                    permissions.retain(|permission| permission != "preview_file");
+                    permissions
+                })
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        16,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
         })
         .transpose()?;
     Ok(Server {

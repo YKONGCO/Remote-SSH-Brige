@@ -35,6 +35,31 @@ fn server() -> Server {
 }
 
 #[test]
+fn retired_preview_grant_is_removed_on_load_without_granting_text_reads() {
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    drop(state);
+    let connection = rusqlite::Connection::open(dir.join("remote-desk.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE servers SET mcp_permissions_json=?1 WHERE id=?2",
+            rusqlite::params![r#"["preview_file","terminal_read"]"#, saved.id],
+        )
+        .unwrap();
+    drop(connection);
+    let state = AppState::open(dir.clone()).unwrap();
+    let loaded = state.server(&saved.id).unwrap();
+    assert_eq!(loaded.mcp_permissions.as_ref().unwrap(), &["terminal_read"]);
+    assert!(!loaded.permits_mcp("preview_file"));
+    assert!(!loaded.permits_mcp("read_file"));
+    assert!(loaded.permits_mcp("terminal_read"));
+    state.save_server(loaded, None).unwrap();
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
 fn granular_permissions_persist_and_invalid_grants_are_rejected() {
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
@@ -66,15 +91,7 @@ fn granular_permissions_persist_and_invalid_grants_are_rejected() {
     ] {
         assert!(!saved.permits_mcp(denied));
     }
-    for grant in [
-        "invalid",
-        "upload",
-        "remove",
-        "list_files",
-        "download",
-        "mkdir",
-        "rename",
-    ] {
+    for grant in ["invalid", "upload", "remove", "download", "mkdir", "rename"] {
         let mut invalid = saved.clone();
         invalid.mcp_permissions = Some(vec![grant.into()]);
         assert!(state.save_server(invalid, None).is_err());
@@ -125,7 +142,10 @@ async fn granular_denials_are_enforced_before_network_and_survive_live_updates()
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("未授权"), "{operation}: {error}");
+        assert!(
+            error.to_string().contains("not authorized"),
+            "{operation}: {error}"
+        );
     }
     saved.mcp_permissions = Some(vec!["read_file".into()]);
     state.save_server(saved.clone(), None).unwrap();
@@ -142,7 +162,7 @@ async fn granular_denials_are_enforced_before_network_and_survive_live_updates()
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("未授权"));
+    assert!(error.to_string().contains("not authorized"));
     let audits = state.audit.lock().unwrap();
     assert!(audits.iter().all(|entry| !entry.success));
     assert!(audits.iter().any(|entry| entry.kind == "terminal_write"));
@@ -165,6 +185,7 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
     assert_eq!(*state.settings.lock().unwrap(), RuntimeSettings::default());
     let settings = RuntimeSettings {
         close_to_tray: false,
+        approval_timeout_secs: 15,
         command_policy: Some(remote_ssh_brige_lib::model::CommandPolicy {
             allow_pipes: true,
             allow_redirection: true,
@@ -175,10 +196,30 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
         connect_timeout_secs: 12,
         io_timeout_secs: 60,
         command_timeout_secs: 90,
+        exec_timeout_to_job: true,
         max_terminals: 4,
         ..Default::default()
     };
     let mut legacy_settings = serde_json::to_value(&settings).unwrap();
+    legacy_settings
+        .as_object_mut()
+        .unwrap()
+        .remove("approval_timeout_secs");
+    assert_eq!(
+        serde_json::from_value::<RuntimeSettings>(legacy_settings.clone())
+            .unwrap()
+            .approval_timeout_secs,
+        120
+    );
+    legacy_settings
+        .as_object_mut()
+        .unwrap()
+        .remove("exec_timeout_to_job");
+    assert!(
+        !serde_json::from_value::<RuntimeSettings>(legacy_settings.clone())
+            .unwrap()
+            .exec_timeout_to_job
+    );
     legacy_settings
         .as_object_mut()
         .unwrap()
@@ -191,15 +232,23 @@ fn runtime_settings_persist_and_reject_invalid_updates() {
     state.save_settings(settings.clone()).unwrap();
     for invalid in [
         RuntimeSettings {
-            upload_limit_mib: 0,
+            approval_timeout_secs: 0,
             ..settings.clone()
         },
         RuntimeSettings {
-            download_limit_mib: 257,
+            approval_timeout_secs: 121,
             ..settings.clone()
         },
         RuntimeSettings {
-            upload_limit_mib: 257,
+            upload_limit_mib: u64::MAX,
+            ..settings.clone()
+        },
+        RuntimeSettings {
+            download_limit_mib: u64::MAX,
+            ..settings.clone()
+        },
+        RuntimeSettings {
+            upload_limit_mib: remote_ssh_brige_lib::model::MAX_TRANSFER_MIB + 1,
             ..settings.clone()
         },
         RuntimeSettings {
@@ -338,10 +387,10 @@ async fn mcp_permissions_are_denied_before_connecting_and_audited() {
             "mcp",
         )
         .await;
-        assert!(result.unwrap_err().to_string().contains("未授权"));
+        assert!(result.unwrap_err().to_string().contains("not authorized"));
     }
     let logs = state.audit.lock().unwrap();
-    assert_eq!(logs.len(), 4);
+    assert_eq!(logs.len(), 5);
     assert!(logs.iter().all(|a| !a.success));
     drop(logs);
     drop(state);
@@ -398,6 +447,7 @@ async fn mcp_start_stop_and_restart_releases_listener() {
     let mut response = String::new();
     client.read_to_string(&mut response).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 401"));
+    assert!(response.ends_with("Missing or invalid MCP bearer token"));
     drop(client);
     remote_ssh_brige_lib::mcp::stop(state.clone())
         .await
@@ -605,7 +655,7 @@ fn audit_caps_multibyte_output_and_omits_file_and_input_payloads() {
             .response
             .as_ref()
             .unwrap()
-            .data["error"],
+            .data["message"],
         "connection failed"
     );
     drop(state);

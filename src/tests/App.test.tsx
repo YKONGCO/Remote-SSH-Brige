@@ -1,6 +1,7 @@
 ﻿// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -9,8 +10,8 @@ import {
   waitFor,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App from "./App";
-import * as remoteApi from "./api";
+import App from "../App";
+import * as remoteApi from "../api";
 beforeAll(() => {
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
     function (this: HTMLElement) {
@@ -34,6 +35,24 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture = () => {};
 });
 afterEach(cleanup);
+
+test("后台任务 navigation appears immediately above operation history and opens the 后台任务 list", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  render(<App />);
+  await screen.findByText("生产服务器");
+  const navigation = screen.getByRole("navigation", { name: "主导航" });
+  const buttons = within(navigation).getAllByRole("button");
+  const jobIndex = buttons.findIndex(
+    (button) => button.getAttribute("aria-label") === "后台任务",
+  );
+  expect(buttons[jobIndex + 1].getAttribute("aria-label")).toBe("操作记录");
+  await user.click(
+    within(navigation).getByRole("button", { name: "后台任务" }),
+  );
+  await screen.findByRole("tablist", { name: "后台任务状态" });
+  expect(await screen.findByText("tail -f /var/log/app.log")).toBeTruthy();
+});
 test("audit loads on scroll, virtualizes rows and exports the full active filter", async () => {
   localStorage.clear();
   const realApi = remoteApi.api;
@@ -134,6 +153,36 @@ test("audit loads on scroll, virtualizes rows and exports the full active filter
         upper: undefined,
       }),
     });
+    const timeButton = screen.getByRole("button", { name: /时间范围/ });
+    expect(
+      timeButton.nextElementSibling?.classList.contains("audit-search"),
+    ).toBe(true);
+    await user.click(timeButton);
+    await user.click(screen.getByRole("button", { name: "2026-10-31" }));
+    await user.click(screen.getByRole("button", { name: "2026-11-02" }));
+    const timeRange = {
+      start_time: new Date("2026-10-31T00:00:00").toISOString(),
+      end_time: new Date("2026-11-03T00:00:00").toISOString(),
+    };
+    await waitFor(() =>
+      expect(requests).toHaveBeenCalledWith("audit_page", {
+        query: expect.objectContaining({
+          ...timeRange,
+          offset: 0,
+          upper: undefined,
+        }),
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "导出" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByRole("button", { name: "导出" }));
+    expect(requests).toHaveBeenCalledWith("export_audits", {
+      query: expect.objectContaining(timeRange),
+    });
     await user.type(
       screen.getByRole("textbox", { name: "搜索操作记录" }),
       "missing",
@@ -143,9 +192,86 @@ test("audit loads on scroll, virtualizes rows and exports the full active filter
       query: expect.objectContaining({
         offset: 0,
         search: "missing",
+        ...timeRange,
         upper: undefined,
       }),
     });
+  } finally {
+    requests.mockRestore();
+  }
+});
+
+test("audit tabs keep rows and totals while loading and ignore superseded results", async () => {
+  localStorage.clear();
+  const realApi = remoteApi.api;
+  const pending = new Map<string, (page: unknown) => void>();
+  const result = (detail: string, total: number) => ({
+    entries: [
+      {
+        id: detail,
+        time: new Date().toISOString(),
+        server_id: "demo-1",
+        server_name: "测试服务器",
+        source: "desktop",
+        kind: "exec",
+        detail,
+        success: true,
+        duration_ms: 1,
+        summary: "ok",
+      },
+    ],
+    total,
+    upper: total,
+  });
+  const requests = vi
+    .spyOn(remoteApi, "api")
+    .mockImplementation(async (command, args) => {
+      if (command !== "audit_page") return realApi(command, args);
+      const { category } = args!.query as { category: string };
+      if (category === "all") return result("原有记录", 12) as never;
+      return new Promise((resolve) => pending.set(category, resolve)) as never;
+    });
+  try {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "操作记录" }));
+    await screen.findByText("原有记录");
+    const scroller = screen.getByLabelText("操作记录列表");
+    scroller.scrollTop = 80;
+    await user.click(screen.getByRole("tab", { name: "文件" }));
+    expect(screen.getByText("原有记录")).toBeTruthy();
+    expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
+      "12 条",
+    );
+    expect(scroller.scrollTop).toBe(80);
+    expect(scroller.getAttribute("aria-busy")).toBe("true");
+    expect(
+      (screen.getByRole("button", { name: "导出" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
+    await user.click(screen.getByRole("tab", { name: "命令" }));
+    await act(async () => pending.get("exec")!(result("最新命令记录", 5)));
+    expect(screen.getByText("最新命令记录")).toBeTruthy();
+    expect(screen.queryByText("原有记录")).toBeNull();
+    expect(scroller.scrollTop).toBe(0);
+    expect(scroller.getAttribute("aria-busy")).toBe("false");
+
+    await act(async () => pending.get("files")!(result("过期文件记录", 99)));
+    expect(screen.queryByText("过期文件记录")).toBeNull();
+    expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
+      "5 条",
+    );
+
+    await user.click(screen.getByRole("tab", { name: "失败" }));
+    await act(async () =>
+      pending.get("error")!({ entries: [], total: 0, upper: 0 }),
+    );
+    expect(screen.getByText("暂无记录")).toBeTruthy();
+    expect(screen.queryByText("最新命令记录")).toBeNull();
+    expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
+      "0 条",
+    );
   } finally {
     requests.mockRestore();
   }
@@ -313,7 +439,7 @@ test("dialogs restore focus, authentication tabs support keyboard, and menus exp
       .getAttribute("data-state"),
   ).toBe("active");
   expect(within(dialog).getByLabelText("登录密码")).toBeTruthy();
-  const permission = within(dialog).getByRole("checkbox", { name: "写入文本" });
+  const permission = within(dialog).getByRole("checkbox", { name: "文件写入" });
   await user.click(permission);
   expect(permission.getAttribute("aria-checked")).toBe("true");
   await user.keyboard("{Escape}");
@@ -375,7 +501,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(14);
+  expect(screen.getAllByRole("combobox")).toHaveLength(17);
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");
@@ -485,13 +611,15 @@ test("Radix preferences persist and enforce the upload limit", async () => {
   localStorage.clear();
 }, 20000);
 
-test("page actions and terminal actions share the integrated titlebar", async () => {
+test("server creation uses its toolbar while terminal actions use the titlebar", async () => {
   localStorage.clear();
   const user = userEvent.setup();
   render(<App />);
   await screen.findByText("生产服务器");
   expect(
-    screen.getByRole("button", { name: "添加服务器" }).closest(".window-bar"),
+    screen
+      .getByRole("button", { name: "添加服务器" })
+      .closest(".server-toolbar"),
   ).toBeTruthy();
   expect(
     screen.getByRole("button", { name: "最大化" }).closest(".window-bar"),
@@ -505,7 +633,9 @@ test("page actions and terminal actions share the integrated titlebar", async ()
   expect(screen.getAllByRole("button", { name: "新建终端" })).toHaveLength(1);
   await user.click(screen.getByRole("button", { name: "服务器" }));
   expect(
-    screen.getByRole("button", { name: "添加服务器" }).closest(".window-bar"),
+    screen
+      .getByRole("button", { name: "添加服务器" })
+      .closest(".server-toolbar"),
   ).toBeTruthy();
   expect(screen.queryByRole("button", { name: "新建终端" })).toBeNull();
 });

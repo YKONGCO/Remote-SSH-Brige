@@ -18,7 +18,7 @@ vi.mock("@tauri-apps/api/window", () => ({
     onResized: calls.onResized.mockResolvedValue(calls.unlisten),
   }),
 }));
-import { WindowBar } from "./WindowBar";
+import { WindowBar } from "../components/WindowBar";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();

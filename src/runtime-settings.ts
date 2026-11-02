@@ -1,4 +1,6 @@
-export const MAX_TRANSFER_MIB = 256;
+import commandPresets from "./command-presets.json";
+
+export const MAX_TRANSFER_MIB = 8_589_934_591;
 export interface CommandPolicy {
   execution_mode?: "disabled" | "whitelist" | "unrestricted";
   allowed_commands?: string[];
@@ -12,30 +14,15 @@ export interface CommandPolicy {
   allow_substitution: boolean;
   allow_mcp_terminal: boolean;
 }
+export { commandPresets };
+export const MAX_COMMAND_RULES = 4096;
 export const defaultAllowedCommands = [
-  "pwd",
-  "ls",
-  "cat",
-  "head",
-  "tail",
-  "stat",
-  "file",
-  "du",
-  "df",
-  "free",
-  "uptime",
-  "whoami",
-  "id",
-  "uname",
-  "date",
-  "hostname",
-  "ps",
-  "ss",
-  "netstat",
-  "wc",
-  "readlink",
-  "realpath",
+  ...new Set(commandPresets.flatMap((preset) => preset.commands)),
 ];
+
+export function parseCommandList(value: string): string[] {
+  return [...new Set(value.split(/[\s,;，；、]+/u).filter(Boolean))];
+}
 export function commandMode(policy: CommandPolicy) {
   return (
     policy.execution_mode ??
@@ -56,7 +43,7 @@ export function validCommandLists(allowed: unknown, blocked: unknown) {
   return [allowed, blocked].every(
     (list) =>
       Array.isArray(list) &&
-      list.length <= 256 &&
+      list.length <= MAX_COMMAND_RULES &&
       list.every(
         (name: unknown) =>
           typeof name === "string" &&
@@ -104,11 +91,15 @@ export interface RuntimeSettings {
   command_policy?: CommandPolicy | null;
   remote_read_only: boolean;
   approval_mode: "off" | "mcp" | "all";
+  approval_timeout_secs: number;
   upload_limit_mib: number;
   download_limit_mib: number;
+  local_upload_roots: string[];
+  local_download_roots: string[];
   connect_timeout_secs: number;
   io_timeout_secs: number;
   command_timeout_secs: number;
+  exec_timeout_to_job: boolean;
   max_terminals: number;
 }
 export const defaultRuntimeSettings: RuntimeSettings = {
@@ -117,11 +108,15 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   block_dangerous_commands: true,
   remote_read_only: false,
   approval_mode: "off",
+  approval_timeout_secs: 120,
   upload_limit_mib: 128,
   download_limit_mib: 128,
+  local_upload_roots: [],
+  local_download_roots: [],
   connect_timeout_secs: 8,
   io_timeout_secs: 15,
   command_timeout_secs: 30,
+  exec_timeout_to_job: false,
   max_terminals: 32,
 };
 export type NumericRuntimeSetting = {

@@ -349,8 +349,8 @@ export function McpPanel({
         )}
         <p className="mcp-note">
           {status.running
-            ? "服务重启后令牌会更新，显示“需要更新”时请重新配置。"
-            : "启动服务后可一键配置客户端，也可复制对应格式手动接入。"}
+            ? "服务重启后需更新客户端配置。"
+            : "启动服务后可一键配置或手动接入。"}
         </p>
       </section>
       <ManualMcpConfig status={status} notify={notify} />
@@ -380,7 +380,7 @@ export function McpPanel({
           {!servers.length && <div className="empty-small">请先添加服务器</div>}
         </div>
         <p className="mcp-note">
-          命令和终端使用登录账号的完整权限，不受文件根目录限制。其他主机请使用上方客户端配置，本机一键配置会自动匹配监听地址。
+          命令和终端使用 SSH 账户权限，不受文件根目录限制。
         </p>
       </section>
     </div>

@@ -1,5 +1,4 @@
 import { Download, Pencil, X } from "lucide-react";
-import { useState } from "react";
 import type { FileEntry, FilePreview as Preview } from "../types";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
@@ -19,12 +18,6 @@ export function FilePreview({
   onDownload: () => void;
   readOnly: boolean;
 }) {
-  const [imageFailed, setImageFailed] = useState(false);
-  const image =
-    data.kind === "image" &&
-    ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(
-      data.mime || "",
-    );
   return (
     <ModalFrame width={900} className="file-preview-modal" onClose={onClose}>
       <div className="modal-head file-preview-head">
@@ -62,7 +55,7 @@ export function FilePreview({
         </p>
       )}
       <div className="file-preview-body">
-        {data.kind === "text" ? (
+        {data.kind === "text" && (
           <textarea
             className="file-preview-text"
             aria-label="文件预览"
@@ -70,18 +63,6 @@ export function FilePreview({
             spellCheck={false}
             value={data.content || ""}
           />
-        ) : image && !imageFailed ? (
-          <img
-            className="file-preview-image"
-            alt={entry.name}
-            src={`data:${data.mime};base64,${data.base64}`}
-            onError={() => setImageFailed(true)}
-          />
-        ) : (
-          <div className="empty-panel">
-            <h3>此文件暂不支持预览</h3>
-            <p>可下载后使用本地应用查看。</p>
-          </div>
         )}
       </div>
     </ModalFrame>

@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { MAX_TRANSFER_MIB } from "../runtime-settings";
 import { Input } from "./ui/input";
+import { SelectField } from "./SelectField";
 
 export function TransferLimitField({
   value,
@@ -15,21 +16,22 @@ export function TransferLimitField({
 }) {
   const [draft, setDraft] = useState(value === undefined ? "" : String(value));
   const [error, setError] = useState("");
+  const [unit, setUnit] = useState(1);
   const saving = useRef(false);
   const errorId = useId();
   useEffect(() => {
-    setDraft(value === undefined ? "" : String(value));
-  }, [value]);
+    setDraft(value === undefined ? "" : String(value / unit));
+  }, [value, unit]);
   async function commit() {
     if (disabled || saving.current) return;
-    const next = Number(draft);
+    const next = Number(draft) * unit;
     if (
-      !/^\d+$/.test(draft) ||
+      !/^\d+(?:\.\d+)?$/.test(draft) ||
       !Number.isSafeInteger(next) ||
-      next < 1 ||
+      next < 0 ||
       next > MAX_TRANSFER_MIB
     ) {
-      setError(`请输入 1–${MAX_TRANSFER_MIB} 的整数`);
+      setError(`请输入有效大小，须对应整数 MiB；0 表示不限大小`);
       return;
     }
     setError("");
@@ -37,7 +39,7 @@ export function TransferLimitField({
     saving.current = true;
     try {
       if (!(await onSave(next)))
-        setDraft(value === undefined ? "" : String(value));
+        setDraft(value === undefined ? "" : String(value / unit));
     } finally {
       saving.current = false;
     }
@@ -48,9 +50,9 @@ export function TransferLimitField({
         <Input
           type="number"
           inputMode="numeric"
-          min={1}
-          max={MAX_TRANSFER_MIB}
-          step={1}
+          min={0}
+          max={MAX_TRANSFER_MIB / unit}
+          step={unit === 1 ? 1 : "any"}
           aria-label={label}
           aria-invalid={Boolean(error)}
           aria-describedby={error ? errorId : undefined}
@@ -68,12 +70,24 @@ export function TransferLimitField({
               event.currentTarget.blur();
             }
             if (event.key === "Escape") {
-              setDraft(value === undefined ? "" : String(value));
+              setDraft(value === undefined ? "" : String(value / unit));
               setError("");
             }
           }}
         />
-        <span>MiB</span>
+        <SelectField
+          className="transfer-limit-unit"
+          aria-label={`${label}单位`}
+          value={String(unit)}
+          disabled={disabled}
+          onValueChange={(v) => {
+            setError("");
+            setUnit(Number(v));
+          }}
+        >
+          <option value="1">MiB</option>
+          <option value="1024">GiB</option>
+        </SelectField>
       </div>
       {error && (
         <p className="transfer-limit-error" id={errorId} role="alert">

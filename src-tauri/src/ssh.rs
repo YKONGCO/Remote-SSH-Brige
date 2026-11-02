@@ -11,7 +11,7 @@ use std::{
     io::{BufReader, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub fn handshake(server: &Server) -> Result<Session> {
@@ -20,17 +20,23 @@ pub fn handshake(server: &Server) -> Result<Session> {
 pub fn handshake_with_settings(server: &Server, settings: &RuntimeSettings) -> Result<Session> {
     let addresses = (server.host.as_str(), server.port)
         .to_socket_addrs()
-        .context("无法解析服务器地址")?;
+        .context("Cannot resolve SSH server address")?;
     let mut connection = None;
+    let mut failures = Vec::new();
     for addr in addresses {
-        if let Ok(tcp) =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(settings.connect_timeout_secs))
-        {
-            connection = Some(tcp);
-            break;
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(settings.connect_timeout_secs)) {
+            Ok(tcp) => { connection = Some(tcp); break; }
+            Err(e) => failures.push(json!({"address":addr.to_string(),"reason":e.to_string(),"os_code":e.raw_os_error()})),
         }
     }
-    let tcp = connection.context("SSH 连接失败，请检查地址、端口和网络")?;
+    let tcp = connection.ok_or_else(|| {
+        crate::operation_error::error_with_details(
+            "SSH_CONNECT_FAILED",
+            "Cannot connect to SSH server",
+            json!({"host":server.host,"port":server.port,"attempts":failures}),
+        )
+    })?;
+    tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
     let mut session = Session::new()?;
@@ -40,7 +46,9 @@ pub fn handshake_with_settings(server: &Server, settings: &RuntimeSettings) -> R
     Ok(session)
 }
 pub fn fingerprint(session: &Session) -> Result<String> {
-    let (key, _) = session.host_key().context("SSH 服务器未提供主机密钥")?;
+    let (key, _) = session
+        .host_key()
+        .context("SSH server did not provide a host key")?;
     Ok(format!(
         "SHA256:{}",
         STANDARD.encode(Sha256::digest(key)).trim_end_matches('=')
@@ -50,19 +58,28 @@ pub fn connect(server: &Server) -> Result<Session> {
     connect_with_settings(server, &RuntimeSettings::default())
 }
 pub fn connect_with_settings(server: &Server, settings: &RuntimeSettings) -> Result<Session> {
-    let session = handshake_with_settings(server, settings)?;
+    let session = handshake_with_settings(server, settings)
+        .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
     let actual = fingerprint(&session)?;
     if server.fingerprint.is_empty() {
-        bail!("尚未信任 SSH 主机，请在服务器菜单中核验指纹。当前指纹：{actual}")
+        return Err(crate::operation_error::error_with_details(
+            "SSH_HOST_UNTRUSTED",
+            "SSH host is not trusted; verify its fingerprint",
+            json!({"actual_fingerprint":actual}),
+        ));
     }
     if actual != server.fingerprint {
-        bail!("SSH 主机指纹不匹配，连接已中止。当前指纹：{actual}")
+        return Err(crate::operation_error::error_with_details(
+            "SSH_HOST_KEY_MISMATCH",
+            "SSH host fingerprint mismatch; connection aborted",
+            json!({"actual_fingerprint":actual,"expected_fingerprint":server.fingerprint}),
+        ));
     }
     match server.auth.as_str() {
         "password" => {
             let password = keyring::Entry::new("dev.remotedesk.ssh", &server.id)?
                 .get_password()
-                .context("请先保存服务器密码")?;
+                .context("SSH password is not configured")?;
             session.userauth_password(&server.username, &password)?;
         }
         "key" => {
@@ -80,20 +97,29 @@ pub fn connect_with_settings(server: &Server, settings: &RuntimeSettings) -> Res
             )?;
         }
         "agent" => session.userauth_agent(&server.username)?,
-        _ => bail!("未知的认证方式"),
+        _ => bail!("Unsupported SSH authentication method"),
     }
     if !session.authenticated() {
-        bail!("SSH 身份认证失败")
+        bail!("SSH authentication failed")
     }
     Ok(session)
 }
-fn remote_path(sftp: &Sftp, server: &Server, value: &str, create: bool) -> Result<PathBuf> {
+pub(crate) fn remote_path(
+    sftp: &Sftp,
+    server: &Server,
+    value: &str,
+    create: bool,
+) -> Result<PathBuf> {
     if !value.starts_with('/')
         || value.contains('\0')
         || value.contains('\\')
         || value.split('/').any(|p| p == "..")
     {
-        bail!("请使用不含 .. 或反斜杠的远程绝对路径")
+        return Err(crate::operation_error::error_with_details(
+            "INVALID_ARGUMENT",
+            "path must be an absolute POSIX path without NUL, .. or backslashes",
+            json!({"field":"path","path":value}),
+        ));
     }
     let root = sftp.realpath(Path::new(&server.root))?;
     // Resolve existing targets, including symlinks. New targets resolve their parent.
@@ -106,36 +132,102 @@ fn remote_path(sftp: &Sftp, server: &Server, value: &str, create: bool) -> Resul
                 Err(missing) if missing.code() == ssh2::ErrorCode::SFTP(2) => {}
                 Err(other) => return Err(other.into()),
             }
-            sftp.realpath(path.parent().context("无效路径")?)
+            sftp.realpath(path.parent().context("Invalid path")?)
                 .map_err(|e| {
                     if e.code() == ssh2::ErrorCode::SFTP(2) {
-                        file_tools::error(
+                        crate::operation_error::error(
                             "PARENT_NOT_FOUND",
-                            "Parent directory must exist; create it first (use exec for MCP)",
+                            "Parent directory does not exist; use write_file with create_parents=true or create it first",
                         )
                     } else {
                         e.into()
                     }
                 })?
-                .join(path.file_name().context("无效文件名")?)
+                .join(path.file_name().context("Invalid filename")?)
         }
         Err(e) => return Err(e.into()),
     };
     if resolved != root && !resolved.starts_with(&root) {
-        bail!("路径超出此服务器授权的文件根目录")
+        return Err(crate::operation_error::error_with_details(
+            "PATH_OUTSIDE_ROOT",
+            "Path is outside the allowed file root",
+            json!({"field":"path","path":value,"resolved_path":resolved,"allowed_root":root}),
+        ));
     }
     Ok(resolved)
+}
+fn create_parent_directories(sftp: &Sftp, server: &Server, value: &str) -> Result<()> {
+    // Validate the entire request before creating anything. Resolve the nearest
+    // existing ancestor first, so symlinks outside the root cannot cause writes.
+    if !value.starts_with('/')
+        || value.contains('\0')
+        || value.contains('\\')
+        || value.split('/').any(|p| p == "..")
+        || value.ends_with('/')
+    {
+        return Err(crate::operation_error::error_with_details(
+            "INVALID_ARGUMENT",
+            "path must be an absolute file path without .., NUL or backslashes",
+            json!({"field":"path","path":value}),
+        ));
+    }
+    let mut ancestor = Path::new(value)
+        .parent()
+        .context("INVALID_ARGUMENT: path has no parent")?;
+    let mut missing = Vec::new();
+    loop {
+        match sftp.lstat(ancestor) {
+            Ok(_) => break,
+            Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => {
+                missing.push(ancestor.to_path_buf());
+                anyhow::ensure!(
+                    missing.len() <= 128,
+                    "INVALID_ARGUMENT: create_parents exceeds 128 directory levels"
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("INVALID_ARGUMENT: no existing parent directory")?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let resolved = remote_path(sftp, server, &ancestor.to_string_lossy(), false)?;
+    if !sftp.stat(&resolved)?.is_dir() {
+        return Err(crate::operation_error::error_with_details(
+            "NOT_A_DIRECTORY",
+            "A parent path is not a directory",
+            json!({"path":ancestor}),
+        ));
+    }
+    for directory in missing.into_iter().rev() {
+        let checked = remote_path(sftp, server, &directory.to_string_lossy(), true)?;
+        match sftp.mkdir(&checked, 0o755) {
+            Ok(()) => {}
+            Err(e) => {
+                // A concurrent creator is acceptable only after rechecking scope
+                // and type. Other errors retain the original SFTP diagnostic.
+                let existing = remote_path(sftp, server, &directory.to_string_lossy(), false);
+                if !existing.is_ok_and(|p| sftp.stat(&p).is_ok_and(|st| st.is_dir())) {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "create_parents: cannot create {}",
+                        directory.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn destructive_path(sftp: &Sftp, server: &Server, value: &str) -> Result<PathBuf> {
     let p = remote_path(sftp, server, value, false)?;
     if p == sftp.realpath(Path::new(&server.root))? {
-        bail!("不能删除或重命名授权根目录")
+        bail!("Cannot delete or rename the allowed file root")
     }
     // Preserve the original basename for unlink/rename so a symlink itself is affected.
     let original = Path::new(value);
     Ok(sftp
-        .realpath(original.parent().context("无效路径")?)?
-        .join(original.file_name().context("无效文件名")?))
+        .realpath(original.parent().context("Invalid path")?)?
+        .join(original.file_name().context("Invalid filename")?))
 }
 pub fn operate(server: &Server, op: &Operation) -> Result<Value> {
     operate_with_settings(server, op, &RuntimeSettings::default())
@@ -145,20 +237,33 @@ pub fn operate_with_settings(
     op: &Operation,
     settings: &RuntimeSettings,
 ) -> Result<Value> {
+    anyhow::ensure!(
+        op.kind != "exec",
+        "Use state::execute for managed SSH execution"
+    );
     settings.validate()?;
     validate_payload(op, settings)?;
     let limit = settings.transfer_limit(&op.kind);
     // Reject oversized payloads before allocating decoded bytes or connecting.
     if op.kind == "upload" && op.content.len() as u64 > ((limit + 2) / 3) * 4 {
-        bail!("文件超过 {} MiB 上传限制", settings.upload_limit_mib)
+        bail!(
+            "File exceeds the {} MiB upload limit",
+            settings.upload_limit_mib
+        )
     }
     if op.kind == "write_file" && op.content.len() as u64 > limit {
-        bail!("文件超过 {} MiB 写入限制", settings.upload_limit_mib)
+        bail!(
+            "File exceeds the {} MiB write limit",
+            settings.upload_limit_mib
+        )
     }
     let upload_bytes = if op.kind == "upload" {
         let bytes = STANDARD.decode(&op.content)?;
         if bytes.len() as u64 > limit {
-            bail!("文件超过 {} MiB 上传限制", settings.upload_limit_mib)
+            bail!(
+                "File exceeds the {} MiB upload limit",
+                settings.upload_limit_mib
+            )
         }
         Some(bytes)
     } else {
@@ -167,9 +272,6 @@ pub fn operate_with_settings(
     let session = connect_with_settings(server, settings)?;
     if op.kind == "test" {
         return Ok(json!({"connected": true, "fingerprint": fingerprint(&session)?}));
-    }
-    if op.kind == "exec" {
-        return exec(&session, op, settings);
     }
     let sftp = session.sftp()?;
     if let Some(FileRequest::Remove {
@@ -189,12 +291,12 @@ pub fn operate_with_settings(
         let p = remote_path(&sftp, server, &op.path, false)?;
         let mut file = sftp.open(&p)?;
         if !file.stat()?.is_file() {
-            return Err(file_tools::error(
+            return Err(crate::operation_error::error(
                 "UNSUPPORTED_TEXT",
                 "Path is not a regular file",
             ));
         }
-        let scan_limit = settings.transfer_limit("download");
+        let scan_limit = settings.transfer_limit("read_file");
         let mut value = file_tools::read_page(
             BufReader::new(file.take(scan_limit + 1)),
             offset,
@@ -208,24 +310,26 @@ pub fn operate_with_settings(
         let p = remote_path(&sftp, server, &op.path, false)?;
         let mut file = sftp.open(&p)?;
         if !file.stat()?.is_file() {
-            return Err(file_tools::error(
+            return Err(crate::operation_error::error(
                 "UNSUPPORTED_TEXT",
                 "Path is not a regular file",
             ));
         }
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
-            .take(settings.transfer_limit("download") + 1)
+            .take(settings.transfer_limit("read_file") + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > settings.transfer_limit("download") {
-            return Err(file_tools::error(
+        if bytes.len() as u64 > settings.transfer_limit("read_file") {
+            return Err(crate::operation_error::error(
                 "PAYLOAD_TOO_LARGE",
                 "Original file exceeds download limit",
             ));
         }
-        let original = std::str::from_utf8(&bytes)
-            .map_err(|_| file_tools::error("UNSUPPORTED_TEXT", "Cannot edit non-UTF-8 text"))?;
-        let mut edit = file_tools::edit_text(original, edits, settings.transfer_limit("upload"))?;
+        let original = std::str::from_utf8(&bytes).map_err(|_| {
+            crate::operation_error::error("UNSUPPORTED_TEXT", "Cannot edit non-UTF-8 text")
+        })?;
+        let mut edit =
+            file_tools::edit_text(original, edits, settings.transfer_limit("write_file"))?;
         atomic_write(
             &session,
             &sftp,
@@ -237,18 +341,6 @@ pub fn operate_with_settings(
         return Ok(edit.response);
     }
     match op.kind.as_str() {
-        "preview_file" => {
-            let p = remote_path(&sftp, server, &op.path, false)?;
-            let stat = sftp.stat(&p)?;
-            let cap = settings.transfer_limit("download").min(2 * 1024 * 1024);
-            let mut bytes = Vec::new();
-            sftp.open(&p)?.take(cap + 1).read_to_end(&mut bytes)?;
-            let truncated = bytes.len() as u64 > cap;
-            bytes.truncate(cap as usize);
-            let mut preview = preview_content(bytes, stat.size, truncated)?;
-            preview["preview_limit_bytes"] = json!(cap);
-            Ok(preview)
-        }
         "list_files" => {
             let p = remote_path(&sftp, server, &op.path, false)?;
             let mut directory = sftp.opendir(&p)?;
@@ -260,7 +352,7 @@ pub fn operate_with_settings(
                             continue;
                         }
                         if scanned.len() >= file_tools::DIRECTORY_SCAN_LIMIT {
-                            return Err(file_tools::error(
+                            return Err(crate::operation_error::error(
                                 "DIRECTORY_SCAN_LIMIT",
                                 "Directory exceeds 10000 entries; choose a smaller directory",
                             ));
@@ -297,30 +389,49 @@ pub fn operate_with_settings(
                 Ok(json!({"path":p.to_string_lossy().replace('\\', "/"), "entries": entries}))
             }
         }
+        "stat_file" => {
+            let p = remote_path(&sftp, server, &op.path, false)?;
+            let stat = sftp
+                .stat(&p)
+                .context("stat_file: reading resolved path metadata")?;
+            let original = sftp.lstat(Path::new(&op.path))?;
+            Ok(json!({
+                "path":p.to_string_lossy().replace('\\', "/"),
+                "name":p.file_name().unwrap_or_default().to_string_lossy(),
+                "kind":if stat.is_dir() {"directory"} else if stat.is_file() {"file"} else {"other"},
+                "is_dir":stat.is_dir(), "is_symlink":original.file_type().is_symlink(),
+                "size":stat.size,"modified":stat.mtime,"accessed":stat.atime,
+                "permissions":stat.perm.map(|perm| format!("{:o}",perm & 0o7777)),
+                "uid":stat.uid,"gid":stat.gid,
+            }))
+        }
         "read_file" | "download" => {
             let p = remote_path(&sftp, server, &op.path, false)?;
             let mut bytes = Vec::new();
             sftp.open(&p)?.take(limit + 1).read_to_end(&mut bytes)?;
             if bytes.len() as u64 > limit {
-                bail!("文件超过 {} MiB 读取/下载限制", settings.download_limit_mib)
+                bail!(
+                    "File exceeds the {} MiB read/download limit",
+                    settings.download_limit_mib
+                )
             }
             if op.kind == "download" {
                 Ok(json!({"base64": STANDARD.encode(bytes)}))
             } else {
                 Ok(
-                    json!({"content":String::from_utf8(bytes).context("此文件不是 UTF-8 文本，请使用下载")?}),
+                    json!({"content":String::from_utf8(bytes).context("File is not UTF-8 text; use download_file")?}),
                 )
             }
         }
         "write_file" | "upload" => {
             let mode = match op.file_request {
-                Some(FileRequest::Write { mode }) => mode,
+                Some(FileRequest::Write { mode, .. }) => mode,
                 _ => WriteMode::Overwrite,
             };
             if mode == WriteMode::Create {
                 match sftp.lstat(Path::new(&op.path)) {
                     Ok(_) => {
-                        return Err(file_tools::error(
+                        return Err(crate::operation_error::error(
                             "ALREADY_EXISTS",
                             "Create mode refuses existing targets, including symlinks",
                         ))
@@ -329,14 +440,26 @@ pub fn operate_with_settings(
                     Err(e) => return Err(e.into()),
                 }
             }
+            if matches!(
+                op.file_request,
+                Some(FileRequest::Write {
+                    create_parents: true,
+                    ..
+                })
+            ) {
+                create_parent_directories(&sftp, server, &op.path)?;
+            }
             let p = remote_path(&sftp, server, &op.path, true)?;
             let bytes = if op.kind == "upload" {
-                upload_bytes.context("上传内容未解码")?
+                upload_bytes.context("Upload content was not decoded")?
             } else {
                 op.content.as_bytes().to_vec()
             };
             if bytes.len() as u64 > limit {
-                bail!("文件超过 {} MiB 上传/写入限制", settings.upload_limit_mib)
+                bail!(
+                    "File exceeds the {} MiB upload/write limit",
+                    settings.upload_limit_mib
+                )
             }
             let created = atomic_write(&session, &sftp, &p, &bytes, mode)?;
             Ok(
@@ -359,7 +482,7 @@ pub fn operate_with_settings(
                             continue
                         }
                         Ok(_) => {
-                            return Err(file_tools::error(
+                            return Err(crate::operation_error::error(
                                 "DIRECTORY_NOT_EMPTY",
                                 "Only empty directories can be removed",
                             ))
@@ -380,16 +503,16 @@ pub fn operate_with_settings(
             let p = destructive_path(&sftp, server, &op.path)?;
             let target = remote_path(&sftp, server, &op.target, true)?;
             if sftp.lstat(&target).is_ok() {
-                return Err(file_tools::error(
+                return Err(crate::operation_error::error(
                     "ALREADY_EXISTS",
-                    "目标已存在，重命名不会覆盖文件",
+                    "Rename target already exists",
                 ));
             }
             // None in ssh2 enables OVERWRITE by default. Empty flags request SFTP no-replace.
             mutation_result(sftp.rename(&p, &target, Some(ssh2::RenameFlags::empty())))?;
             Ok(json!({"path":op.path,"target":op.target,"renamed":true}))
         }
-        _ => bail!("未知操作：{}", op.kind),
+        _ => bail!("Unknown operation: {}", op.kind),
     }
 }
 struct SftpRemoval<'a>(&'a Sftp);
@@ -411,7 +534,7 @@ impl crate::safe_remove::FileSystem for SftpRemoval<'_> {
         } else if st.is_file() {
             crate::safe_remove::Kind::File
         } else {
-            return Err(file_tools::error(
+            return Err(crate::operation_error::error(
                 "UNSUPPORTED_FILE_TYPE",
                 "Safe deletion supports regular files, directories, and symlinks only",
             ));
@@ -432,7 +555,7 @@ impl crate::safe_remove::FileSystem for SftpRemoval<'_> {
                         continue;
                     }
                     if names.len() >= limit {
-                        return Err(file_tools::error(
+                        return Err(crate::operation_error::error(
                             "REMOVE_LIMIT",
                             "Directory exceeds the deletion entry budget; no entries were deleted",
                         ));
@@ -462,10 +585,12 @@ impl crate::safe_remove::FileSystem for SftpRemoval<'_> {
 
 fn mutation_result(result: std::result::Result<(), ssh2::Error>) -> Result<()> {
     result.map_err(|e| match e.code() {
-        ssh2::ErrorCode::Session(_) | ssh2::ErrorCode::SFTP(6 | 7) => file_tools::error(
-            "COMMIT_STATUS_UNKNOWN",
-            "Connection failed during mutation; inspect the path before retrying",
-        ),
+        ssh2::ErrorCode::Session(_) | ssh2::ErrorCode::SFTP(6 | 7) => {
+            crate::operation_error::error(
+                "COMMIT_STATUS_UNKNOWN",
+                "Connection failed during mutation; inspect the path before retrying",
+            )
+        }
         _ => e.into(),
     })
 }
@@ -521,13 +646,13 @@ fn commit_extension(session: &Session, extension: &str, from: &Path, to: &Path) 
         receive(&mut channel)
     })()
     .map_err(|_| {
-        file_tools::error(
+        crate::operation_error::error(
             "COMMIT_STATUS_UNKNOWN",
             "Connection failed during commit; read back before retrying",
         )
     })?;
     if response.len() < 9 || response[0] != 101 || response[1..5] != [0, 0, 0, 1] {
-        return Err(file_tools::error(
+        return Err(crate::operation_error::error(
             "COMMIT_STATUS_UNKNOWN",
             "Invalid commit response; read back before retrying",
         ));
@@ -537,7 +662,7 @@ fn commit_extension(session: &Session, extension: &str, from: &Path, to: &Path) 
         return Ok(());
     }
     if status == 8 {
-        return Err(file_tools::error(
+        return Err(crate::operation_error::error(
             if extension.starts_with("hardlink") {
                 "ATOMIC_CREATE_UNSUPPORTED"
             } else {
@@ -547,12 +672,12 @@ fn commit_extension(session: &Session, extension: &str, from: &Path, to: &Path) 
         ));
     }
     if status == 11 {
-        return Err(file_tools::error(
+        return Err(crate::operation_error::error(
             "ALREADY_EXISTS",
             "Destination already exists",
         ));
     }
-    Err(file_tools::error(
+    Err(crate::operation_error::error(
         "COMMIT_FAILED",
         "SFTP server rejected atomic commit; destination was not replaced",
     ))
@@ -565,16 +690,37 @@ fn atomic_write(
     bytes: &[u8],
     mode: WriteMode,
 ) -> Result<bool> {
+    atomic_write_using(
+        session,
+        sftp,
+        path,
+        mode,
+        |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        },
+        || Ok(()),
+    )
+}
+
+fn atomic_write_using(
+    session: &Session,
+    sftp: &Sftp,
+    path: &Path,
+    mode: WriteMode,
+    write: impl FnOnce(&mut ssh2::File) -> Result<()>,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
     let existing = match sftp.stat(path) {
         Ok(st) => {
             if !st.is_file() {
-                return Err(file_tools::error(
+                return Err(crate::operation_error::error(
                     "INVALID_ARGUMENT",
                     "Destination must be a regular file",
                 ));
             }
             if mode == WriteMode::Create {
-                return Err(file_tools::error(
+                return Err(crate::operation_error::error(
                     "ALREADY_EXISTS",
                     "Destination already exists",
                 ));
@@ -595,7 +741,7 @@ fn atomic_write(
             0o600,
             ssh2::OpenType::File,
         )?;
-        file.write_all(bytes)?;
+        write(&mut file)?;
         file.close()?;
         if let Some(perm) = existing.as_ref().and_then(|st| st.perm) {
             sftp.setstat(
@@ -610,6 +756,7 @@ fn atomic_write(
                 },
             )?;
         }
+        before_commit()?;
         commit_extension(
             session,
             if mode == WriteMode::Create {
@@ -626,10 +773,10 @@ fn atomic_write(
     let _ = sftp.unlink(&temp);
     if let Err(error) = result {
         if mode == WriteMode::Create
-            && file_tools::error_code(&error) == "COMMIT_FAILED"
+            && crate::operation_error::error_code(&error) == "COMMIT_FAILED"
             && sftp.lstat(path).is_ok()
         {
-            return Err(file_tools::error(
+            return Err(crate::operation_error::error(
                 "ALREADY_EXISTS",
                 "Destination was concurrently created; it was not replaced",
             ));
@@ -639,111 +786,150 @@ fn atomic_write(
     Ok(existing.is_none())
 }
 
+pub(crate) fn transfer_file(
+    state: &crate::state::AppState,
+    server: &Server,
+    op: &Operation,
+    settings: &RuntimeSettings,
+    source: &str,
+    local: &Path,
+    local_file: Option<std::fs::File>,
+    handle: &crate::transfers::Handle,
+) -> Result<Value> {
+    use crate::transfers::{copy_file, unchanged, validate_commit};
+    let spec = op
+        .transfer_request
+        .as_ref()
+        .context("Missing transfer request")?;
+    handle.check_cancelled()?;
+    let session = connect_with_settings(server, settings)?;
+    let sftp = session.sftp()?;
+    let upload = op.kind == "upload_file";
+    let remote = remote_path(&sftp, server, &spec.remote_path, upload)?;
+    let limit = settings.transfer_limit(&op.kind);
+    if upload {
+        let mut input = local_file.context("Missing selected upload file")?;
+        let before = input.metadata()?;
+        anyhow::ensure!(
+            Some(before.len()) == spec.size,
+            "SOURCE_CHANGED: Local file size changed"
+        );
+        if !spec.overwrite {
+            match sftp.lstat(&remote) {
+                Ok(_) => {
+                    return Err(crate::operation_error::error(
+                        "ALREADY_EXISTS",
+                        "Remote target already exists; overwrite is disabled",
+                    ))
+                }
+                Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mode = if spec.overwrite {
+            WriteMode::Overwrite
+        } else {
+            WriteMode::Create
+        };
+        atomic_write_using(
+            &session,
+            &sftp,
+            &remote,
+            mode,
+            |output| {
+                let hash = copy_file(&mut input, output, before.len(), limit, handle)?;
+                anyhow::ensure!(
+                    unchanged(&before, &input.metadata()?),
+                    "SOURCE_CHANGED: Local source changed during transfer"
+                );
+                if let Some(expected) = &spec.sha256 {
+                    anyhow::ensure!(
+                        *expected == hash,
+                        "SOURCE_CHANGED: Upload content differs from the approved file"
+                    );
+                }
+                Ok(())
+            },
+            || {
+                validate_commit(state, server, op, source, local)?;
+                anyhow::ensure!(
+                    remote_path(&sftp, server, &spec.remote_path, true)? == remote,
+                    "Remote target path changed"
+                );
+                handle.begin_commit()
+            },
+        )?;
+        Ok(json!({"written_bytes":before.len()}))
+    } else {
+        let mut input = sftp.open(&remote)?;
+        let before = input.stat()?;
+        anyhow::ensure!(
+            before.is_file(),
+            "INVALID_ARGUMENT: remote_path must be a regular file"
+        );
+        let size = before.size.context("Remote file size is unavailable")?;
+        if size > limit {
+            return Err(crate::operation_error::error(
+                "PAYLOAD_TOO_LARGE",
+                "File exceeds the download limit",
+            ));
+        }
+        let mut temp =
+            tempfile::NamedTempFile::new_in(local.parent().context("Invalid local parent")?)?;
+        copy_file(&mut input, temp.as_file_mut(), size, limit, handle)?;
+        let after = input.stat()?;
+        anyhow::ensure!(
+            after.size == before.size && after.mtime == before.mtime,
+            "SOURCE_CHANGED: Remote source changed during transfer"
+        );
+        temp.as_file().sync_all()?;
+        validate_commit(state, server, op, source, local)?;
+        anyhow::ensure!(
+            remote_path(&sftp, server, &spec.remote_path, false)? == remote,
+            "Remote source path changed"
+        );
+        handle.begin_commit()?;
+        if spec.overwrite {
+            temp.persist(local).map_err(|e| e.error)?;
+        } else {
+            temp.persist_noclobber(local).map_err(|e| {
+                if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    crate::operation_error::error(
+                        "ALREADY_EXISTS",
+                        "Local target already exists; overwrite is disabled",
+                    )
+                } else {
+                    e.error.into()
+                }
+            })?;
+        }
+        Ok(json!({"downloaded_bytes":size}))
+    }
+}
+
 pub fn validate_payload(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
     file_tools::validate(op, settings)?;
     let limit = settings.transfer_limit(&op.kind);
     if op.kind == "write_file" && op.content.len() as u64 > limit {
-        bail!("文件超过 {} MiB 写入限制", settings.upload_limit_mib)
+        bail!(
+            "File exceeds the {} MiB write limit",
+            settings.upload_limit_mib
+        )
     }
     if op.kind == "upload" {
         anyhow::ensure!(
             op.content.len() as u64 <= ((limit + 2) / 3) * 4,
-            "文件超过 {} MiB 上传限制",
+            "File exceeds the {} MiB upload limit",
             settings.upload_limit_mib
         );
         anyhow::ensure!(
             STANDARD.decode(&op.content)?.len() as u64 <= limit,
-            "文件超过 {} MiB 上传限制",
+            "File exceeds the {} MiB upload limit",
             settings.upload_limit_mib
         );
     }
     if op.kind == "terminal_write" {
-        anyhow::ensure!(op.content.len() <= 65536, "单次终端输入不得超过 64 KiB");
+        anyhow::ensure!(op.content.len() <= 65536, "Terminal input exceeds 64 KiB");
     }
     Ok(())
-}
-fn exec(session: &Session, op: &Operation, settings: &RuntimeSettings) -> Result<Value> {
-    if op.command.trim().is_empty() {
-        bail!("命令不能为空")
-    }
-    let mut channel = session.channel_session()?;
-    channel.exec(&op.command)?;
-    session.set_blocking(false);
-    let started = Instant::now();
-    let timeout = Duration::from_secs(if op.timeout_secs == 0 {
-        settings.command_timeout_secs
-    } else {
-        op.timeout_secs.clamp(1, 300)
-    });
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let mut buffer = [0; 8192];
-    let mut truncated = false;
-    loop {
-        if started.elapsed() > timeout {
-            let _ = channel.close();
-            bail!(
-                "命令执行超时（{} 秒）；SSH 通道已关闭，远程派生进程可能仍在运行",
-                timeout.as_secs()
-            )
-        }
-        for (mut stream, dest) in [(channel.stream(0), &mut out), (channel.stderr(), &mut err)] {
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let remaining = (1024 * 1024_usize).saturating_sub(dest.len());
-                        dest.extend_from_slice(&buffer[..n.min(remaining)]);
-                        if n > remaining {
-                            truncated = true;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        if channel.eof() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    session.set_blocking(true);
-    channel.wait_close()?;
-    Ok(
-        json!({"stdout":String::from_utf8_lossy(&out), "stderr":String::from_utf8_lossy(&err), "exit_code":channel.exit_status()?, "truncated":truncated}),
-    )
-}
-
-pub fn preview_content(bytes: Vec<u8>, size: Option<u64>, truncated: bool) -> Result<Value> {
-    let size = size.unwrap_or(bytes.len() as u64);
-    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("image/webp")
-    } else {
-        None
-    };
-    if let Some(mime) = mime {
-        anyhow::ensure!(!truncated, "图片超过预览上限，请下载查看");
-        Ok(
-            json!({"kind":"image","mime":mime,"base64":STANDARD.encode(&bytes),"bytes":size,"truncated":false}),
-        )
-    } else if bytes.contains(&0) {
-        Ok(json!({"kind":"unsupported","bytes":size,"truncated":truncated}))
-    } else {
-        let content = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) if truncated && error.utf8_error().error_len().is_none() => {
-                let valid = error.utf8_error().valid_up_to();
-                String::from_utf8(error.into_bytes()[..valid].to_vec())?
-            }
-            Err(_) => return Ok(json!({"kind":"unsupported","bytes":size,"truncated":truncated})),
-        };
-        Ok(json!({"kind":"text","content":content,"bytes":size,"truncated":truncated}))
-    }
 }

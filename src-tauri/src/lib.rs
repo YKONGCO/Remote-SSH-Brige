@@ -1,15 +1,21 @@
+mod audit_input;
 pub mod clients;
 mod command_policy;
 pub mod database;
 pub mod file_tools;
+pub mod jobs;
 pub mod mcp;
 mod mcp_args;
+mod mcp_response;
 pub mod model;
+pub mod operation_error;
 pub mod safe_remove;
 pub mod security;
 pub mod ssh;
 pub mod state;
 pub mod terminal;
+pub mod transfers;
+pub mod tunnels;
 
 #[cfg(feature = "desktop")]
 mod desktop {
@@ -94,6 +100,31 @@ mod desktop {
     }
 
     #[tauri::command]
+    async fn pick_local_directories(window: tauri::WebviewWindow) -> Result<Vec<String>, String> {
+        use tauri_plugin_dialog::DialogExt;
+        tokio::task::spawn_blocking(move || {
+            window
+                .dialog()
+                .file()
+                .set_parent(&window)
+                .set_title("选择本地授权目录")
+                .blocking_pick_folders()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| {
+                    path.into_path()
+                        .map_err(|e| e.to_string())?
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| "所选目录路径不是有效的 UTF-8".to_string())
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
     async fn export_audits(
         state: Shared<'_>,
         window: tauri::WebviewWindow,
@@ -117,39 +148,165 @@ mod desktop {
         server_id: String,
         path: String,
         name: String,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<serde_json::Value>, String> {
         let Some(destination) = save_destination(window, name).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let value = state::execute(
+        let spec = transfers::TransferSpec {
+            local_path: destination.to_string_lossy().into_owned(),
+            remote_path: path,
+            overwrite: true,
+            size: None,
+            sha256: None,
+        };
+        transfers::start(
             state.inner().clone(),
             model::Operation {
-                kind: "download".into(),
+                kind: "download_file".into(),
                 server_id,
-                path,
+                transfer_request: Some(spec),
                 ..Default::default()
             },
             "desktop",
         )
         .await
-        .map_err(|e| format!("{e:#}"))?;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            use base64::Engine;
-            let data = value["base64"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("下载结果缺少文件内容"))?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
-            std::fs::write(destination, bytes)?;
-            Ok(())
+        .map(Some)
+        .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn upload_file(
+        state: Shared<'_>,
+        window: tauri::WebviewWindow,
+        server_id: String,
+        remote_dir: String,
+    ) -> Result<Option<serde_json::Value>, String> {
+        use tauri_plugin_dialog::DialogExt;
+        let selected = tokio::task::spawn_blocking(move || {
+            window
+                .dialog()
+                .file()
+                .set_parent(&window)
+                .blocking_pick_file()
+                .map(|p| p.into_path())
+                .transpose()
         })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
-        Ok(true)
+        .map_err(|e| e.to_string())?;
+        let Some(local) = selected else {
+            return Ok(None);
+        };
+        let name = local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "Invalid local file name".to_string())?;
+        if name.contains(['/', '\\', '\0']) {
+            return Err("Invalid file name".into());
+        }
+        let spec = transfers::TransferSpec {
+            local_path: local.to_string_lossy().into_owned(),
+            remote_path: format!("{}/{}", remote_dir.trim_end_matches('/'), name),
+            overwrite: false,
+            size: None,
+            sha256: None,
+        };
+        transfers::start(
+            state.inner().clone(),
+            model::Operation {
+                kind: "upload_file".into(),
+                server_id,
+                transfer_request: Some(spec),
+                ..Default::default()
+            },
+            "desktop",
+        )
+        .await
+        .map(Some)
+        .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn transfer(
+        state: Shared<'_>,
+        server_id: String,
+        action: String,
+        transfer_id: Option<String>,
+        version: Option<u64>,
+        wait_secs: Option<u64>,
+    ) -> Result<serde_json::Value, String> {
+        state
+            .transfers
+            .operate(
+                &state,
+                &model::Operation {
+                    kind: "transfer".into(),
+                    server_id,
+                    transfer_action: action,
+                    transfer_id: transfer_id.unwrap_or_default(),
+                    version,
+                    wait_secs: wait_secs.unwrap_or(0),
+                    ..Default::default()
+                },
+                "desktop",
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
     fn runtime_settings(state: Shared<'_>) -> model::RuntimeSettings {
         state.settings.lock().unwrap().clone()
+    }
+    #[tauri::command]
+    fn list_jobs(state: Shared<'_>) -> serde_json::Value {
+        serde_json::json!({"jobs":state.jobs.list()})
+    }
+    #[tauri::command]
+    fn list_port_forwards(state: Shared<'_>) -> serde_json::Value {
+        serde_json::json!({"tunnels":state.tunnels.list(None)})
+    }
+    #[tauri::command]
+    async fn port_forward(
+        state: Shared<'_>,
+        args: mcp_args::PortForwardArgs,
+    ) -> Result<serde_json::Value, String> {
+        state::execute(state.inner().clone(), args.into(), "desktop")
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn job(
+        state: Shared<'_>,
+        server_id: String,
+        job_id: String,
+        action: String,
+        stdout_cursor: Option<u64>,
+        stderr_cursor: Option<u64>,
+    ) -> Result<serde_json::Value, String> {
+        let shared = state.inner().clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let op = model::Operation {
+                kind: "job".into(),
+                server_id: server_id.clone(),
+                job_id,
+                job_action: action,
+                stdout_cursor: stdout_cursor.unwrap_or(0),
+                stderr_cursor: stderr_cursor.unwrap_or(0),
+                ..Default::default()
+            };
+            let result = shared.jobs.operate_desktop(&op);
+            if op.job_action == "close" {
+                // Local owners can close a retained connection after its server was disabled or removed.
+                let server = shared.server(&server_id).unwrap_or_else(|_| model::Server {
+                    id: server_id.clone(),
+                    name: server_id,
+                    ..Default::default()
+                });
+                shared.log(&server, "desktop", &op, &result, 0)?;
+            }
+            result
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
     fn pending_approvals(state: Shared<'_>) -> Vec<security::ApprovalView> {
@@ -207,6 +364,9 @@ mod desktop {
     }
     #[tauri::command]
     async fn operate(state: Shared<'_>, op: model::Operation) -> Result<serde_json::Value, String> {
+        if matches!(op.kind.as_str(), "upload" | "download") {
+            return Err("请使用 upload_file / download_file 文件流传输接口".into());
+        }
         state::execute(state.inner().clone(), op, "desktop")
             .await
             .map_err(|e| format!("{e:#}"))
@@ -294,9 +454,16 @@ mod desktop {
                 audit_page,
                 export_audits,
                 download_file,
+                upload_file,
+                pick_local_directories,
+                transfer,
                 mcp_clients,
                 configure_mcp_client,
                 runtime_settings,
+                list_jobs,
+                list_port_forwards,
+                port_forward,
+                job,
                 pending_approvals,
                 resolve_approval,
                 save_runtime_settings,
@@ -308,8 +475,15 @@ mod desktop {
                 start_mcp,
                 stop_mcp
             ])
-            .run(tauri::generate_context!())
-            .expect("启动 Remote SSH Brige 失败");
+            .build(tauri::generate_context!())
+            .expect("启动 Remote SSH Brige 失败")
+            .run(|app, event| {
+                if matches!(event, tauri::RunEvent::Exit) {
+                    app.state::<Arc<state::AppState>>().jobs.close_all();
+                    app.state::<Arc<state::AppState>>().transfers.cancel_all();
+                    app.state::<Arc<state::AppState>>().tunnels.stop_all();
+                }
+            });
     }
 }
 #[cfg(feature = "desktop")]

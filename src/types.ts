@@ -28,7 +28,11 @@ export interface Audit {
   success: boolean;
   duration_ms: number;
   summary: string;
-  response?: { data: Record<string, unknown>; truncated: boolean } | null;
+  response?: {
+    data: Record<string, unknown>;
+    truncated: boolean;
+    input?: { data: Record<string, unknown>; truncated: boolean } | null;
+  } | null;
 }
 export interface Session {
   id: string;
@@ -40,6 +44,8 @@ export interface Session {
 export interface AuditQuery {
   category: string;
   search: string;
+  start_time?: string;
+  end_time?: string;
   offset: number;
   limit: number;
   upper?: number;
@@ -88,14 +94,13 @@ export interface FileEntry {
 }
 export interface FilePreview {
   preview_limit_bytes?: number;
-  kind: "text" | "image" | "unsupported";
+  kind: "text";
   content?: string;
-  base64?: string;
-  mime?: string;
   bytes: number;
   truncated: boolean;
 }
 export interface ApprovalRequest {
+  create_parents?: boolean | null;
   recursive?: boolean | null;
   missing_ok?: boolean | null;
   created_at?: string;
@@ -131,15 +136,25 @@ export const newServer = (): Server => ({
   allow_write: false,
   allow_terminal: false,
   mcp_enabled: true,
-  mcp_permissions: ["read_file", "preview_file"],
+  mcp_permissions: ["read_file", "list_files", "stat_file"],
   root: "/",
 });
 export const labels: Record<string, string> = {
-  preview_file: "预览文件",
+  port_forward_open: "创建端口转发",
+  port_forward_list: "列出端口转发",
+  port_forward_read: "查看端口转发",
+  port_forward_close: "关闭端口转发",
+  list_servers: "列出服务器",
+  list_terminals: "列出终端",
   security_approve: "批准操作",
   security_reject: "拒绝操作",
   exec: "命令执行",
+  job: "后台任务",
+  upload_file: "上传文件",
+  download_file: "下载文件",
+  transfer: "文件传输",
   list_files: "浏览目录",
+  stat_file: "查询文件属性",
   read_file: "读取文件",
   write_file: "写入文件",
   edit_file: "精确编辑文件",
@@ -151,6 +166,8 @@ export const labels: Record<string, string> = {
   download: "下载文件",
   test: "测试连接",
   terminal_open: "创建终端",
+  terminal_read: "读取终端输出",
+  terminal_resize: "调整终端尺寸",
   terminal_write: "终端输入",
   terminal_close: "关闭终端",
 };

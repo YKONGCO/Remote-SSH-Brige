@@ -375,7 +375,7 @@ fn lost_delete_response_is_not_reported_as_a_clean_failure() {
     assert!(fs.nodes.borrow().get("/workspace/file").is_none());
 }
 #[test]
-fn new_permission_is_opt_in_and_independent_of_desktop_and_command_protection() {
+fn deletion_permission_is_opt_in_and_respects_global_protection() {
     let op = Operation {
         kind: "remove_path".into(),
         file_request: Some(FileRequest::Remove {
@@ -402,7 +402,27 @@ fn new_permission_is_opt_in_and_independent_of_desktop_and_command_protection() 
     assert!(server.permits_mcp("remove_path"));
     let mut settings = RuntimeSettings::default();
     assert!(settings.deletion_protection && settings.block_dangerous_commands);
+    assert!(security::check(&settings, &op, "mcp").is_err());
+    assert!(security::check(
+        &settings,
+        &Operation {
+            kind: "remove".into(),
+            ..Default::default()
+        },
+        "desktop"
+    )
+    .is_err());
+    settings.deletion_protection = false;
     assert!(security::check(&settings, &op, "mcp").is_ok());
+    assert!(security::check(
+        &settings,
+        &Operation {
+            kind: "remove".into(),
+            ..Default::default()
+        },
+        "desktop"
+    )
+    .is_ok());
     assert!(security::check_command_with_settings("rm /tmp/test", &settings).is_err());
     settings.approval_mode = "mcp".into();
     assert!(security::needs_approval(&settings, &op, "mcp"));

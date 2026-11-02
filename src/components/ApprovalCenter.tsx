@@ -16,12 +16,14 @@ export function ApprovalCenter({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [now, setNow] = useState(Date.now);
   const known = useRef(new Set<string>());
   useEffect(() => {
     if (!desktop) return;
     let disposed = false;
     let loading = false;
     const load = async () => {
+      setNow(Date.now());
       if (loading) return;
       loading = true;
       try {
@@ -48,6 +50,9 @@ export function ApprovalCenter({
     };
   }, []);
   const request = requests[0];
+  const remainingSeconds = request
+    ? Math.max(0, Math.ceil((Date.parse(request.expires_at) - now) / 1000))
+    : 0;
   async function decide(approved: boolean) {
     if (!request || busy) return;
     setBusy(true);
@@ -122,6 +127,16 @@ export function ApprovalCenter({
                   </dd>
                   <dt>操作</dt>
                   <dd>{labels[request.kind] || request.kind}</dd>
+                  {request.kind === "write_file" && (
+                    <>
+                      <dt>父目录</dt>
+                      <dd>
+                        {request.create_parents
+                          ? "自动创建缺失的父目录"
+                          : "必须已存在"}
+                      </dd>
+                    </>
+                  )}
                   {request.kind === "remove_path" && (
                     <>
                       <dt>删除范围</dt>
@@ -144,6 +159,9 @@ export function ApprovalCenter({
                       hour12: false,
                     })}{" "}
                     前
+                    {remainingSeconds > 0
+                      ? `（剩余 ${remainingSeconds} 秒，超时自动拒绝）`
+                      : "（已超时，自动拒绝）"}
                   </dd>
                 </dl>
                 {request.path && (

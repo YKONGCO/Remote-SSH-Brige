@@ -9,7 +9,7 @@ pub fn check(command: &str, settings: &RuntimeSettings) -> Result<()> {
     policy.validate()?;
     ensure!(
         policy.execution_mode.as_deref() != Some("disabled"),
-        "命令执行已禁止"
+        "Command execution is disabled"
     );
     inspect(command, &policy, settings.block_dangerous_commands, 0)
 }
@@ -20,37 +20,40 @@ fn inspect(
     block_dangerous: bool,
     nesting: usize,
 ) -> Result<()> {
-    ensure!(nesting <= 8, "命令保护：嵌套脚本过深");
-    ensure!(!source.trim().is_empty(), "命令不能为空");
+    ensure!(nesting <= 8, "Script nesting exceeds 8 levels");
+    ensure!(!source.trim().is_empty(), "command must not be empty");
     ensure!(
         source.len() <= 16384
             && !source
                 .chars()
                 .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')),
-        "命令保护：命令过长或包含不支持的控制字符"
+        "command exceeds 16384 bytes or contains unsupported control characters"
     );
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_bash::LANGUAGE.into())?;
     let tree = parser
         .parse(source, None)
-        .context("命令保护：无法解析 Shell 命令")?;
+        .context("Cannot parse shell command")?;
     ensure!(
         !tree.root_node().has_error(),
-        "命令保护：Shell 语法不完整或无法安全解析"
+        "Invalid or incomplete shell syntax"
     );
     let mut pending = vec![(tree.root_node(), 0)];
     while let Some((node, depth)) = pending.pop() {
-        ensure!(depth <= 128, "命令保护：Shell 语法嵌套过深");
+        ensure!(depth <= 128, "Shell syntax nesting exceeds 128 levels");
         match node.kind() {
-            "pipeline" => ensure!(policy.allow_pipes, "命令保护：未允许管道"),
+            "pipeline" => ensure!(policy.allow_pipes, "Pipes are not allowed"),
             "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                ensure!(policy.allow_redirection, "命令保护：未允许重定向")
+                ensure!(policy.allow_redirection, "Redirection is not allowed")
             }
             "command_substitution" | "process_substitution" => {
-                ensure!(policy.allow_substitution, "命令保护：未允许命令替换")
+                ensure!(
+                    policy.allow_substitution,
+                    "Command substitution is not allowed"
+                )
             }
             "list" | "subshell" | "compound_statement" => {
-                ensure!(policy.allow_compound, "命令保护：未允许组合命令")
+                ensure!(policy.allow_compound, "Compound commands are not allowed")
             }
             "function_definition"
             | "if_statement"
@@ -70,11 +73,13 @@ fn inspect(
                 ensure!(
                     policy.allow_scripts
                         && (!policy.diagnostic_only || policy.execution_mode.is_some()),
-                    "命令保护：未允许脚本、变量或控制结构"
+                    "Scripts, variables and control structures are not allowed"
                 );
             }
             "command" => inspect_command(node, source, policy, block_dangerous, nesting)?,
-            ";" | "&" | "&&" | "||" => ensure!(policy.allow_compound, "命令保护：未允许组合命令"),
+            ";" | "&" | "&&" | "||" => {
+                ensure!(policy.allow_compound, "Compound commands are not allowed")
+            }
             _ => {}
         }
         let mut cursor = node.walk();
@@ -90,7 +95,7 @@ fn inspect(
                 .count();
             ensure!(
                 count <= 1 || policy.allow_compound,
-                "命令保护：未允许组合命令或多行命令"
+                "Compound or multiline commands are not allowed"
             );
         }
         pending.extend(children.into_iter().map(|child| (child, depth + 1)));
@@ -132,7 +137,7 @@ fn inspect_command(
 ) -> Result<()> {
     let name = node
         .child_by_field_name("name")
-        .context("命令保护：无法确定命令名")?;
+        .context("Cannot determine command name")?;
     if has_dynamic(name) {
         ensure!(
             policy.allow_scripts
@@ -140,10 +145,10 @@ fn inspect_command(
                 && !block_dangerous
                 && policy.execution_mode.as_deref() != Some("whitelist")
                 && policy.blocked_commands.is_empty(),
-            "命令保护：无法静态确定命令名"
+            "Dynamic command names are not allowed by the current policy"
         );
     }
-    let mut words = shlex::split(text(name, source)).context("命令保护：无法解析命令名")?;
+    let mut words = shlex::split(text(name, source)).context("Cannot parse command name")?;
     let mut cursor = node.walk();
     for argument in node.children_by_field_name("argument", &mut cursor) {
         // Keep expansions as one argument; nested executable nodes are checked separately.
@@ -170,7 +175,7 @@ fn inspect_words(
     block_dangerous: bool,
     nesting: usize,
 ) -> Result<()> {
-    ensure!(nesting <= 8, "命令保护：包装命令嵌套过深");
+    ensure!(nesting <= 8, "Command wrapper nesting exceeds 8 levels");
     let Some(first) = words.first() else {
         return Ok(());
     };
@@ -185,7 +190,7 @@ fn inspect_words(
             } else {
                 rule == name
             }),
-        "命令保护：黑名单已拦截「{name}」"
+        "Command '{name}' is blocked by the denylist"
     );
     if policy.execution_mode.as_deref() == Some("whitelist") {
         let system_name = !first.contains('/')
@@ -201,13 +206,10 @@ fn inspect_words(
                 .allowed_commands
                 .iter()
                 .any(|rule| rule == first || (!rule.contains('/') && system_name && rule == name)),
-            "命令保护：「{name}」不在白名单中"
+            "Command '{name}' is not on the allowlist"
         );
         // Preserve parameter restrictions for built-in diagnostic commands.
-        if crate::model::default_allowed_commands()
-            .iter()
-            .any(|command| command == name)
-        {
+        if crate::security::DIAGNOSTIC_COMMANDS.contains(&name) {
             let mut diagnostic = words.to_vec();
             diagnostic[0] = name.to_owned();
             crate::security::check_diagnostic_words(&diagnostic)?;
@@ -219,7 +221,7 @@ fn inspect_words(
             || policy.execution_mode.as_deref() == Some("whitelist")
             || !policy.blocked_commands.is_empty())
             || !first.chars().any(|c| "$`*?[]{}".contains(c)),
-        "命令保护：无法静态确定命令名"
+        "Dynamic command names are not allowed by the current policy"
     );
     if block_dangerous {
         let dangerous = [
@@ -229,7 +231,7 @@ fn inspect_words(
         ];
         ensure!(
             !dangerous.contains(&name) && !name.starts_with("mkfs."),
-            "命令保护：已拦截高危命令「{name}」"
+            "Dangerous command '{name}' is blocked"
         );
         ensure!(
             name != "find"
@@ -237,7 +239,7 @@ fn inspect_words(
                     arg.as_str(),
                     "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
                 )),
-            "命令保护：已拦截 find 删除或执行动作"
+            "find delete and execute actions are blocked"
         );
         ensure!(
             name != "systemctl"
@@ -245,7 +247,7 @@ fn inspect_words(
                     arg.as_str(),
                     "reboot" | "poweroff" | "halt" | "rescue" | "emergency"
                 )),
-            "命令保护：已拦截系统电源操作"
+            "System power operations are blocked"
         );
     }
     let shell = ["sh", "bash", "dash", "zsh", "ksh", "ash", "fish"].contains(&name);
@@ -284,7 +286,7 @@ fn inspect_words(
             });
     ensure!(
         policy.allow_scripts || !(interpreter || script_file || custom_path),
-        "命令保护：未允许脚本、解释器或自定义程序路径"
+        "Scripts, interpreters and custom executable paths are not allowed"
     );
     if shell {
         if let Some(index) = args
@@ -293,7 +295,7 @@ fn inspect_words(
         {
             let code = args
                 .get(index + 1)
-                .context("命令保护：Shell -c 缺少脚本内容")?;
+                .context("Shell -c requires script content")?;
             inspect(code, policy, block_dangerous, nesting + 1)?;
         }
     } else if name == "eval" {
@@ -386,7 +388,7 @@ fn inspect_words(
                             && (arg.contains('s') || arg.contains('i')))
                 })
             {
-                ensure!(policy.allow_scripts, "命令保护：未允许 sudo Shell 模式");
+                ensure!(policy.allow_scripts, "sudo shell mode is not allowed");
                 inspect(
                     &args[index..].join(" "),
                     policy,

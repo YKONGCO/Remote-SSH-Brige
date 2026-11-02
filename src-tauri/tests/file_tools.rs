@@ -230,3 +230,54 @@ fn edits_are_sensitive_and_payload_validation_happens_before_io() {
     op.file_request = Some(FileRequest::Edit { edits: vec![] });
     assert!(file_tools::validate(&op, &settings).is_err());
 }
+
+#[test]
+fn permission_diagnostics_name_missing_dependency_and_preserve_short_message() {
+    use remote_ssh_brige_lib::model::Server;
+    let server = Server {
+        mcp_permissions: Some(vec!["edit_file".into()]),
+        ..Default::default()
+    };
+    let error = file_tools::with_stage(
+        file_tools::require_mcp_permissions(&server, &["edit_file", "read_file"]).unwrap_err(),
+        "authorization",
+    );
+    let response = file_tools::error_response(
+        &error,
+        &Operation {
+            kind: "edit_file".into(),
+            server_id: "s".into(),
+            path: "/app/file".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(response["code"], "PERMISSION_DENIED");
+    assert_eq!(response["stage"], "authorization");
+    assert_eq!(
+        response["details"]["missing_permissions"],
+        json!(["read_file"])
+    );
+    assert_eq!(response["details"]["path"], "/app/file");
+    assert!(error.to_string().contains("not authorized"));
+}
+
+#[test]
+fn remote_errors_preserve_native_code_and_are_execution_failures() {
+    let error = anyhow::Error::from(ssh2::Error::from_errno(ssh2::ErrorCode::SFTP(3)))
+        .context("cannot open remote file");
+    let response = file_tools::error_response(
+        &error,
+        &Operation {
+            kind: "read_file".into(),
+            path: "/app/private".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(response["stage"], "execution");
+    assert_eq!(response["code"], "PERMISSION_DENIED");
+    assert_eq!(response["details"]["ssh_code"], "SFTP(3)");
+    assert!(response["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot open remote file"));
+}

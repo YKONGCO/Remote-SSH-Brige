@@ -24,7 +24,10 @@ import {
   Code2,
 } from "lucide-react";
 import { api, desktop, operate } from "../api";
+import { TransferPanel } from "./TransferPanel";
 import { chooseBrowserSave } from "../save-file";
+import type { FileTransfer } from "../transfers";
+import { formatBytes } from "../transfers";
 import type { RuntimeSettings } from "../runtime-settings";
 import type { Server, FileEntry, FilePreview as Preview } from "../types";
 export function Files({
@@ -59,29 +62,46 @@ export function Files({
     name: string;
     entry?: FileEntry;
   } | null>(null);
-  const upload = useRef<HTMLInputElement>(null);
   const downloading = useRef(new Set<string>());
-  const load = async (p = path) => {
+  const upload = useRef<HTMLInputElement>(null);
+  const listingRequest = useRef(0);
+  const listingBusy = useRef(false);
+  const load = async (p = path, quiet = false) => {
     if (!server) return;
-    setBusy(true);
-    setError("");
+    if (quiet && listingBusy.current) return;
+    const request = ++listingRequest.current;
+    listingBusy.current = true;
+    if (!quiet) {
+      setBusy(true);
+      setError("");
+    }
     try {
       const r = await operate<{ path: string; entries: FileEntry[] }>({
         kind: "list_files",
         server_id: server.id,
         path: p,
       });
+      if (request !== listingRequest.current) return;
       setEntries(r.entries);
-      setPath(r.path);
-      setInput(r.path);
-      refresh();
+      setError("");
+      if (!quiet) {
+        setPath(r.path);
+        setInput(r.path);
+        refresh();
+      }
     } catch (e) {
-      setError(String(e));
+      if (request === listingRequest.current) setError(String(e));
     } finally {
-      setBusy(false);
+      if (request === listingRequest.current) {
+        listingBusy.current = false;
+        setBusy(false);
+      }
     }
   };
   useEffect(() => {
+    ++listingRequest.current;
+    listingBusy.current = false;
+    setBusy(false);
     setEntries([]);
     setEditor(null);
     setPreview(null);
@@ -93,6 +113,20 @@ export function Files({
     setInput(server?.root || "/");
     if (server) void load(server.root);
   }, [server?.id]);
+  useEffect(() => {
+    if (!server?.enabled || preferences.refreshSeconds === "0") return;
+    const timer = setInterval(
+      () => void load(path, true),
+      Number(preferences.refreshSeconds) * 1000,
+    );
+    return () => clearInterval(timer);
+  }, [server?.id, server?.enabled, path, preferences.refreshSeconds]);
+  useEffect(
+    () => () => {
+      ++listingRequest.current;
+    },
+    [],
+  );
   const join = (name: string) => (path === "/" ? "" : path) + "/" + name;
   const act = async (kind: string, extra: Record<string, string>) => {
     if (!server) return;
@@ -127,12 +161,20 @@ export function Files({
       return;
     }
     try {
-      const data = await operate<Preview>({
-        kind: "preview_file",
+      const result = await operate<{ content: string }>({
+        kind: "read_file",
         server_id: server!.id,
         path: entry.path,
       });
-      setPreview({ entry, data });
+      setPreview({
+        entry,
+        data: {
+          kind: "text",
+          content: result.content,
+          bytes: entry.size,
+          truncated: false,
+        },
+      });
       refresh();
     } catch (e) {
       notify(String(e), true);
@@ -142,25 +184,29 @@ export function Files({
     if (downloading.current.has(entry.path)) return;
     downloading.current.add(entry.path);
     try {
-      if (desktop) {
-        const saved = await api<boolean>("download_file", {
-          serverId: server!.id,
+      if (!desktop) {
+        // Browser preview has only a small in-memory demo, never a real SSH transfer.
+        const save = await chooseBrowserSave(entry.name);
+        if (!save) return;
+        const data = await operate<{ base64: string }>({
+          kind: "download",
+          server_id: server!.id,
           path: entry.path,
-          name: entry.name,
         });
-        if (saved) notify("文件已保存");
+        await save(
+          new Blob([
+            Uint8Array.from(atob(data.base64), (c) => c.charCodeAt(0)),
+          ]),
+        );
+        notify("文件已保存");
         return;
       }
-      const save = await chooseBrowserSave(entry.name);
-      if (!save) return;
-      const data = await operate<{ base64: string }>({
-        kind: "download",
-        server_id: server!.id,
+      const transfer = await api<FileTransfer | null>("download_file", {
+        serverId: server!.id,
         path: entry.path,
+        name: entry.name,
       });
-      const bytes = Uint8Array.from(atob(data.base64), (c) => c.charCodeAt(0));
-      await save(new Blob([bytes]));
-      notify("文件已保存");
+      if (transfer) notify("下载任务已开始，进度见文件传输列表");
     } catch (e) {
       notify(String(e), true);
     } finally {
@@ -262,50 +308,68 @@ export function Files({
           size="sm"
           className="btn primary"
           disabled={security?.remote_read_only}
-          onClick={() => upload.current?.click()}
+          onClick={() => {
+            if (!desktop) {
+              upload.current?.click();
+              return;
+            }
+            void api<FileTransfer | null>("upload_file", {
+              serverId: server.id,
+              remoteDir: path,
+            })
+              .then((transfer) => {
+                if (transfer) notify("上传任务已开始，进度见文件传输列表");
+              })
+              .catch((e) => notify(String(e), true));
+          }}
         >
           <Upload size={15} />
           上传
         </Button>
-        <input
-          hidden
-          type="file"
-          ref={upload}
-          onChange={async (e) => {
-            const f = e.target.files?.[0];
-            if (!f) return;
-            try {
-              const limits = await api<RuntimeSettings>("runtime_settings");
-              if (f.size > limits.upload_limit_mib * 1024 * 1024) {
-                notify(
-                  `文件超过 ${limits.upload_limit_mib} MiB 上传限制`,
-                  true,
-                );
-                return;
+        {!desktop && (
+          <input
+            hidden
+            type="file"
+            ref={upload}
+            onChange={async (e) => {
+              const f = e.target.files?.[0];
+              if (!f) return;
+              try {
+                const limits = await api<RuntimeSettings>("runtime_settings");
+                if (
+                  f.size >
+                  Math.min(limits.upload_limit_mib || 256, 256) * 1024 * 1024
+                ) {
+                  notify(
+                    `文件超过 ${limits.upload_limit_mib} MiB 上传限制`,
+                    true,
+                  );
+                  return;
+                }
+                if (entries.some((x) => x.name === f.name)) {
+                  setDialog({ kind: "upload-conflict", name: f.name });
+                  return;
+                }
+                setBusy(true);
+                const bytes = new Uint8Array(await f.arrayBuffer());
+                let binary = "";
+                for (let i = 0; i < bytes.length; i += 8192)
+                  binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+                await act("upload", {
+                  path: join(f.name),
+                  content: btoa(binary),
+                });
+                notify("文件已上传");
+                await load();
+              } catch (e) {
+                notify(String(e), true);
+              } finally {
+                setBusy(false);
+                e.target.value = "";
               }
-              if (entries.some((x) => x.name === f.name)) {
-                setDialog({ kind: "upload-conflict", name: f.name });
-                return;
-              }
-              setBusy(true);
-              const bytes = new Uint8Array(await f.arrayBuffer());
-              let binary = "";
-              for (let i = 0; i < bytes.length; i += 8192)
-                binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-              await act("upload", {
-                path: join(f.name),
-                content: btoa(binary),
-              });
-              notify("文件已上传");
-              await load();
-            } catch (e) {
-              notify(String(e), true);
-            } finally {
-              setBusy(false);
-              e.target.value = "";
-            }
-          }}
-        />
+            }}
+          />
+        )}
       </div>
       {error && (
         <div className="error-inline">
@@ -320,6 +384,11 @@ export function Files({
           </Button>
         </div>
       )}
+      <TransferPanel
+        serverId={server.id}
+        onComplete={() => void load()}
+        notify={notify}
+      />
       <div className="file-surface">
         <div className="file-list-scroll">
           <table className="data-table file-table">
@@ -617,10 +686,4 @@ export function Files({
     </div>
   );
 }
-export function formatSize(n: number) {
-  return n < 1024
-    ? n + " B"
-    : n < 1024 * 1024
-      ? (n / 1024).toFixed(1) + " KB"
-      : (n / 1024 / 1024).toFixed(1) + " MB";
-}
+export const formatSize = formatBytes;

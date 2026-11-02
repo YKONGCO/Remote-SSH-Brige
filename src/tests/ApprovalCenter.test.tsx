@@ -8,7 +8,7 @@ const mock = vi.hoisted(() => ({
   api: vi.fn(),
 }));
 vi.mock("../api", () => ({ desktop: true, api: mock.api }));
-import { ApprovalCenter } from "./ApprovalCenter";
+import { ApprovalCenter } from "../components/ApprovalCenter";
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });

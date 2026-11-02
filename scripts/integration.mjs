@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { connect } from "node:net";
+import { runForwardChecks } from "./forward-checks.mjs";
 import ssh2 from "ssh2";
 const { Server, utils } = ssh2;
 const sftpUtils = utils.sftp;
@@ -42,6 +43,9 @@ const entries = new Map([
 ]);
 const { STATUS_CODE: STATUS, OPEN_MODE: OPEN } = sftpUtils;
 const clients = new Set();
+const jobsEnabled = process.env.REMOTE_SSH_TEST_JOBS === "1";
+const executionCounts = new Map();
+const heldExecutions = new Map();
 const fixture = {
   rejectCommit: false,
   dropCommitResponse: false,
@@ -50,6 +54,9 @@ const fixture = {
   failDeletePath: null,
   dropDeletePath: null,
   deleteCalls: 0,
+  transferReadDelay: 0,
+  transferWriteDelay: 0,
+  dropTransferRead: false,
 };
 const canonical = (p) => (p === "/" ? "/" : p.replace(/\/+$/, ""));
 const stats = (p) => {
@@ -70,6 +77,22 @@ const ssh = new Server(
     debug: process.env.SSH_TEST_DEBUG ? console.log : undefined,
   },
   (client) => {
+    client.on("tcpip", (accept, reject, info) => {
+      if (!["127.0.0.1", "::1"].includes(info.destIP)) return reject();
+      const upstream = connect({ host: info.destIP, port: info.destPort });
+      let channel;
+      upstream.on("connect", () => {
+        channel = accept();
+        upstream.pipe(channel).pipe(upstream);
+        channel.on("error", () => upstream.destroy());
+        channel.on("close", () => upstream.destroy());
+      });
+      upstream.on("error", () => {
+        if (channel) channel.destroy();
+        else reject();
+      });
+    });
+    client.setNoDelay(true);
     clients.add(client);
     client.on("close", () => clients.delete(client));
     client.on("error", (e) => {
@@ -94,6 +117,17 @@ const ssh = new Server(
         session.on("window-change", (accept) => accept?.());
         session.on("exec", (accept, reject, info) => {
           const stream = accept();
+          executionCounts.set(
+            info.command,
+            (executionCounts.get(info.command) || 0) + 1,
+          );
+          stream.on("error", () => {});
+          if (info.command.startsWith("fixture:job")) {
+            heldExecutions.set(info.command, { stream, client });
+            stream.write("before ✓\n");
+            stream.stderr.write("error before ✓\n");
+            return;
+          }
           if (info.command === "fixture:streams") {
             stream.write("SSH stdout ✓\n");
             stream.stderr.write("SSH stderr ✓\n");
@@ -205,19 +239,41 @@ const ssh = new Server(
             if (!handle) return fail(id);
             const bytes = entries.get(handle.path);
             if (offset >= bytes.length) return fail(id, STATUS.EOF);
-            channel.data(id, bytes.subarray(offset, offset + length));
+            if (fixture.dropTransferRead) {
+              fixture.dropTransferRead = false;
+              client.end();
+              return;
+            }
+            const reply = () => {
+              if (!channel.destroyed)
+                channel.data(id, bytes.subarray(offset, offset + length));
+            };
+            if (fixture.transferReadDelay)
+              setTimeout(reply, fixture.transferReadDelay);
+            else reply();
           });
           channel.on("WRITE", (id, h, offset, data) => {
             const handle = handles.get(h.toString("hex"));
             if (!handle) return fail(id);
             const old = entries.get(handle.path);
-            const dest = Buffer.alloc(
-              Math.max(old.length, offset + data.length),
-            );
-            old.copy(dest);
-            data.copy(dest, offset);
-            entries.set(handle.path, dest);
-            ok(id);
+            const size = Math.max(old.length, offset + data.length);
+            if (!handle.backing || handle.backing.length < size) {
+              const capacity = Math.max(
+                65536,
+                size,
+                (handle.backing?.length || 0) * 2,
+              );
+              const backing = Buffer.alloc(capacity);
+              old.copy(backing);
+              handle.backing = backing;
+            }
+            data.copy(handle.backing, offset);
+            entries.set(handle.path, handle.backing.subarray(0, size));
+            if (fixture.transferWriteDelay)
+              setTimeout(() => {
+                if (!channel.destroyed) ok(id);
+              }, fixture.transferWriteDelay);
+            else ok(id);
           });
           channel.on("CLOSE", (id, h) => {
             handles.delete(h.toString("hex"));
@@ -327,12 +383,18 @@ const configServer = {
   allow_write: true,
   allow_terminal: true,
   mcp_permissions: [
+    "port_forward_open",
+    "port_forward_list",
+    "port_forward_read",
+    "port_forward_close",
     "read_file",
-    "preview_file",
+    "list_files",
+    "stat_file",
     "write_file",
     "edit_file",
     "remove_path",
     "exec",
+    "job",
     "list_terminals",
     "terminal_open",
     "terminal_read",
@@ -344,6 +406,7 @@ const configServer = {
 };
 const configServers = [
   configServer,
+  { ...configServer, id: "no-job-host", mcp_permissions: ["exec"] },
   {
     ...configServer,
     id: "limited-host",
@@ -402,7 +465,7 @@ settingsDB
   .prepare("INSERT INTO metadata(key,value) VALUES('runtime_settings',?)")
   .run(
     JSON.stringify({
-      deletion_protection: true,
+      deletion_protection: false,
       block_dangerous_commands: true,
       command_policy: {
         diagnostic_only: false,
@@ -420,6 +483,7 @@ settingsDB
       connect_timeout_secs: 8,
       io_timeout_secs: 15,
       command_timeout_secs: 1,
+      exec_timeout_to_job: jobsEnabled,
       max_terminals: 1,
     }),
   );
@@ -497,6 +561,10 @@ try {
     body: "{}",
   });
   check("Reject missing bearer token", unauthorized.status === 401);
+  check(
+    "Missing-token error is specific and English",
+    (await unauthorized.text()) === "Missing or invalid MCP bearer token",
+  );
   const badToken = await fetch(url, {
     method: "POST",
     headers: {
@@ -516,6 +584,10 @@ try {
     body: "{}",
   });
   check("Reject browser Origin", browser.status === 403);
+  check(
+    "Origin error is specific and English",
+    (await browser.text()) === "Browser-origin MCP requests are not allowed",
+  );
   await mcp.connect(transport);
   check(
     "MCP reports the new service name and title",
@@ -524,17 +596,23 @@ try {
   );
   const tools = await mcp.listTools();
   check(
-    "MCP exposes exactly 8 focused tools",
+    "MCP exposes exactly 14 focused tools",
     JSON.stringify(tools.tools.map((t) => t.name).sort()) ===
       JSON.stringify(
         [
           "list_servers",
           "exec",
+          "job",
+          "port_forward",
+          "upload_file",
+          "download_file",
+          "transfer",
           "read_file",
+          "list_files",
+          "stat_file",
           "write_file",
           "edit_file",
           "remove_path",
-          "preview_file",
           "terminal",
         ].sort(),
       ),
@@ -549,12 +627,29 @@ try {
             ? args
             : { server_id: "test-host", ...args },
       });
+      if (result.isError) {
+        assert.equal(
+          result.structuredContent,
+          undefined,
+          "Error payload must not be duplicated",
+        );
+        assert.equal(result.content.length, 1);
+        const text = result.content[0].text;
+        assert.equal(typeof text, "string");
+        assert.ok(text.length > 0);
+        assert.ok([...text].length <= 240);
+        assert.ok(!text.includes("\n"));
+        assert.ok(!text.includes('"command_policy"'));
+        assert.ok(!text.startsWith("{"));
+        assert.ok(!/[\u3400-\u9fff]/u.test(text), text);
+      }
       return {
         error: result.isError,
         value: result.content?.map((c) => c.text || "").join(""),
         metadata: result.structuredContent,
       };
     } catch (error) {
+      if (error?.code === "ERR_ASSERTION") throw error;
       return { error: true, value: String(error) };
     }
   };
@@ -563,14 +658,43 @@ try {
     assert.ok(!r.error, r.value);
     return name === "read_file"
       ? { content: r.value, ...r.metadata }
-      : JSON.parse(r.value);
+      : name === "terminal" && args?.action === "read"
+        ? { stdout: r.value, ...r.metadata }
+        : JSON.parse(r.value);
   };
+  const jobSchema = tools.tools.find((t) => t.name === "job").inputSchema;
+  check(
+    "Unknown tool error identifies the requested tool",
+    (await call("missing_tool")).value.includes("Unknown tool: missing_tool"),
+  );
+  await runForwardChecks({ call, value, check, tools });
+  check(
+    "Job schema exposes exactly list/read/close",
+    jobSchema.type === "object" &&
+      jobSchema.oneOf.length === 3 &&
+      jobSchema.oneOf.every((s) => s.additionalProperties === false),
+  );
+  for (const args of [
+    { action: "status" },
+    { action: "read" },
+    { action: "list", job_id: "irrelevant" },
+    { action: "close", job_id: "missing", wait_secs: 1 },
+  ]) {
+    check(
+      "Job rejects invalid action fields: " + JSON.stringify(args),
+      (await call("job", args)).error,
+    );
+  }
   for (const [name, expected] of Object.entries({
     list_servers: [],
     read_file: ["server_id", "path", "offset", "limit"],
-    write_file: ["server_id", "path", "content", "mode"],
+    list_files: ["server_id", "path", "offset", "limit"],
+    stat_file: ["server_id", "path"],
+    write_file: ["server_id", "path", "content", "mode", "create_parents"],
     edit_file: ["server_id", "path", "edits"],
     exec: ["server_id", "command", "timeout_secs"],
+    upload_file: ["server_id", "local_path", "remote_path", "overwrite"],
+    download_file: ["server_id", "local_path", "remote_path", "overwrite"],
     remove_path: ["server_id", "path", "recursive", "missing_ok"],
   })) {
     const schema = tools.tools.find((tool) => tool.name === name).inputSchema;
@@ -618,7 +742,6 @@ try {
       ),
   );
   for (const oldName of [
-    "list_files",
     "mkdir",
     "rename",
     "remove",
@@ -637,6 +760,69 @@ try {
     );
   }
   const hosts = await value("list_servers", {});
+  const listing = await value("list_files", { path: "/workspace", limit: 1 });
+  check(
+    "Directory listing is paginated and contains metadata",
+    listing.entries.length === 1 &&
+      listing.has_more &&
+      listing.next_offset === 1 &&
+      typeof listing.entries[0].permissions === "string",
+  );
+  const metadata = await value("stat_file", { path: "/workspace/hello.txt" });
+  check(
+    "Stat reads metadata without file content",
+    metadata.kind === "file" &&
+      metadata.size === 10 &&
+      !Object.hasOwn(metadata, "content"),
+  );
+  const missingParents = await call("write_file", {
+    path: "/workspace/new-parents/a/test.txt",
+    content: "nested",
+  });
+  check(
+    "write_file leaves missing parents untouched by default",
+    missingParents.error &&
+      missingParents.value.includes("Parent directory") &&
+      !entries.has("/workspace/new-parents"),
+  );
+  await value("write_file", {
+    path: "/workspace/new-parents/a/test.txt",
+    content: "nested",
+    create_parents: true,
+    mode: "create",
+  });
+  check(
+    "write_file creates nested parents when explicitly requested",
+    entries.get("/workspace/new-parents") === null &&
+      entries.get("/workspace/new-parents/a/test.txt").toString() === "nested",
+  );
+  const outsideParents = await call("write_file", {
+    path: "/outside/new-parents/test.txt",
+    content: "denied",
+    create_parents: true,
+  });
+  check(
+    "create_parents rejects outside-root ancestors before mutation",
+    outsideParents.error &&
+      outsideParents.value.includes("allowed file root") &&
+      !entries.has("/outside/new-parents"),
+  );
+  const deniedListing = await call("list_files", {
+    server_id: "limited-host",
+    path: "/workspace",
+  });
+  check(
+    "Permission errors identify the missing grant in one sentence",
+    deniedListing.error &&
+      deniedListing.value.includes("Missing MCP permission") &&
+      deniedListing.value.includes("list_files"),
+  );
+  const invalidPath = await call("stat_file", { path: "relative/path" });
+  check(
+    "Path validation errors identify the invalid parameter",
+    invalidPath.error &&
+      invalidPath.value.includes("path must be an absolute POSIX path"),
+  );
   check(
     "Discovery exposes independently configured Shell policy",
     hosts[0].security.command_policy.allow_pipes &&
@@ -664,12 +850,14 @@ try {
     const result = await call("exec", { command });
     check(
       `High-risk command stays blocked with Shell enabled: ${command}`,
-      result.error && result.value.includes("高危"),
+      result.error && result.value.includes("Dangerous"),
     );
   }
   check(
     "Discover configured host without credentials",
-    hosts.length === 3 && !JSON.stringify(hosts).includes("client.pem"),
+    hosts.length ===
+      configServers.filter((s) => s.mcp_enabled !== false).length &&
+      !JSON.stringify(hosts).includes("client.pem"),
   );
   check(
     "MCP-disabled host is hidden from discovery",
@@ -681,7 +869,7 @@ try {
   });
   check(
     "MCP-disabled host rejects calls by known ID",
-    hidden.error && hidden.value.includes("未授权"),
+    hidden.error && hidden.value.includes("Missing MCP permission"),
   );
   const limitedHost = hosts.find((host) => host.id === "limited-host");
   check(
@@ -712,7 +900,7 @@ try {
     const denied = await call(kind, { server_id: "limited-host", ...args });
     check(
       "Independent permission denies " + kind,
-      denied.error && JSON.parse(denied.value).code === "PERMISSION_DENIED",
+      denied.error && denied.value.includes("Missing MCP permission"),
     );
   }
   const mismatch = await call("read_file", {
@@ -721,7 +909,7 @@ try {
   });
   check(
     "Reject changed SSH host fingerprint before authentication",
-    mismatch.error && mismatch.value.includes("指纹不匹配"),
+    mismatch.error && mismatch.value.includes("fingerprint mismatch"),
   );
   const exec = await value("exec", { command: "fixture:streams" });
   check(
@@ -746,20 +934,16 @@ try {
   }
   const text = await value("read_file", { path: "/workspace/hello.txt" });
   check("Read remote UTF-8 file", text.content === "hello SSH\n");
-  const preview = await value("preview_file", { path: "/workspace/hello.txt" });
-  check(
-    "Preview remote text without changing the file",
-    preview.kind === "text" &&
-      preview.content === "hello SSH\n" &&
-      preview.truncated === false,
-  );
   await value("write_file", {
     path: "/workspace/new.txt",
     content: "原子写入 ✓",
   });
   const written = await value("read_file", { path: "/workspace/new.txt" });
   check("Atomic SFTP create and read", written.content === "原子写入 ✓");
-  await value("write_file", { path: "/workspace/new.txt", content: "updated" });
+  await value("write_file", {
+    path: "/workspace/new.txt",
+    content: "updated",
+  });
   check(
     "Atomic SFTP replace existing file",
     (await value("read_file", { path: "/workspace/new.txt" })).content ===
@@ -776,8 +960,7 @@ try {
   check(
     "Read returns raw text with continuation metadata",
     !page.error &&
-      page.value.startsWith("一\r\n二\r\n") &&
-      page.value.includes("offset=3") &&
+      page.value === "一\r\n二\r\n" &&
       page.metadata.next_offset === 3,
   );
   check(
@@ -816,7 +999,7 @@ try {
   check(
     "Failed batch leaves original file intact",
     failedBatch.error &&
-      failedBatch.value.includes("EDIT_NOT_FOUND") &&
+      failedBatch.value.includes("Text not found") &&
       beforeFailure.equals(entries.get("/workspace/edit.txt")),
   );
   const deniedEdit = await call("edit_file", {
@@ -826,7 +1009,7 @@ try {
   });
   check(
     "Edit permission is independent of shell access",
-    deniedEdit.error && deniedEdit.value.includes("未授权"),
+    deniedEdit.error && deniedEdit.value.includes("Missing MCP permission"),
   );
   await value("write_file", {
     path: "/workspace/create-only.txt",
@@ -866,7 +1049,7 @@ try {
   check(
     "Unsupported atomic write fails without touching destination",
     unsupported.error &&
-      unsupported.value.includes("ATOMIC_WRITE_UNSUPPORTED") &&
+      unsupported.value.includes("atomic SFTP extension is unsupported") &&
       beforeFailure.equals(entries.get("/workspace/edit.txt")),
   );
   fixture.dropCommitResponse = true;
@@ -879,7 +1062,7 @@ try {
   check(
     "Lost commit response is reported without retry",
     uncertain.error &&
-      uncertain.value.includes("COMMIT_STATUS_UNKNOWN") &&
+      uncertain.value.includes("read back before retrying") &&
       fixture.commitCalls === commitCount + 1 &&
       entries.get("/workspace/uncertain.txt").toString() ===
         "committed-without-ack",
@@ -908,11 +1091,6 @@ try {
     ![...entries.keys()].some((p) => p.includes(".remote-ssh-brige-")),
   );
   entries.set("/workspace/binary.bin", Buffer.from([0, 255, 16, 128]));
-  check(
-    "Binary preview returns metadata",
-    (await value("preview_file", { path: "/workspace/binary.bin" })).kind ===
-      "unsupported",
-  );
   await value("write_file", {
     path: "/workspace/large.txt",
     content: "x".repeat(3 * 1024 * 1024),
@@ -945,11 +1123,11 @@ try {
     path: "/workspace/mcp_test_remote_ssh.txt",
   });
   check(
-    "Safe removal deletes an empty test file while command and desktop protection stay on",
+    "Safe removal requires deletion protection off while command protection stays on",
     cleanup.removed &&
       cleanup.removed_entries === 1 &&
       !entries.has("/workspace/mcp_test_remote_ssh.txt") &&
-      hosts[0].security.deletion_protection &&
+      !hosts[0].security.deletion_protection &&
       hosts[0].security.command_protection,
   );
   const repeated = await value("remove_path", {
@@ -960,15 +1138,15 @@ try {
     repeated.missing && !repeated.removed && repeated.removed_entries === 0,
   );
   check(
-    "Strict missing mode reports NOT_FOUND",
-    JSON.parse(
+    "Strict missing mode reports a missing target",
+    /not found|no such|不存在/i.test(
       (
         await call("remove_path", {
           path: "/workspace/mcp_test_remote_ssh.txt",
           missing_ok: false,
         })
       ).value,
-    ).code === "NOT_FOUND",
+    ),
   );
   entries.set("/workspace/delete-tree", null);
   entries.set("/workspace/delete-tree/a", Buffer.from("a"));
@@ -983,7 +1161,7 @@ try {
   check(
     "Non-empty directory requires explicit recursion",
     nonEmpty.error &&
-      JSON.parse(nonEmpty.value).code === "DIRECTORY_NOT_EMPTY" &&
+      nonEmpty.value.includes("not empty") &&
       entries.has("/workspace/delete-tree/a"),
   );
   const removedTree = await value("remove_path", {
@@ -1023,7 +1201,7 @@ try {
   check(
     "Safe deletion requires a new explicit permission",
     deniedRemoval.error &&
-      JSON.parse(deniedRemoval.value).code === "PERMISSION_DENIED" &&
+      deniedRemoval.value.includes("Missing MCP permission") &&
       entries.has("/workspace/limited.txt"),
   );
   entries.set("/workspace/partial", null);
@@ -1035,13 +1213,10 @@ try {
     recursive: true,
   });
   fixture.failDeletePath = null;
-  const partialDetails = JSON.parse(partial.value);
   check(
     "Recursive deletion reports partial progress on server denial",
     partial.error &&
-      partialDetails.code === "PERMISSION_DENIED" &&
-      partialDetails.details.removed_entries === 1 &&
-      partialDetails.details.partial &&
+      partial.value.includes("removed entries: 1") &&
       !entries.has("/workspace/partial/a") &&
       entries.has("/workspace/partial/b"),
   );
@@ -1056,8 +1231,7 @@ try {
   check(
     "Lost delete response reports unknown outcome without retry",
     unknownDelete.error &&
-      JSON.parse(unknownDelete.value).code === "COMMIT_STATUS_UNKNOWN" &&
-      JSON.parse(unknownDelete.value).details.outcome_unknown &&
+      unknownDelete.value.includes("outcome unknown") &&
       fixture.deleteCalls === deleteCalls + 1 &&
       !entries.has("/workspace/delete-unknown"),
   );
@@ -1091,7 +1265,7 @@ try {
       session_id: terminal.session_id,
       cursor: 0,
     });
-    output = Buffer.from(r.base64, "base64").toString();
+    output = r.stdout;
     if (output.includes("/workspace/kept")) break;
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -1110,7 +1284,10 @@ try {
     cols: 120,
     rows: 40,
   });
-  await value("terminal", { action: "close", session_id: terminal.session_id });
+  await value("terminal", {
+    action: "close",
+    session_id: terminal.session_id,
+  });
   check(
     "Resize and close persistent terminal",
     (await value("terminal", { action: "list" })).length === 0,
@@ -1136,7 +1313,8 @@ try {
   });
   check(
     "Terminal output can be read without input permission",
-    typeof limitedOutput.base64 === "string",
+    typeof limitedOutput.stdout === "string" &&
+      !Object.hasOwn(limitedOutput, "base64"),
   );
   const deniedInput = await call("terminal", {
     action: "write",
@@ -1146,21 +1324,260 @@ try {
   });
   check(
     "Existing terminal input is denied without permission",
-    deniedInput.error && deniedInput.value.includes("未授权"),
+    deniedInput.error && deniedInput.value.includes("Missing MCP permission"),
   );
   await value("terminal", {
     action: "close",
     server_id: "limited-host",
     session_id: limitedTerminal.session_id,
   });
-  check(
-    "Command timeout enforced",
-    (await call("exec", { command: "fixture:timeout", timeout_secs: 1 })).error,
-  );
-  check(
-    "Configured default command timeout applies when omitted",
-    (await call("exec", { command: "fixture:timeout" })).error,
-  );
+  if (!jobsEnabled) {
+    check(
+      "Command timeout enforced",
+      (await call("exec", { command: "fixture:timeout", timeout_secs: 1 }))
+        .error,
+    );
+    check(
+      "Configured default command timeout applies when omitted",
+      (await call("exec", { command: "fixture:timeout" })).error,
+    );
+    const timed = await call("exec", {
+      command: "fixture:job-disabled",
+      timeout_secs: 1,
+    });
+    check(
+      "Timeout error returns only its concise reason",
+      timed.error &&
+        timed.value.includes("job") &&
+        !timed.value.includes("before ✓"),
+    );
+  } else {
+    const notifications = [];
+    const result = await mcp.callTool(
+      {
+        name: "exec",
+        arguments: {
+          server_id: "test-host",
+          command: "fixture:job-incremental",
+          timeout_secs: 1,
+        },
+      },
+      undefined,
+      { onprogress: (p) => notifications.push(p) },
+    );
+    check("Timeout handoff is a successful tool result", !result.isError);
+    const retained = JSON.parse(result.content[0].text);
+    check(
+      "Retained execution returns output, byte cursors and running state",
+      retained.status === "running" &&
+        retained.stdout === "before ✓\n" &&
+        retained.stderr === "error before ✓\n" &&
+        retained.next_stdout_cursor === Buffer.byteLength(retained.stdout),
+    );
+    check(
+      "Foreground exec sends bounded progress notifications",
+      notifications.length > 0 &&
+        notifications.every((p) => p.message.length < 60000),
+    );
+    const progressCount = notifications.length;
+    const held = heldExecutions.get("fixture:job-incremental");
+    setTimeout(() => {
+      held.stream.write("after ✓\n");
+      held.stream.stderr.write("error after ✓\n");
+    }, 100);
+    const readStarted = Date.now();
+    const incremental = await value("job", {
+      action: "read",
+      job_id: retained.job_id,
+      stdout_cursor: retained.next_stdout_cursor,
+      stderr_cursor: retained.next_stderr_cursor,
+      wait_secs: 10,
+    });
+    check(
+      "job.read wakes early and returns only incremental bytes",
+      Date.now() - readStarted < 2000 &&
+        incremental.stdout === "after ✓\n" &&
+        incremental.stderr === "error after ✓\n",
+    );
+    held.stream.exit(9);
+    held.stream.end();
+    const final = await value("job", {
+      action: "read",
+      job_id: retained.job_id,
+      stdout_cursor: incremental.next_stdout_cursor,
+      stderr_cursor: incremental.next_stderr_cursor,
+      wait_secs: 10,
+    });
+    check(
+      "Final nonzero exit code remains available without repeated execution",
+      final.status === "exited" &&
+        final.exit_code === 9 &&
+        final.stdout === "" &&
+        executionCounts.get("fixture:job-incremental") === 1,
+    );
+    check(
+      "Original exec progress stops at handoff",
+      notifications.length === progressCount,
+    );
+    check(
+      "Finished sessions remain listed",
+      (await value("job", { action: "list" })).jobs.some(
+        (j) => j.job_id === retained.job_id && j.status === "exited",
+      ),
+    );
+    check(
+      "Future cursors are rejected",
+      (
+        await call("job", {
+          action: "read",
+          job_id: retained.job_id,
+          stdout_cursor: final.next_stdout_cursor + 1,
+        })
+      ).error,
+    );
+    check(
+      "Job access checks server permission",
+      (
+        await call("job", {
+          server_id: "no-job-host",
+          action: "read",
+          job_id: retained.job_id,
+        })
+      ).error,
+    );
+    check(
+      "Job IDs cannot be accessed through another server",
+      (
+        await call("job", {
+          server_id: "wrong-fingerprint",
+          action: "read",
+          job_id: retained.job_id,
+        })
+      ).error,
+    );
+    check(
+      "Invalid wait duration is rejected",
+      (
+        await call("job", {
+          action: "read",
+          job_id: retained.job_id,
+          wait_secs: 31,
+        })
+      ).error,
+    );
+    const denied = await call("exec", {
+      server_id: "no-job-host",
+      command: "fixture:job-denied",
+      timeout_secs: 1,
+    });
+    check(
+      "Handoff without job authorization closes with explicit reason",
+      denied.error && denied.value.includes("job"),
+    );
+    const high = await value("exec", {
+      command: "fixture:job-high",
+      timeout_secs: 1,
+    });
+    const highStream = heldExecutions.get("fixture:job-high").stream;
+    const block = Buffer.alloc(5 * 1024 * 1024, "x");
+    const write = (stream, bytes) =>
+      new Promise((resolve) => stream.write(bytes, resolve));
+    let highTimer;
+    await Promise.race([
+      (async () => {
+        // The ssh2 fixture server can starve a pending stderr write when two
+        // multi-megabyte writes exhaust the same SSH window. Produce realistic
+        // interleaved chunks while leaving job.read entirely idle.
+        for (let offset = 0; offset < block.length; offset += 8192) {
+          const chunk = block.subarray(offset, offset + 8192);
+          await write(highStream, chunk);
+          await write(highStream.stderr, chunk);
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+      })(),
+      new Promise((_, reject) => {
+        highTimer = setTimeout(
+          async () =>
+            reject(
+              new Error(
+                "High output write stalled: " +
+                  JSON.stringify(await value("job", { action: "list" })),
+              ),
+            ),
+          15000,
+        );
+      }),
+    ]).finally(() => clearTimeout(highTimer));
+    highStream.exit(0);
+    highStream.end();
+    let highFinal;
+    for (let i = 0; i < 100; i++) {
+      highFinal = await value("job", {
+        action: "read",
+        job_id: high.job_id,
+        stdout_cursor: 0,
+        stderr_cursor: 0,
+      });
+      if (highFinal.status !== "running") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    check(
+      "Both streams drain without readers and retain only 4 MiB each",
+      highFinal.status === "exited" &&
+        highFinal.stdout.length === 4 * 1024 * 1024 &&
+        highFinal.stderr.length === 4 * 1024 * 1024 &&
+        highFinal.stdout_truncated &&
+        highFinal.stderr_truncated &&
+        highFinal.next_stdout_cursor === high.next_stdout_cursor + block.length,
+    );
+    const active = await Promise.all(
+      Array.from({ length: 4 }, (_, i) =>
+        value("exec", { command: "fixture:job-active-" + i, timeout_secs: 1 }),
+      ),
+    );
+    const full = await call("exec", {
+      command: "fixture:job-over-limit",
+      timeout_secs: 1,
+    });
+    check(
+      "Per-server active job limit is enforced with reason",
+      full.error && full.value.includes("4"),
+    );
+    const closed = await value("job", {
+      action: "close",
+      job_id: active[0].job_id,
+    });
+    check(
+      "Close confirms closed with unknown exit code and preserves output",
+      closed.status === "closed" &&
+        closed.exit_code === null &&
+        closed.stdout === "before ✓\n",
+    );
+    check(
+      "Closing a completed session preserves its result",
+      (await value("job", { action: "close", job_id: retained.job_id }))
+        .exit_code === 9,
+    );
+    const disconnectedPromise = value("job", {
+      action: "read",
+      job_id: active[1].job_id,
+      stdout_cursor: active[1].next_stdout_cursor,
+      stderr_cursor: active[1].next_stderr_cursor,
+      wait_secs: 10,
+    });
+    heldExecutions.get("fixture:job-active-1").client.end();
+    const disconnected = await disconnectedPromise;
+    check(
+      "SSH disconnect has unknown final result",
+      disconnected.status === "disconnected" && disconnected.exit_code === null,
+    );
+    await Promise.all(
+      active
+        .slice(2)
+        .map((j) => value("job", { action: "close", job_id: j.job_id })),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+  }
   const auditDB = new DatabaseSync(resolve(work, "remote-desk.sqlite3"), {
     readOnly: true,
   });
@@ -1189,6 +1606,14 @@ try {
         "+port=90",
       ),
   );
+  check(
+    "Forward audit records mapping metadata without traffic contents",
+    logs.some(
+      (l) => l.kind === "port_forward_open" && l.response?.data?.local_port > 0,
+    ) &&
+      logs.some((l) => l.kind === "port_forward_close") &&
+      !JSON.stringify(logs).includes("forward-secret-payload"),
+  );
   const recordedExec = logs.find(
     (entry) => entry.kind === "exec" && entry.response?.data?.exit_code === 7,
   );
@@ -1197,6 +1622,38 @@ try {
     recordedExec?.response.data.stdout.includes("stdout ✓") &&
       recordedExec?.response.data.stderr.includes("stderr ✓"),
   );
+  if (jobsEnabled) {
+    const handoff = logs.find(
+      (l) =>
+        l.kind === "exec" &&
+        l.response?.data?.job_id &&
+        l.detail === "fixture:job-incremental",
+    );
+    const finished = logs.find(
+      (l) =>
+        l.kind === "job" &&
+        l.response?.data?.job_id === handoff?.response?.data?.job_id &&
+        l.response?.data?.status === "exited",
+    );
+    check(
+      "Audit links successful handoff to nonzero final result",
+      handoff?.success &&
+        !finished?.success &&
+        finished?.response?.data?.exit_code === 9 &&
+        handoff.sequence < finished.sequence,
+    );
+    check(
+      "Audit records close and disconnect without invented exit codes",
+      ["closed", "disconnected"].every((status) =>
+        logs.some(
+          (l) =>
+            l.kind === "job" &&
+            l.response?.data?.status === status &&
+            l.response.data.exit_code === null,
+        ),
+      ),
+    );
+  }
   const deniedTransport = new StreamableHTTPClientTransport(url, {
     requestInit: { headers: { Authorization: "Bearer wrong-token" } },
   });
@@ -1209,6 +1666,15 @@ try {
     await deniedTransport.close();
   }
   check("MCP SDK rejects unauthorized connection", denied);
+  const { runTransferChecks } = await import("./transfer-checks.mjs");
+  await runTransferChecks({
+    binary,
+    work,
+    server: configServer,
+    entries,
+    fixture,
+    check,
+  });
   await writeFile(
     resolve(work, "report.json"),
     JSON.stringify({ passed: checks.length, checks }, null, 2),

@@ -1,5 +1,5 @@
 //! Root-scoped SFTP deletion. Preflight first; never recurse through symlinks.
-use crate::file_tools::{error, error_code, error_with_details};
+use crate::operation_error::{error, error_code, error_with_details};
 use anyhow::Result;
 use serde_json::{json, Value};
 

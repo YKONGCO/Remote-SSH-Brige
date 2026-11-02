@@ -2,7 +2,7 @@
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { McpPanel } from "./McpPanel";
+import { McpPanel } from "../components/McpPanel";
 import { api } from "../api";
 import type { McpClient } from "../mcp-clients";
 vi.mock("../api", () => ({ desktop: true, api: vi.fn() }));

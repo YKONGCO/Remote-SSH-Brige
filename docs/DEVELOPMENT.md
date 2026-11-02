@@ -56,9 +56,15 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```sh
 npm run build:headless
 npm run test:e2e
+
+# 可选：实际传输 272 MiB 文件并校验内容；Linux 还检查 Rust 进程内存增量
+# 设置环境变量 REMOTE_SSH_TEST_LARGE_FILES=1 后运行 npm run test:e2e
+
 ```
 
 测试在回环地址创建一次性 SSH / SFTP fixture，使用真实 MCP JS 客户端连接 Rust 服务，不访问用户服务器。远程命令和文件系统由内存服务实现，不能代替真实 Linux / OpenSSH 环境验收。输出位于 `.artifacts/integration-*/report.json`；程序路径识别平台可执行文件后缀并支持 `CARGO_TARGET_DIR`，也可用 `REMOTE_SSH_BRIGE_TEST_BINARY` 直接指定。
+
+默认协议测试验证关闭超时保留的兼容行为。设置环境变量 `REMOTE_SSH_TEST_JOBS=1` 可在完整协议测试中开启 Job 分支，包括移交只执行一次、progress、增量游标、两路高输出缓冲、活动上限、权限隔离、关闭、断线和审计关联。
 
 ## 代码结构
 
@@ -67,13 +73,18 @@ npm run test:e2e
 | `src/App.tsx`                                    | 工作区与页面导航                         |
 | `src/components/`                                | 服务器、文件、终端、审批、审计与设置界面 |
 | `src/components/ui/`                             | shadcn/ui 基础组件                       |
+| `src/tests/`                                    | 前端界面测试，统一存放 `*.test.tsx`，运行 `npm run test:ui` |
 | `src/api.ts`                                     | Tauri IPC 与浏览器演示                   |
 | `src/theme-tokens.css`                           | 亮暗主题与语义颜色                       |
 | `src/styles.css`、`src/fluent.css`               | 布局与组件样式                           |
 | `src-tauri/src/model.rs`                         | 配置、设置与操作数据类型                 |
 | `src-tauri/src/database.rs`、`schema.sql`        | SQLite 持久化与当前表结构                |
 | `src-tauri/src/state.rs`                         | 共享状态、权限校验、执行入口和审计       |
+| `src-tauri/src/jobs.rs`                          | 本地 SSH 执行 worker、Job 缓冲与生命周期 |
+| `src-tauri/src/tunnels.rs`                       | SSH 本地 TCP 转发、连接限额与生命周期    |
 | `src-tauri/src/mcp.rs`、`mcp_args.rs`            | MCP 服务、工具路由与参数 Schema          |
+| `src-tauri/src/mcp_response.rs`                  | MCP JSON 与原始正文返回封装              |
+| `src-tauri/src/operation_error.rs`               | 通用错误分类、阶段、消息及诊断详情       |
 | `src-tauri/src/clients.rs`                       | 客户端配置检测、备份和写入               |
 | `src-tauri/src/ssh.rs`、`terminal.rs`            | SSH / SFTP 与 PTY 会话                   |
 | `src-tauri/src/file_tools.rs`、`safe_remove.rs`  | 文本读写编辑与删除预检                   |

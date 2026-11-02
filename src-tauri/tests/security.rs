@@ -6,6 +6,84 @@ use remote_ssh_brige_lib::{
 use std::sync::Arc;
 
 #[test]
+fn extended_default_whitelist_keeps_independent_protections() {
+    use remote_ssh_brige_lib::model::CommandPolicy;
+    let mut settings = RuntimeSettings {
+        block_dangerous_commands: false,
+        command_policy: Some(CommandPolicy {
+            execution_mode: Some("whitelist".into()),
+            allow_advanced_shell: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for command in [
+        "nvidia-smi",
+        "mkdir -p /tmp/work",
+        "python -c 'print(1)'",
+        "git status",
+        "grep error /tmp/log",
+        "pgrep python",
+        "rm /tmp/file",
+        "systemctl status sshd",
+        "python3 -m pytest tests",
+        "uv run train.py",
+        "pip install numpy scipy pandas",
+        "conda list",
+        "ruff check .",
+        "node app.mjs",
+        "npm run build",
+        "pnpm test",
+        "bun run index.ts",
+        "tsc --noEmit",
+        "jupyter lab --no-browser",
+        "torchrun --nproc_per_node=2 train.py",
+        "accelerate launch train.py",
+        "tensorboard --logdir runs",
+        "hf download organization/model",
+        "Rscript analysis.R",
+        "squeue -u researcher",
+        "g++ -std=c++20 main.cpp -o app",
+        "clang-tidy main.cpp",
+        "javac Main.java",
+        "java -jar app.jar",
+        "mvn test",
+        "gradle build",
+        "go test ./...",
+        "gopls version",
+        "cargo test",
+        "rustc main.rs",
+        "rustup show",
+        "dotnet build",
+        "php -v",
+        "ruby -v",
+        "zig build",
+    ] {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_ok(),
+            "{command}"
+        );
+    }
+    settings.block_dangerous_commands = true;
+    settings
+        .command_policy
+        .as_ref()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert!(security::check_command_with_settings("rm /tmp/file", &settings).is_err());
+    assert!(security::check_command_with_settings("systemctl reboot", &settings).is_err());
+    assert!(security::check_command_with_settings("date -s tomorrow", &settings).is_err());
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allow_advanced_shell = Some(false);
+    assert!(security::check_command_with_settings("python -c 'print(1)'", &settings).is_err());
+    assert!(security::check_command_with_settings("node app.js", &settings).is_err());
+}
+
+#[test]
 fn editable_command_lists_apply_to_nested_commands_and_preserve_blacklist_priority() {
     use remote_ssh_brige_lib::model::CommandPolicy;
     let mut settings = RuntimeSettings {
@@ -51,7 +129,7 @@ fn editable_command_lists_apply_to_nested_commands_and_preserve_blacklist_priori
             check(command, &settings)
                 .unwrap_err()
                 .to_string()
-                .contains("黑名单"),
+                .contains("denylist"),
             "{command}"
         );
     }
@@ -79,7 +157,7 @@ fn editable_command_lists_apply_to_nested_commands_and_preserve_blacklist_priori
     assert!(check("ls", &settings)
         .unwrap_err()
         .to_string()
-        .contains("已禁止"));
+        .contains("disabled"));
 }
 
 #[test]
@@ -183,6 +261,52 @@ fn command_list_validation_and_persistence_preserve_explicit_empty_lists() {
         .clear();
     settings.command_policy.as_mut().unwrap().execution_mode = Some("unknown".into());
     assert!(settings.validate().is_err());
+}
+
+#[test]
+fn expanded_command_lists_persist_and_enforce_both_limits() {
+    use remote_ssh_brige_lib::model::{CommandPolicy, MAX_COMMAND_RULES};
+    let mut policy = CommandPolicy {
+        execution_mode: Some("whitelist".into()),
+        allowed_commands: (0..MAX_COMMAND_RULES).map(|n| format!("tool{n}")).collect(),
+        blocked_commands: (0..MAX_COMMAND_RULES)
+            .map(|n| format!("blocked{n}"))
+            .collect(),
+        ..Default::default()
+    };
+    assert!(policy.validate().is_ok());
+    policy.allowed_commands.push("overflow".into());
+    assert!(policy.validate().is_err());
+    policy.allowed_commands.pop();
+    policy.blocked_commands.push("overflow".into());
+    assert!(policy.validate().is_err());
+    policy.blocked_commands.pop();
+    let settings = RuntimeSettings {
+        command_policy: Some(policy),
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!("remote-command-policy-{}", uuid::Uuid::new_v4()));
+    let state = AppState::open(dir.clone()).unwrap();
+    state.save_settings(settings.clone()).unwrap();
+    drop(state);
+    let reopened = AppState::open(dir.clone()).unwrap();
+    assert_eq!(*reopened.settings.lock().unwrap(), settings);
+    assert!(security::check_command_with_settings("tool4095", &settings).is_ok());
+    assert!(
+        security::check_command_with_settings("blocked4095", &settings)
+            .unwrap_err()
+            .to_string()
+            .contains("denylist")
+    );
+    drop(reopened);
+    let resolved = dir.canonicalize().unwrap();
+    assert!(resolved.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert!(resolved
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("remote-command-policy-"));
+    std::fs::remove_dir_all(resolved).unwrap();
 }
 
 #[test]
@@ -314,7 +438,7 @@ fn known_dangerous_commands_remain_blocked_with_shell_features_enabled() {
         "find /tmp -delete",
     ] {
         let error = security::check_command_with_settings(command, &settings).unwrap_err();
-        assert!(error.to_string().contains("拦截"), "{command}: {error}");
+        assert!(error.to_string().contains("blocked"), "{command}: {error}");
     }
     settings.block_dangerous_commands = false;
     assert!(security::check_command_with_settings("rm -rf /tmp/test", &settings).is_ok());
@@ -367,7 +491,7 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
     let legacy = Server::default();
     assert_eq!(
         legacy.effective_mcp_permissions(),
-        ["read_file", "preview_file"]
+        ["read_file", "list_files", "stat_file"]
     );
     let legacy = Server {
         allow_exec: true,
@@ -380,7 +504,19 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
         MCP_OPERATIONS
             .iter()
             .copied()
-            .filter(|op| *op != "edit_file" && *op != "remove_path")
+            .filter(|op| !matches!(
+                *op,
+                "edit_file"
+                    | "remove_path"
+                    | "job"
+                    | "upload_file"
+                    | "download_file"
+                    | "transfer"
+                    | "port_forward_open"
+                    | "port_forward_list"
+                    | "port_forward_read"
+                    | "port_forward_close"
+            ))
             .collect::<Vec<_>>()
     );
     let editor = Server {
@@ -393,29 +529,6 @@ fn granular_permissions_override_legacy_switches_and_deny_unspecified_operations
         ..legacy
     };
     assert!(empty.effective_mcp_permissions().is_empty());
-}
-
-#[test]
-fn preview_treats_markup_as_text_and_never_returns_binary_as_html() {
-    use remote_ssh_brige_lib::ssh::preview_content;
-    let html = b"<script>alert(1)</script>".to_vec();
-    let view = preview_content(html.clone(), None, false).unwrap();
-    assert_eq!(view["kind"], "text");
-    assert_eq!(view["bytes"], html.len());
-    assert_eq!(view["content"], "<script>alert(1)</script>");
-    assert_eq!(
-        preview_content(vec![0, 1, 2], Some(3), false).unwrap()["kind"],
-        "unsupported"
-    );
-    let png = b"\x89PNG\r\n\x1a\n".to_vec();
-    assert_eq!(
-        preview_content(png.clone(), Some(8), false).unwrap()["mime"],
-        "image/png"
-    );
-    assert!(preview_content(png, Some(1024), true).is_err());
-    let text = preview_content(vec![b'a', 0xe4, 0xb8], Some(100), true).unwrap();
-    assert_eq!(text["content"], "a");
-    assert_eq!(text["truncated"], true);
 }
 
 #[test]
@@ -489,7 +602,6 @@ fn protections_and_approval_scope_are_independent_and_default_to_no_approval() {
     for kind in [
         "list_files",
         "read_file",
-        "preview_file",
         "download",
         "terminal_read",
         "terminal_close",
@@ -517,6 +629,68 @@ async fn request(queue: &ApprovalQueue) -> security::ApprovalView {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn configured_timeout_auto_rejects_and_pending_deadline_survives_setting_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().to_path_buf()).unwrap();
+    state
+        .save_settings(RuntimeSettings {
+            approval_mode: "mcp".into(),
+            approval_timeout_secs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let server = state
+        .save_server(
+            Server {
+                name: "timeout".into(),
+                host: "127.0.0.1".into(),
+                auth: "agent".into(),
+                allow_exec: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    let task = tokio::spawn(state::execute(
+        state.clone(),
+        Operation {
+            kind: "exec".into(),
+            command: "pwd".into(),
+            server_id: server.id,
+            ..Default::default()
+        },
+        "mcp",
+    ));
+    let pending =
+        tokio::time::timeout(std::time::Duration::from_secs(2), request(&state.approvals))
+            .await
+            .unwrap();
+    let created = chrono::DateTime::parse_from_rfc3339(&pending.created_at).unwrap();
+    let expires = chrono::DateTime::parse_from_rfc3339(&pending.expires_at).unwrap();
+    assert!((expires - created).num_milliseconds() <= 1100);
+    state
+        .save_settings(RuntimeSettings {
+            approval_mode: "mcp".into(),
+            approval_timeout_secs: 120,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(state.approvals.list()[0].expires_at, pending.expires_at);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        remote_ssh_brige_lib::file_tools::error_code(&error),
+        "APPROVAL_TIMEOUT"
+    );
+    let details = remote_ssh_brige_lib::file_tools::error_response(&error, &Operation::default());
+    assert_eq!(details["details"]["timeout_secs"], 1);
+    assert!(state.approvals.list().is_empty());
 }
 
 #[tokio::test]
@@ -579,7 +753,7 @@ async fn approval_is_single_use_cancellable_and_fails_closed_when_journaling_fai
         .unwrap()
         .unwrap_err()
         .to_string()
-        .contains("拒绝"));
+        .contains("rejected"));
     assert!(queue.decide(&pending.id, true, |_| Ok(())).is_err());
     let worker = queue.clone();
     let task = tokio::spawn(async move {
@@ -640,7 +814,10 @@ async fn changed_server_permissions_invalidate_an_approved_request_before_networ
     state.save_server(changed, None).unwrap();
     state.resolve_approval(&pending.id, true).unwrap();
     let error = task.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("配置已变更"), "{error}");
+    assert!(
+        error.to_string().contains("configuration changed"),
+        "{error}"
+    );
     assert!(!serde_json::to_string(&state.snapshot())
         .unwrap()
         .contains("secret-body"));
@@ -717,7 +894,7 @@ async fn rejection_metadata_survives_restart_without_persisting_file_bodies() {
         .unwrap()
         .unwrap_err()
         .to_string()
-        .contains("拒绝"));
+        .contains("rejected"));
     let decision = state
         .audit
         .lock()

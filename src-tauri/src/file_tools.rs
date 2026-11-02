@@ -9,56 +9,41 @@ pub const MAX_BYTES: usize = 50 * 1024;
 pub const MAX_LINES: u64 = 2000;
 pub const DIRECTORY_SCAN_LIMIT: usize = 10000;
 
-#[derive(Debug)]
-pub struct FileError {
-    pub code: &'static str,
-    message: &'static str,
-    pub details: Option<Value>,
-}
-impl fmt::Display for FileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-impl std::error::Error for FileError {}
-pub fn error(code: &'static str, message: &'static str) -> anyhow::Error {
-    FileError {
-        code,
-        message,
-        details: None,
-    }
-    .into()
-}
-pub fn error_with_details(
-    code: &'static str,
-    message: &'static str,
-    details: Value,
-) -> anyhow::Error {
-    FileError {
-        code,
-        message,
-        details: Some(details),
-    }
-    .into()
-}
+// Keep the existing imports available to operation implementations and callers.
+pub use crate::operation_error::{
+    error, error_code, error_message, error_response, error_with_details, with_stage, ErrorStage,
+    OperationError as FileError,
+};
 
-pub fn error_code(error: &anyhow::Error) -> &'static str {
-    if let Some(error) = error.downcast_ref::<FileError>() {
-        return error.code;
+pub fn require_mcp_permissions(server: &crate::model::Server, required: &[&str]) -> Result<()> {
+    let missing: Vec<_> = required
+        .iter()
+        .copied()
+        .filter(|kind| {
+            // edit_file's dependency is checked separately, so don't report a
+            // granted edit_file as missing when only read_file is absent.
+            let explicitly_granted_edit = *kind == "edit_file"
+                && server.enabled
+                && server.mcp_enabled
+                && server
+                    .mcp_permissions
+                    .as_ref()
+                    .is_some_and(|permissions| permissions.iter().any(|p| p == "edit_file"));
+            !server.permits_mcp(kind) && !explicitly_granted_edit
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
     }
-    if let Some(error) = error.downcast_ref::<ssh2::Error>() {
-        return match error.code() {
-            ssh2::ErrorCode::SFTP(2) => "NOT_FOUND",
-            ssh2::ErrorCode::SFTP(3) => "PERMISSION_DENIED",
-            ssh2::ErrorCode::SFTP(11) => "ALREADY_EXISTS",
-            _ => "OPERATION_FAILED",
-        };
-    }
-    if error.to_string().starts_with("INVALID_ARGUMENT:") {
-        "INVALID_ARGUMENT"
-    } else {
-        "OPERATION_FAILED"
-    }
+    Err(error_with_details(
+        "PERMISSION_DENIED",
+        "MCP operation is not authorized",
+        json!({
+            "required_permissions":required,"missing_permissions":missing,
+            "granted_permissions":server.effective_mcp_permissions(),
+            "mcp_enabled":server.mcp_enabled,"server_enabled":server.enabled,
+        }),
+    ))
 }
 
 pub fn mutates(kind: &str) -> bool {
@@ -211,13 +196,13 @@ pub fn read_page(
             if line.contains(&0) {
                 return Err(error(
                     "UNSUPPORTED_TEXT",
-                    "Not UTF-8 text; use preview_file or exec if permitted",
+                    "Not UTF-8 text; download the file or use exec if permitted",
                 ));
             }
             let text = std::str::from_utf8(&line).map_err(|_| {
                 error(
                     "UNSUPPORTED_TEXT",
-                    "Not UTF-8 text; use preview_file or exec if permitted",
+                    "Not UTF-8 text; download the file or use exec if permitted",
                 )
             })?;
             content.push_str(text);
