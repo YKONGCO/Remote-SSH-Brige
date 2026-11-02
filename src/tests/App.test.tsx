@@ -36,6 +36,58 @@ beforeAll(() => {
 });
 afterEach(cleanup);
 
+test("server PATH synchronization refreshes its timestamp and preserves state on failure", async () => {
+  localStorage.clear();
+  const realApi = remoteApi.api;
+  let synced = false;
+  let fail = false;
+  const requests = vi
+    .spyOn(remoteApi, "api")
+    .mockImplementation(async (command, args) => {
+      if (command === "sync_login_path") {
+        if (fail) throw new Error("PATH synchronization failed");
+        synced = true;
+        return {} as never;
+      }
+      const result = await realApi(command, args);
+      if (command === "snapshot" && synced) {
+        const snapshot = structuredClone(result) as {
+          servers: { login_path_synced_at?: string }[];
+        };
+        snapshot.servers[0].login_path_synced_at = "2026-11-02T08:00:00Z";
+        return snapshot as never;
+      }
+      return result;
+    });
+  try {
+    const user = userEvent.setup();
+    render(<App />);
+    const button = await screen.findByRole("button", {
+      name: "更多操作 生产服务器",
+    });
+    expect(
+      screen.queryByRole("button", { name: /同步PATH|测试连接/ }),
+    ).toBeNull();
+    expect(screen.getAllByText("PATH 未同步").length).toBeGreaterThan(0);
+    await user.click(button);
+    expect(screen.getByRole("menuitem", { name: "测试连接" })).toBeTruthy();
+    await user.click(screen.getByRole("menuitem", { name: "同步PATH" }));
+    await screen.findByText(/^PATH ·/);
+    expect(
+      requests.mock.calls.some(
+        ([command, args]) => command === "sync_login_path" && args?.id,
+      ),
+    ).toBe(true);
+    fail = true;
+    await user.click(button);
+    await user.click(screen.getByRole("menuitem", { name: "同步PATH" }));
+    await screen.findByText(/PATH synchronization failed/);
+    expect(screen.getByText(/^PATH ·/)).toBeTruthy();
+  } finally {
+    requests.mockRestore();
+  }
+});
+
 test("后台任务 navigation appears immediately above operation history and opens the 后台任务 list", async () => {
   localStorage.clear();
   const user = userEvent.setup();

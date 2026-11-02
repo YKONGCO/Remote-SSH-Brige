@@ -219,7 +219,15 @@ MCP `content` 仅提供原始文本；`structuredContent` 提供 `path`、`start
 
 ### 错误返回
 
-业务错误使用 `isError=true`，`content[0].text` 直接用英文说明具体原因，例如 `Redirection is not allowed`、`Missing MCP permission: list_files`。不返回错误 JSON、完整命令、策略配置、权限列表或错误链。文字为单行，最多 240 个字符。删除部分完成或结果未知时，保留失败路径及简短核验提示。Schema 错误保留具体参数和预期类型，删除冗长的候选字段列表，例如 ``Invalid arguments: missing field `path` ``。
+`exec` 被命令策略拒绝时，返回精简 JSON，例如：
+
+```json
+{"code":"COMMAND_POLICY_DENIED","details":{"command":"ls; true"},"message":"Compound commands are not allowed"}
+```
+
+只包含错误码、原始命令和简短英文原因，不返回完整策略、保护开关、错误链或结构化副本。原始命令保留完整内容，消息仍有界；不会截断整个 JSON。审计中的策略拒绝也不再保存整份策略配置。其他业务错误继续使用简短英文文本。
+
+除上述 exec 策略拒绝外，业务错误使用 `isError=true`，`content[0].text` 直接用英文说明具体原因，例如 `Redirection is not allowed`、`Missing MCP permission: list_files`。不返回错误 JSON、完整命令、策略配置、权限列表或错误链。文字为单行，最多 240 个字符。删除部分完成或结果未知时，保留失败路径及简短核验提示。Schema 错误保留具体参数和预期类型，删除冗长的候选字段列表，例如 ``Invalid arguments: missing field `path` ``。
 
 HTTP 拒绝保持原状态码，并返回简短英文正文，例如 401 的 `Missing or invalid MCP bearer token`、403 的 `Browser-origin MCP requests are not allowed`、413 的 `Request body exceeds the configured size limit`。远端程序的 stdout/stderr、文件正文和用户提供的路径保持原样。
 

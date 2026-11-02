@@ -18,8 +18,11 @@ import {
   ShieldCheck,
   KeyRound,
   ArrowRight,
+  Plus,
+  Trash2,
+  RefreshCw,
 } from "lucide-react";
-import type { Server } from "../types";
+import type { Server, LoginPathUpdate } from "../types";
 import {
   permissionGroups,
   selectedMcpPermissions,
@@ -48,17 +51,35 @@ export function ServerModal({
   onClose,
   onSave,
   onOpenSettings,
+  onPathSynced,
 }: {
+  onPathSynced?: () => void;
   onOpenSettings?: () => void;
   initial: Server;
   groups?: string[];
   onClose: () => void;
-  onSave: (s: Server, secret: string) => Promise<void>;
+  onSave: (
+    s: Server,
+    secret: string,
+    loginPathUpdate?: LoginPathUpdate,
+  ) => Promise<void>;
 }) {
   const [server, setServer] = useState(initial),
     [secret, setSecret] = useState(""),
-    [busy, setBusy] = useState(false),
+    [saving, setSaving] = useState(false),
+    [syncing, setSyncing] = useState(false),
+    [pathBaseline, setPathBaseline] = useState(initial.login_path ?? null),
     [error, setError] = useState("");
+  const busy = saving || syncing;
+  const [pathRows, setPathRows] = useState(() =>
+    initial.login_path == null
+      ? []
+      : initial.login_path.split(":").map((value) => ({
+          id: crypto.randomUUID(),
+          value,
+          added: false,
+        })),
+  );
   const set = (key: keyof Server, value: unknown) =>
     setServer((s) => ({ ...s, [key]: value }));
   const [deletionProtection, setDeletionProtection] = useState<boolean | null>(
@@ -80,7 +101,55 @@ export function ServerModal({
     };
   }, []);
   const selectedPermissions = selectedMcpPermissions(server);
+  const savedRows = pathRows.filter((row) => !row.added || row.value !== "");
+  const loginPath = savedRows.length
+    ? savedRows.map((row) => row.value).join(":")
+    : null;
+  const pathChanged = loginPath !== pathBaseline;
+  const identityChanged =
+    !!initial.id &&
+    (server.host.trim() !== initial.host ||
+      server.port !== initial.port ||
+      server.username !== initial.username);
   const mcpEnabled = server.mcp_enabled !== false;
+  const connectionChanged =
+    identityChanged ||
+    server.auth !== initial.auth ||
+    server.key_path !== initial.key_path ||
+    !!secret;
+  const canSync =
+    !!initial.id &&
+    !!initial.fingerprint &&
+    server.enabled &&
+    !connectionChanged;
+  const syncPath = async () => {
+    if (busy || !canSync) return;
+    setSyncing(true);
+    setError("");
+    try {
+      const synced = await api<Server>("sync_login_path", { id: initial.id });
+      setPathRows(
+        synced.login_path == null
+          ? []
+          : synced.login_path.split(":").map((value) => ({
+              id: crypto.randomUUID(),
+              value,
+              added: false,
+            })),
+      );
+      setPathBaseline(synced.login_path ?? null);
+      setServer((current) => ({
+        ...current,
+        login_path: synced.login_path,
+        login_path_synced_at: synced.login_path_synced_at,
+      }));
+      onPathSynced?.();
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setSyncing(false);
+    }
+  };
   return (
     <ModalFrame
       onClose={() => {
@@ -92,18 +161,23 @@ export function ServerModal({
         className="modal-form"
         onSubmit={async (e) => {
           e.preventDefault();
-          setBusy(true);
+          if (busy) return;
+          setSaving(true);
           setError("");
           try {
             await onSave(
-              withMcpPermissions(server, selectedPermissions),
+              withMcpPermissions(
+                { ...server, login_path: loginPath },
+                selectedPermissions,
+              ),
               secret,
+              pathChanged ? { value: loginPath } : undefined,
             );
             onClose();
           } catch (e) {
             setError(String(e));
           } finally {
-            setBusy(false);
+            setSaving(false);
           }
         }}
       >
@@ -123,6 +197,7 @@ export function ServerModal({
             className="icon-btn"
             onClick={onClose}
             aria-label="关闭"
+            disabled={busy}
           >
             <X size={20} />
           </Button>
@@ -380,6 +455,105 @@ export function ServerModal({
               </div>
             </fieldset>
           </div>
+          <section className="server-path-editor">
+            <div className="server-path-header">
+              <div className="server-path-title">PATH 目录</div>
+              <div className="flex items-center gap-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy || !canSync}
+                  title={
+                    connectionChanged
+                      ? "连接信息已修改，请先保存后同步"
+                      : "使用已保存的连接信息同步 PATH，立即生效并替换当前目录列表"
+                  }
+                  onClick={() => void syncPath()}
+                >
+                  <RefreshCw
+                    size={14}
+                    className={syncing ? "spinning" : undefined}
+                  />
+                  {syncing ? "正在同步…" : "同步PATH"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy || identityChanged}
+                  onClick={() =>
+                    setPathRows((rows) => [
+                      ...rows,
+                      { id: crypto.randomUUID(), value: "", added: true },
+                    ])
+                  }
+                >
+                  <Plus size={14} />
+                  添加目录
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="清空 PATH"
+                  title="清空 PATH"
+                  disabled={busy || identityChanged || pathRows.length === 0}
+                  onClick={() => setPathRows([])}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </div>
+            </div>
+            <div
+              className="server-path-list"
+              role="group"
+              aria-label="PATH 目录"
+            >
+              {pathRows.length === 0 && (
+                <p className="server-path-empty">暂无 PATH 目录</p>
+              )}
+              {pathRows.map((row, index) => (
+                <div className="server-path-row" key={row.id}>
+                  <Input
+                    className="min-w-0 flex-1 font-mono"
+                    aria-label={"PATH 目录 " + (index + 1)}
+                    spellCheck={false}
+                    disabled={busy || identityChanged}
+                    placeholder={
+                      row.added ? "/opt/venv/bin" : "当前目录（空路径项）"
+                    }
+                    value={row.value}
+                    pattern="[^:]*"
+                    title="每行填写一个目录"
+                    onChange={(e) =>
+                      setPathRows((rows) =>
+                        rows.map((item) =>
+                          item.id === row.id
+                            ? { ...item, value: e.target.value }
+                            : item,
+                        ),
+                      )
+                    }
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={"删除 PATH 目录 " + (index + 1)}
+                    disabled={busy || identityChanged}
+                    onClick={() =>
+                      setPathRows((rows) =>
+                        rows.filter((item) => item.id !== row.id),
+                      )
+                    }
+                  >
+                    <Trash2 size={14} />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </section>
           {error && <div className="error-inline">{error}</div>}
         </div>
         <div className="modal-foot">
@@ -389,6 +563,7 @@ export function ServerModal({
             type="button"
             className="btn"
             onClick={onClose}
+            disabled={busy}
           >
             取消
           </Button>
@@ -398,7 +573,7 @@ export function ServerModal({
             className="btn primary"
             disabled={busy}
           >
-            {busy ? "正在保存…" : "保存服务器"}
+            {saving ? "正在保存…" : "保存服务器"}
             <ArrowRight size={15} />
           </Button>
         </div>

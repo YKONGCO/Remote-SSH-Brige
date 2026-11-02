@@ -42,27 +42,17 @@ pub fn check_command_with_settings(command: &str, settings: &RuntimeSettings) ->
 
 pub(crate) const DIAGNOSTIC_COMMANDS: &[&str] = &[
     "pwd", "ls", "cat", "head", "tail", "stat", "file", "du", "df", "free", "uptime", "whoami",
-    "id", "uname", "date", "hostname", "ps", "ss", "netstat", "wc", "readlink", "realpath",
+    "id", "uname", "date", "hostname", "ps", "ss", "netstat", "wc", "readlink", "realpath", "true",
+    "false", ":", "yes", "set",
 ];
 
 pub(crate) fn check_diagnostic_words(words: &[String]) -> Result<()> {
     let first = words.first().context("command must not be empty")?;
-    let executable = if let Some(name) = first
-        .strip_prefix("/usr/bin/")
-        .or_else(|| first.strip_prefix("/bin/"))
-    {
-        anyhow::ensure!(
-            !name.contains('/'),
-            "Custom executable paths are not allowed"
-        );
-        name
-    } else {
-        anyhow::ensure!(
-            !first.contains('/'),
-            "Custom executable paths are not allowed"
-        );
-        first.as_str()
-    };
+    anyhow::ensure!(
+        crate::command_policy::trusted_executable(first),
+        "Executable path is outside trusted directories: {first}"
+    );
+    let executable = first.rsplit('/').next().unwrap_or(first);
     anyhow::ensure!(
         DIAGNOSTIC_COMMANDS.contains(&executable),
         "Command '{executable}' is not allowed in diagnostic-only mode"
@@ -128,9 +118,7 @@ pub fn check(settings: &RuntimeSettings, op: &Operation, source: &str) -> Result
                 "Command rejected by shell policy",
                 serde_json::json!({
                     "command": op.command,
-                    "reason": format!("{e:#}"),
-                    "command_policy": settings.effective_command_policy(),
-                    "command_protection": settings.block_dangerous_commands,
+                    "reason": crate::operation_error::error_message(&e),
                 }),
             )
         })?;

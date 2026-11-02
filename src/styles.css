@@ -4542,3 +4542,84 @@
     max-height: none;
   }
 }
+@layer fluent {
+  .server-path-editor {
+    margin-top: 4px;
+    overflow: hidden;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--card-fill);
+  }
+  .server-path-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 36px;
+    padding: 4px 6px 4px 10px;
+  }
+  .server-path-title {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .server-path-header button {
+    height: 26px;
+    gap: 5px;
+    padding-inline: 6px;
+    font-size: 11px;
+  }
+  .server-path-header button svg {
+    width: 13px;
+    height: 13px;
+  }
+  .server-path-header button[aria-label="清空 PATH"] {
+    width: 26px;
+  }
+  .server-path-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border-top: 1px solid var(--hairline);
+  }
+  .server-path-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 8px;
+    border-bottom: 1px solid var(--hairline);
+    transition: background-color 150ms ease;
+  }
+  .server-path-row:last-child {
+    border-bottom: 0;
+  }
+  .server-path-row:focus-within,
+  .server-path-row:hover {
+    background: var(--row-hover);
+  }
+  .server-path-editor .server-path-row input {
+    min-width: 0;
+    height: 28px;
+    padding-inline: 4px;
+    border-color: transparent;
+    border-radius: 4px;
+    background: transparent;
+    box-shadow: none;
+    font-size: 12px;
+  }
+  .server-path-row > button {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    color: var(--ink-secondary);
+  }
+  .server-path-row > button:hover:not(:disabled) {
+    color: var(--danger-text);
+  }
+  .server-path-empty {
+    margin: 0;
+    padding: 14px 10px;
+    text-align: center;
+    color: var(--ink-secondary);
+    font-size: 12px;
+  }
+}

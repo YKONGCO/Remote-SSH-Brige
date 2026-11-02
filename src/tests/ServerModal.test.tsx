@@ -50,6 +50,150 @@ const mount = (permissions: string[] = [], onOpenSettings?: () => void) => {
   return save;
 };
 const box = (name: string) => screen.getByRole("checkbox", { name });
+
+test("PATH follows MCP permissions and synchronization refreshes rows without marking them as manual edits", async () => {
+  const user = userEvent.setup();
+  const save = vi.fn().mockResolvedValue(undefined);
+  const refreshed = vi.fn();
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "sync_login_path")
+      return {
+        ...initial,
+        login_path: "/synced/bin:/usr/bin",
+        login_path_synced_at: "2026-11-02T08:00:00Z",
+      } as never;
+    return defaultRuntimeSettings as never;
+  });
+  render(
+    <ServerModal
+      initial={{
+        ...initial,
+        fingerprint: "SHA256:trusted",
+        login_path: "/old",
+      }}
+      onClose={vi.fn()}
+      onSave={save}
+      onPathSynced={refreshed}
+    />,
+  );
+  const permissions = screen.getByRole("group", { name: "MCP 操作权限" });
+  const paths = screen.getByRole("group", { name: "PATH 目录" });
+  expect(
+    permissions.compareDocumentPosition(paths) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "同步PATH" }));
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("textbox", { name: "PATH 目录 1" }) as HTMLInputElement)
+        .value,
+    ).toBe("/synced/bin"),
+  );
+  expect(
+    (screen.getByRole("textbox", { name: "PATH 目录 2" }) as HTMLInputElement)
+      .value,
+  ).toBe("/usr/bin");
+  expect(refreshed).toHaveBeenCalledOnce();
+  expect(screen.queryByText("PATH 已修改，尚未保存")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "保存服务器" }));
+  await waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(save.mock.calls[0][2]).toBeUndefined();
+});
+
+test("failed synchronization preserves edited PATH rows", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "sync_login_path") throw new Error("同步失败");
+    return defaultRuntimeSettings as never;
+  });
+  render(
+    <ServerModal
+      initial={{
+        ...initial,
+        fingerprint: "SHA256:trusted",
+        login_path: "/old",
+      }}
+      onClose={vi.fn()}
+      onSave={vi.fn()}
+    />,
+  );
+  const field = screen.getByRole("textbox", { name: "PATH 目录 1" });
+  await user.clear(field);
+  await user.type(field, "/draft");
+  await user.click(screen.getByRole("button", { name: "同步PATH" }));
+  await screen.findByText(/同步失败/);
+  expect((field as HTMLInputElement).value).toBe("/draft");
+});
+
+test.each([
+  [null, "/opt/venv/bin:/usr/bin"],
+  ["/old/bin:/usr/bin", "/new/bin:/usr/bin"],
+  ["/old/bin:/usr/bin", null],
+])(
+  "PATH cache can be created, edited and cleared (%s → %s)",
+  async (oldPath, newPath) => {
+    const user = userEvent.setup();
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ServerModal
+        initial={{ ...initial, login_path: oldPath }}
+        onClose={vi.fn()}
+        onSave={save}
+      />,
+    );
+    const oldRows = oldPath?.split(":") ?? [];
+    expect(
+      screen
+        .queryAllByRole("textbox", { name: /^PATH 目录 / })
+        .map((field) => (field as HTMLInputElement).value),
+    ).toEqual(oldRows);
+    if (newPath === null) {
+      for (let i = oldRows.length; i > 0; i--)
+        await user.click(
+          screen.getByRole("button", { name: "删除 PATH 目录 " + i }),
+        );
+    } else {
+      const newRows = newPath.split(":");
+      for (let i = 0; i < newRows.length; i++) {
+        if (i >= oldRows.length)
+          await user.click(screen.getByRole("button", { name: "添加目录" }));
+        const field = screen.getByRole("textbox", {
+          name: "PATH 目录 " + (i + 1),
+        });
+        await user.clear(field);
+        await user.type(field, newRows[i]);
+      }
+    }
+    await user.click(screen.getByRole("button", { name: "保存服务器" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0][2]).toEqual({ value: newPath });
+  },
+);
+
+test("unchanged PATH is preserved and identity changes disable editing", async () => {
+  const user = userEvent.setup();
+  const save = vi.fn().mockResolvedValue(undefined);
+  render(
+    <ServerModal
+      initial={{
+        ...initial,
+        login_path: "/bin",
+        login_path_synced_at: "2026-11-02T08:00:00Z",
+      }}
+      onClose={vi.fn()}
+      onSave={save}
+    />,
+  );
+  expect(screen.queryByText(/^上次同步：/)).toBeNull();
+  await user.type(screen.getByRole("textbox", { name: "主机地址" }), "1");
+  expect(
+    (screen.getByRole("textbox", { name: "PATH 目录 1" }) as HTMLInputElement)
+      .disabled,
+  ).toBe(true);
+  await user.click(screen.getByRole("button", { name: "保存服务器" }));
+  await waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(save.mock.calls[0][2]).toBeUndefined();
+});
 const submit = async (
   user: ReturnType<typeof userEvent.setup>,
   save: ReturnType<typeof vi.fn>,

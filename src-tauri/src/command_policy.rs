@@ -169,6 +169,16 @@ fn basename(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+pub(crate) fn trusted_executable(name: &str) -> bool {
+    !name.contains('/')
+        || ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+}
+
 fn inspect_words(
     words: &[String],
     policy: &CommandPolicy,
@@ -193,19 +203,16 @@ fn inspect_words(
         "Command '{name}' is blocked by the denylist"
     );
     if policy.execution_mode.as_deref() == Some("whitelist") {
-        let system_name = !first.contains('/')
-            || ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
-                .iter()
-                .any(|prefix| {
-                    first
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| !rest.contains('/'))
-                });
+        let explicitly_allowed = policy.allowed_commands.iter().any(|rule| rule == first);
+        ensure!(
+            explicitly_allowed || trusted_executable(first),
+            "Executable path is outside trusted directories: {first}"
+        );
         ensure!(
             policy
                 .allowed_commands
                 .iter()
-                .any(|rule| rule == first || (!rule.contains('/') && system_name && rule == name)),
+                .any(|rule| rule == first || (!rule.contains('/') && rule == name)),
             "Command '{name}' is not on the allowlist"
         );
         // Preserve parameter restrictions for built-in diagnostic commands.
@@ -276,14 +283,7 @@ fn inspect_words(
     ]
     .iter()
     .any(|extension| name.ends_with(extension));
-    let custom_path = first.contains('/')
-        && !["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
-            .iter()
-            .any(|prefix| {
-                first
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| !rest.contains('/'))
-            });
+    let custom_path = !trusted_executable(first);
     ensure!(
         policy.allow_scripts || !(interpreter || script_file || custom_path),
         "Scripts, interpreters and custom executable paths are not allowed"

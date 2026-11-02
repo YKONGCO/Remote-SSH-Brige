@@ -6,6 +6,90 @@ use remote_ssh_brige_lib::{
 use std::sync::Arc;
 
 #[test]
+fn shell_defaults_and_trusted_paths_have_explicit_rules() {
+    use remote_ssh_brige_lib::model::{default_allowed_commands, CommandPolicy};
+    let mut settings = RuntimeSettings {
+        command_policy: Some(CommandPolicy {
+            execution_mode: Some("whitelist".into()),
+            allow_advanced_shell: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let defaults = default_allowed_commands();
+    for name in ["true", "false", ":", "yes", "set", "bash", "sh", "python3"] {
+        assert!(defaults.contains(&name.to_owned()), "{name}");
+    }
+    assert!(defaults.contains(&"python".to_owned()));
+    settings
+        .command_policy
+        .as_ref()
+        .unwrap()
+        .validate()
+        .unwrap();
+    for command in [
+        "true",
+        "false",
+        ":",
+        "yes | head -n 1",
+        "ls; true",
+        "false || :",
+        "set -e; python3 -c 'print(1)'",
+        "python -c 'print(1)'",
+        "bash -c 'set -e; true'",
+        "sh -c 'false || true'",
+    ] {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_ok(),
+            "{command}"
+        );
+    }
+    for command in [
+        "/opt/venv/bin/python3 -V",
+        "/usr/local/bin/python3 -V",
+        "/tmp/ls",
+    ] {
+        let error = security::check_command_with_settings(command, &settings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("Executable path is outside trusted directories:"),
+            "{error}"
+        );
+    }
+    assert!(security::check_command_with_settings("/usr/bin/python3 -V", &settings).is_ok());
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allowed_commands
+        .push("/opt/venv/bin/python3".into());
+    assert!(security::check_command_with_settings("/opt/venv/bin/python3 -V", &settings).is_ok());
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .blocked_commands
+        .push("python3".into());
+    assert!(
+        security::check_command_with_settings("/opt/venv/bin/python3 -V", &settings)
+            .unwrap_err()
+            .to_string()
+            .contains("denylist")
+    );
+    settings
+        .command_policy
+        .as_mut()
+        .unwrap()
+        .allow_advanced_shell = Some(false);
+    assert!(security::check_command_with_settings("bash -c 'true'", &settings).is_err());
+    assert!(security::check_command_with_settings("ls; true", &settings).is_err());
+    let mut invalid = CommandPolicy::default();
+    invalid.allowed_commands.push("bad:name".into());
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
 fn extended_default_whitelist_keeps_independent_protections() {
     use remote_ssh_brige_lib::model::CommandPolicy;
     let mut settings = RuntimeSettings {
@@ -20,7 +104,7 @@ fn extended_default_whitelist_keeps_independent_protections() {
     for command in [
         "nvidia-smi",
         "mkdir -p /tmp/work",
-        "python -c 'print(1)'",
+        "python3 -c 'print(1)'",
         "git status",
         "grep error /tmp/log",
         "pgrep python",
@@ -79,7 +163,7 @@ fn extended_default_whitelist_keeps_independent_protections() {
         .as_mut()
         .unwrap()
         .allow_advanced_shell = Some(false);
-    assert!(security::check_command_with_settings("python -c 'print(1)'", &settings).is_err());
+    assert!(security::check_command_with_settings("python3 -c 'print(1)'", &settings).is_err());
     assert!(security::check_command_with_settings("node app.js", &settings).is_err());
 }
 

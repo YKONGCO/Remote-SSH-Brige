@@ -57,7 +57,14 @@ import {
 } from "lucide-react";
 import { api, desktop, operate } from "./api";
 import { newServer, labels } from "./types";
-import type { Server, Snapshot, Audit, AuditQuery, AuditPage } from "./types";
+import type {
+  Server,
+  Snapshot,
+  Audit,
+  AuditQuery,
+  AuditPage,
+  LoginPathUpdate,
+} from "./types";
 import { ServerModal } from "./components/ServerModal";
 import { mcpPermissionSummary } from "./mcp-permissions";
 import appIcon from "./assets/app-icon.svg";
@@ -148,9 +155,6 @@ export default function App() {
       null,
     ),
     [checking, setChecking] = useState(""),
-    [connection, setConnection] = useState<Record<string, "online" | "error">>(
-      {},
-    ),
     [trust, setTrust] = useState<{
       server: Server;
       fingerprint: string;
@@ -359,8 +363,16 @@ export default function App() {
       setExporting(false);
     }
   };
-  const save = async (s: Server, secret = "") => {
-    await api("save_server", { server: s, secret: secret || null });
+  const save = async (
+    s: Server,
+    secret = "",
+    loginPathUpdate?: LoginPathUpdate,
+  ) => {
+    await api("save_server", {
+      server: s,
+      secret: secret || null,
+      loginPathUpdate,
+    });
     await refresh();
     notify("服务器已保存");
   };
@@ -376,6 +388,18 @@ export default function App() {
       setChecking("");
     }
   };
+  const syncLoginPath = async (s: Server) => {
+    setChecking(s.id);
+    try {
+      await api("sync_login_path", { id: s.id });
+      await refresh();
+      notify(s.name + " · PATH 已同步");
+    } catch (error) {
+      notify(String(error), true);
+    } finally {
+      setChecking("");
+    }
+  };
   const test = async (s: Server) => {
     if (!s.fingerprint) {
       void probe(s);
@@ -384,10 +408,8 @@ export default function App() {
     setChecking(s.id);
     try {
       await operate({ kind: "test", server_id: s.id });
-      setConnection((v) => ({ ...v, [s.id]: "online" }));
       notify(s.name + " · 连接成功");
     } catch (e) {
-      setConnection((v) => ({ ...v, [s.id]: "error" }));
       notify(String(e), true);
     } finally {
       setChecking("");
@@ -596,7 +618,6 @@ export default function App() {
               <div className="server-list">
                 {visible.map((s) => {
                   const Icon = serverIcon(s);
-                  const status = connection[s.id];
                   return (
                     <article
                       key={s.id}
@@ -633,44 +654,38 @@ export default function App() {
                       </div>
                       <div className="server-permission">
                         {mcpPermissionSummary(s)}
-                      </div>
-                      <div className="server-state">
-                        <span
-                          className={
-                            "status-dot " +
-                            (!s.enabled
-                              ? "gray"
-                              : status === "online"
-                                ? "green"
-                                : status === "error"
-                                  ? "red"
-                                  : "gray")
-                          }
-                        />
-                        {!s.enabled
-                          ? "停用"
-                          : status === "online"
-                            ? "已连接"
-                            : status === "error"
-                              ? "连接失败"
-                              : "未测试"}
+                        <div
+                          className="text-xs text-muted-foreground"
+                          title="仅同步 PATH；不继承 Conda 的其他变量、alias 或 shell 函数。远端环境变化后请重新同步。"
+                        >
+                          {s.login_path_synced_at ? (
+                            <>
+                              PATH ·{" "}
+                              <time
+                                dateTime={s.login_path_synced_at}
+                                title={new Date(
+                                  s.login_path_synced_at,
+                                ).toLocaleString()}
+                              >
+                                {new Date(
+                                  s.login_path_synced_at,
+                                ).toLocaleString("zh-CN", {
+                                  month: "2-digit",
+                                  day: "2-digit",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                  hour12: false,
+                                })}
+                              </time>
+                            </>
+                          ) : s.login_path != null ? (
+                            "PATH · 手动设置"
+                          ) : (
+                            "PATH 未同步"
+                          )}
+                        </div>
                       </div>
                       <div className="server-buttons">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="icon-btn"
-                          disabled={!s.enabled || checking === s.id}
-                          title="测试连接"
-                          aria-label={"测试连接 " + s.name}
-                          onClick={() => void test(s)}
-                        >
-                          {checking === s.id ? (
-                            <RefreshCw size={15} className="spinning" />
-                          ) : (
-                            <Play size={15} />
-                          )}
-                        </Button>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -707,6 +722,21 @@ export default function App() {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="min-w-36">
+                          <DropdownMenuItem
+                            disabled={!s.enabled || checking === s.id}
+                            onSelect={() => void test(s)}
+                          >
+                            <Play size={14} />
+                            测试连接
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={!s.enabled || checking === s.id}
+                            onSelect={() => void syncLoginPath(s)}
+                          >
+                            <RefreshCw size={14} />
+                            同步PATH
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
                           <DropdownMenuItem onSelect={() => setModal(s)}>
                             <Pencil size={14} />
                             编辑
@@ -1070,6 +1100,7 @@ export default function App() {
           }}
           onClose={() => setModal(null)}
           onSave={save}
+          onPathSynced={() => void refresh()}
         />
       )}
       {trust && (

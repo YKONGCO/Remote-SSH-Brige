@@ -435,7 +435,7 @@ const settingsDB = new DatabaseSync(resolve(work, "remote-desk.sqlite3"));
 settingsDB.exec(
   await readFile(resolve(root, "src-tauri/src/schema.sql"), "utf8"),
 );
-settingsDB.exec("PRAGMA user_version=2");
+settingsDB.exec("PRAGMA user_version=3");
 const insertServer = settingsDB.prepare(`INSERT INTO servers
   (id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,
    allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json)
@@ -637,10 +637,22 @@ try {
         const text = result.content[0].text;
         assert.equal(typeof text, "string");
         assert.ok(text.length > 0);
-        assert.ok([...text].length <= 240);
         assert.ok(!text.includes("\n"));
         assert.ok(!text.includes('"command_policy"'));
-        assert.ok(!text.startsWith("{"));
+        if (text.startsWith("{")) {
+          const denial = JSON.parse(text);
+          assert.equal(name, "exec");
+          assert.equal(denial.code, "COMMAND_POLICY_DENIED");
+          assert.deepEqual(Object.keys(denial).sort(), [
+            "code",
+            "details",
+            "message",
+          ]);
+          assert.deepEqual(denial.details, { command: args.command });
+          assert.ok([...denial.message].length <= 240);
+        } else {
+          assert.ok([...text].length <= 240);
+        }
         assert.ok(!/[\u3400-\u9fff]/u.test(text), text);
       }
       return {
@@ -663,6 +675,15 @@ try {
         : JSON.parse(r.value);
   };
   const jobSchema = tools.tools.find((t) => t.name === "job").inputSchema;
+  const blockedFindCommand =
+    "find /tmp -maxdepth 1 -name 'wlx*' -exec rm -rf {} ';'";
+  const blockedFind = await call("exec", { command: blockedFindCommand });
+  check(
+    "Exec policy denial is compact JSON without policy configuration",
+    blockedFind.error &&
+      JSON.parse(blockedFind.value).message ===
+        "find delete and execute actions are blocked",
+  );
   check(
     "Unknown tool error identifies the requested tool",
     (await call("missing_tool")).value.includes("Unknown tool: missing_tool"),

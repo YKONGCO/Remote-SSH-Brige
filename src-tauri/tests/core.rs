@@ -35,6 +35,100 @@ fn server() -> Server {
 }
 
 #[test]
+fn manual_path_updates_persist_and_clear_without_stale_server_values_overwriting_them() {
+    use remote_ssh_brige_lib::model::LoginPathUpdate;
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server_with_login_path(server(), None, Some(LoginPathUpdate {
+        value: Some("/manual/bin:/usr/bin".into()),
+    })).unwrap();
+    assert_eq!(saved.login_path.as_deref(), Some("/manual/bin:/usr/bin"));
+    assert!(saved.login_path_synced_at.is_none());
+    let synced = state.store_login_path(&saved, "/synced".into()).unwrap();
+    let edited = state.save_server_with_login_path(synced, None, Some(LoginPathUpdate {
+        value: Some("/edited/a'b:$HOME/bin".into()),
+    })).unwrap();
+    assert!(edited.login_path_synced_at.is_none());
+    assert_eq!(state.save_server(saved.clone(), None).unwrap().login_path, edited.login_path);
+    for invalid in ["bad\0path".to_string(), "x".repeat(65537)] {
+        assert!(state.save_server_with_login_path(saved.clone(), None, Some(LoginPathUpdate { value: Some(invalid) })).is_err());
+        assert_eq!(state.server(&saved.id).unwrap().login_path, edited.login_path);
+    }
+    drop(state);
+    let state = AppState::open(dir.clone()).unwrap();
+    assert_eq!(state.server(&saved.id).unwrap().login_path, edited.login_path);
+    let cleared = state.save_server_with_login_path(saved.clone(), None, Some(LoginPathUpdate { value: None })).unwrap();
+    assert!(cleared.login_path.is_none());
+    assert!(cleared.login_path_synced_at.is_none());
+    let mut moved = saved;
+    moved.username = "other".into();
+    let moved = state.save_server_with_login_path(moved, None, Some(LoginPathUpdate { value: Some("/old-host".into()) })).unwrap();
+    assert!(moved.login_path.is_none());
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
+fn login_path_persists_and_only_connection_identity_changes_clear_it() {
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    let synced = state.store_login_path(&saved, "/opt/venv/bin:/usr/bin".into()).unwrap();
+    assert!(synced.login_path_synced_at.is_some());
+    assert!(state.store_login_path(&saved, "/stale".into()).is_err());
+    assert!(state.sync_login_path("missing").is_err());
+    drop(state);
+    let state = AppState::open(dir.clone()).unwrap();
+    let loaded = state.server(&saved.id).unwrap();
+    assert_eq!(loaded.login_path, synced.login_path);
+    assert_eq!(loaded.login_path_synced_at, synced.login_path_synced_at);
+    let mut renamed = loaded.clone();
+    renamed.name = "Renamed".into();
+    renamed.login_path = Some("/forged".into());
+    assert_eq!(state.save_server(renamed, None).unwrap().login_path, synced.login_path);
+    for field in ["host", "port", "username"] {
+        let old = state.server(&saved.id).unwrap();
+        let cached = if old.login_path.is_none() {
+            state.store_login_path(&old, "/cached".into()).unwrap()
+        } else { old };
+        let mut changed = cached.clone();
+        match field {
+            "host" => changed.host = "localhost".into(),
+            "port" => changed.port = 2222,
+            _ => changed.username = "other".into(),
+        }
+        let result = state.save_server(changed, None).unwrap();
+        assert!(result.login_path.is_none());
+        assert!(result.login_path_synced_at.is_none());
+        assert!(state.store_login_path(&cached, "/stale".into()).is_err());
+    }
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
+fn sqlite_v2_upgrades_and_supports_path_cache() {
+    let dir = workspace();
+    std::fs::create_dir_all(&dir).unwrap();
+    let connection = rusqlite::Connection::open(dir.join("remote-desk.sqlite3")).unwrap();
+    let schema = include_str!("../src/schema.sql").replace("\r\n", "\n").replace(
+        "mcp_permissions_json TEXT,\n    login_path TEXT, login_path_synced_at TEXT",
+        "mcp_permissions_json TEXT");
+    connection.execute_batch(&schema).unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    drop(connection);
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    assert!(saved.login_path.is_none());
+    state.store_login_path(&saved, "/bin".into()).unwrap();
+    drop(state);
+    let state = AppState::open(dir.clone()).unwrap();
+    assert_eq!(state.server(&saved.id).unwrap().login_path.as_deref(), Some("/bin"));
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
 fn retired_preview_grant_is_removed_on_load_without_granting_text_reads() {
     let dir = workspace();
     let state = AppState::open(dir.clone()).unwrap();
@@ -690,7 +784,7 @@ fn json_workspaces_are_rejected_without_creating_a_database_or_changing_files() 
 
 #[test]
 fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
-    for version in [0, 1, 3] {
+    for version in [0, 1, 4] {
         let dir = workspace();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remote-desk.sqlite3");

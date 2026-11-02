@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS servers (
     allow_write INTEGER NOT NULL CHECK(allow_write IN (0,1)),
     allow_terminal INTEGER NOT NULL CHECK(allow_terminal IN (0,1)), root TEXT NOT NULL,
     mcp_enabled INTEGER NOT NULL DEFAULT 1 CHECK(mcp_enabled IN (0,1)),
-    mcp_permissions_json TEXT
+    mcp_permissions_json TEXT,
+    login_path TEXT, login_path_synced_at TEXT
 );
 CREATE TABLE IF NOT EXISTS audit_entries (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,

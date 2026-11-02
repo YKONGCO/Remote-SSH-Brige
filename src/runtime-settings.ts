@@ -49,7 +49,7 @@ export function validCommandLists(allowed: unknown, blocked: unknown) {
           typeof name === "string" &&
           name.length > 0 &&
           name.length <= 512 &&
-          /^[\p{L}\p{N}_.+\-/]+$/u.test(name) &&
+          (name === ":" || /^[\p{L}\p{N}_.+\-/]+$/u.test(name)) &&
           (!name.includes("/") ||
             (name.startsWith("/") &&
               name

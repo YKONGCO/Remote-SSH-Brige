@@ -30,7 +30,27 @@ pub fn success(kind: &str, mut value: Value) -> CallToolResult {
 
 pub fn failure(op: &Operation, error: &anyhow::Error) -> CallToolResult {
     let response = operation_error::error_response(error, op);
-    CallToolResult::error(vec![ContentBlock::text(error_text(&response))])
+    let text = if op.kind == "exec" {
+        command_policy_json(&response).unwrap_or_else(|| error_text(&response))
+    } else {
+        error_text(&response)
+    };
+    CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+fn command_policy_json(error: &Value) -> Option<String> {
+    if error["code"] != "COMMAND_POLICY_DENIED" {
+        return None;
+    }
+    let command = error["details"]["command"].as_str()?;
+    Some(
+        serde_json::json!({
+            "code":"COMMAND_POLICY_DENIED",
+            "details":{"command":command},
+            "message":error_text(error),
+        })
+        .to_string(),
+    )
 }
 
 /// Full diagnostics stay in audit records; MCP only needs the actionable cause.
@@ -117,7 +137,13 @@ pub fn normalize_tool_result(mut result: CallToolResult) -> CallToolResult {
             .map(|text| text.text.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        let message = if text.starts_with("failed to deserialize parameters: ") {
+        let policy_json = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|error| command_policy_json(&error));
+        let message = if let Some(json) = policy_json {
+            // Bound the message, never truncate the JSON or the original command.
+            json
+        } else if text.starts_with("failed to deserialize parameters: ") {
             parameter_error(&text)
         } else {
             short_line(&text)
@@ -213,15 +239,54 @@ mod tests {
 
     #[test]
     fn policy_failure_only_returns_the_specific_reason() {
-        let result = wire(failure(
-            &Operation::default(),
-            &operation_error::error_with_details(
-                "COMMAND_POLICY_DENIED",
-                "Command rejected by shell policy",
-                json!({"reason":"Redirection is not allowed", "command":"secret command", "command_policy":{"allow_redirection":false}}),
-            ),
-        ));
-        assert_eq!(result["content"][0]["text"], "Redirection is not allowed");
+        let command = "find /tmp -maxdepth 1 -name 'wlx*' -exec rm -rf {} ';'";
+        let op = Operation {
+            kind: "exec".into(),
+            command: command.into(),
+            ..Default::default()
+        };
+        let settings = crate::model::RuntimeSettings {
+            command_policy: Some(crate::model::CommandPolicy {
+                execution_mode: Some("whitelist".into()),
+                allow_advanced_shell: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = crate::security::check(&settings, &op, "mcp").unwrap_err();
+        let diagnostic = operation_error::error_response(&error, &op);
+        assert!(diagnostic["details"].get("command_policy").is_none());
+        assert!(diagnostic["details"].get("command_protection").is_none());
+        let result = wire(normalize_tool_result(failure(&op, &error)));
+        assert_eq!(result["isError"], true);
+        assert!(result.get("structuredContent").is_none());
+        let data: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            data,
+            json!({"code":"COMMAND_POLICY_DENIED", "details":{"command":command}, "message":"find delete and execute actions are blocked"})
+        );
+    }
+
+    #[test]
+    fn long_exec_commands_keep_valid_json_and_the_original_command() {
+        let command = format!("ls {}", "a".repeat(2000));
+        let op = Operation {
+            kind: "exec".into(),
+            command: command.clone(),
+            ..Default::default()
+        };
+        let error = operation_error::error_with_details(
+            "COMMAND_POLICY_DENIED",
+            "Command rejected",
+            json!({"command":command,"reason":"Command 'ls' is blocked by the denylist","command_policy":{"large":"must not escape"}}),
+        );
+        let result = wire(normalize_tool_result(failure(&op, &error)));
+        let data: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(data["details"], json!({"command":command}));
+        assert_eq!(data["message"], "Command 'ls' is blocked by the denylist");
+        assert!(data.get("stage").is_none());
     }
 
     #[test]

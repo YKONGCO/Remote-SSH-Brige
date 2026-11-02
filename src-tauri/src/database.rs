@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::{fs, path::Path, time::Duration};
 
 pub const DATABASE_FILE: &str = "remote-desk.sqlite3";
-const SERVER_COLUMNS: &str = "id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json";
+const SERVER_COLUMNS: &str = "id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json,login_path,login_path_synced_at";
 const AUDIT_COLUMNS: &str =
     "id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json";
 
@@ -156,10 +156,10 @@ impl Database {
         let mut connection = Connection::open(database_path).context("无法打开 SQLite 数据库")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 2 {
+        if version > 3 {
             bail!("数据库版本较新，请使用新版应用打开")
         }
-        if version != 0 && version != 2 {
+        if version != 0 && version != 2 && version != 3 {
             bail!("不再支持此数据库版本，请先使用旧版应用升级至 SQLite 版本 2")
         }
         if version == 0 {
@@ -179,8 +179,11 @@ impl Database {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
         let transaction = connection.transaction()?;
+        if version == 2 {
+            transaction.execute_batch("ALTER TABLE servers ADD COLUMN login_path TEXT; ALTER TABLE servers ADD COLUMN login_path_synced_at TEXT;")?;
+        }
         transaction.execute_batch(include_str!("schema.sql"))?;
-        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit().context("SQLite 初始化提交失败")?;
         Ok(Self { connection })
     }
@@ -264,6 +267,8 @@ fn server_row(row: &Row<'_>) -> rusqlite::Result<Server> {
         root: row.get(14)?,
         mcp_enabled: row.get(15)?,
         mcp_permissions,
+        login_path: row.get(17)?,
+        login_path_synced_at: row.get(18)?,
     })
 }
 fn audit_row(row: &Row<'_>) -> rusqlite::Result<Audit> {
@@ -303,6 +308,8 @@ fn save_server(connection: &Connection, s: &Server) -> Result<()> {
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth=excluded.auth,key_path=excluded.key_path,fingerprint=excluded.fingerprint,group_name=excluded.group_name,color=excluded.color,enabled=excluded.enabled,allow_exec=excluded.allow_exec,allow_write=excluded.allow_write,allow_terminal=excluded.allow_terminal,root=excluded.root,mcp_enabled=excluded.mcp_enabled,mcp_permissions_json=excluded.mcp_permissions_json",
         params![s.id,s.name,s.host,s.port,s.username,s.auth,s.key_path,s.fingerprint,s.group,s.color,s.enabled,s.allow_exec,s.allow_write,s.allow_terminal,s.root,s.mcp_enabled,permissions])?;
+    connection.execute("UPDATE servers SET login_path=?1,login_path_synced_at=?2 WHERE id=?3",
+        params![s.login_path,s.login_path_synced_at,s.id])?;
     Ok(())
 }
 fn insert_audit(connection: &Connection, a: &Audit) -> Result<()> {

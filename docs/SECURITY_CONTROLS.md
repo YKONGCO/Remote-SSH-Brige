@@ -35,6 +35,8 @@ MCP 默认监听 `127.0.0.1`，使用 Bearer Token，校验 IP Host 并拒绝浏
 
 名单支持换行、空格、中英文逗号或分号分隔，最多各 4096 项，保存时自动去重。只填命令名称或完整路径，不填参数、通配符或 Shell 语法。白名单仅在“仅允许白名单”模式生效，留空时拒绝全部命令；黑名单在白名单和不限命令模式下均生效。命令名称的白名单规则允许不带路径及位于 `/bin/`、`/usr/bin/`、`/sbin/`、`/usr/sbin/` 的同名程序，自定义路径须明确加入白名单。黑名单中的命令名称匹配所有路径下的同名程序；完整路径规则精确匹配。
 
+未显式授权的自定义程序路径返回 `Executable path is outside trusted directories: ...`，与命令名不在白名单区分。默认名单包含 `true`、`false`、`:`、`yes`、`set`、`bash`、`sh`；`:` 是允许的单独命令名，不表示允许其他包含冒号的规则。组合命令、`set -e; ...` 和 `bash/sh` 脚本仍受高级 Shell 权限控制。
+
 例如，把 `grep` 加入白名单并开启 Shell 高级功能后，`ls | grep error` 可以执行；同时将 `grep` 加入黑名单后，该管道仍会被拒绝。可解析的嵌套 Shell 和常用包装命令也会检查名单；不在名单中的包装命令本身同样会被拒绝。
 
 默认白名单按 24 类维护，覆盖文件与系统、文本处理、Python、JavaScript / TypeScript、C/C++/Fortran、Java/JVM、Go、Rust、.NET、PHP、Ruby、Lua、Perl、Swift、Dart、Elixir/Erlang、Haskell/OCaml、Zig、机器学习、科研计算、构建工具、容器、数据库和网络诊断。包括 `python3`、`pip`、`uv`、`conda`、`pytest`、`ruff`、`node`、`npm`、`pnpm`、`tsc`、`jupyter`、`torchrun`、`accelerate`、`tensorboard`、`wandb`、`hf`、`Rscript`、`mpirun`、`squeue` 等；前后端共用 `src/command-presets.json`，命令仍需在远端安装后才能执行。

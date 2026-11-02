@@ -315,7 +315,7 @@ pub fn execute(
     anyhow::ensure!(!op.command.trim().is_empty(), "command must not be empty");
     let session = crate::ssh::connect_with_settings(server, settings)?;
     let mut channel = session.channel_session()?;
-    channel.exec(&op.command)?; // Exactly once; this channel is moved intact to the worker.
+    channel.exec(&crate::ssh::command_with_login_path(server, &op.command))?; // Exactly once; this channel is moved intact to the worker.
     session.set_blocking(false);
     let mut execution = Job::new(&server.id);
     execution.server_name = server.name.clone();

@@ -36,7 +36,7 @@ export async function runTransferChecks({
       "utf8",
     ),
   );
-  db.exec("PRAGMA user_version=2");
+  db.exec("PRAGMA user_version=3");
   const insert = db.prepare(
     "INSERT INTO servers (id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
   );

@@ -50,7 +50,14 @@
       "sleep",
       "echo",
       "printf",
-      "test"
+      "test",
+      "true",
+      "false",
+      ":",
+      "yes",
+      "set",
+      "bash",
+      "sh"
     ]
   },
   {

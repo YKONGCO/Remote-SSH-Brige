@@ -12,6 +12,7 @@ import type {
   Operation,
   FileEntry,
   AuditQuery,
+  LoginPathUpdate,
 } from "./types";
 import { chooseBrowserSave } from "./save-file";
 import { newServer } from "./types";
@@ -419,6 +420,25 @@ export async function api<T = unknown>(
     const s = { ...(args.server as Server) };
     if (!s.id) s.id = crypto.randomUUID();
     const i = demo.servers.findIndex((v) => v.id === s.id);
+    const old = demo.servers[i];
+    const same =
+      old &&
+      old.host === s.host &&
+      old.port === s.port &&
+      old.username === s.username;
+    s.login_path = same ? old.login_path : null;
+    s.login_path_synced_at = same ? old.login_path_synced_at : null;
+    const pathUpdate = args.loginPathUpdate as LoginPathUpdate | undefined;
+    if (pathUpdate && (!old || same)) {
+      if (
+        pathUpdate.value != null &&
+        (pathUpdate.value.includes("\0") ||
+          new TextEncoder().encode(pathUpdate.value).length > 65536)
+      )
+        throw new Error("PATH 不能包含 NUL 或超过 65536 字节");
+      s.login_path = pathUpdate.value;
+      s.login_path_synced_at = null;
+    }
     if (i < 0) demo.servers.push(s);
     else demo.servers[i] = s;
     return s as T;
@@ -427,6 +447,8 @@ export async function api<T = unknown>(
     demo.servers = demo.servers.filter((s) => s.id !== args.id);
     return undefined as T;
   }
+  if (command === "sync_login_path")
+    throw new Error("同步登录 PATH 需要在桌面应用中连接远端服务器。");
   if (command === "probe_host")
     return "SHA256:BrowserDemoFingerprintForPreviewOnly" as T;
   if (command === "start_mcp" || command === "stop_mcp")

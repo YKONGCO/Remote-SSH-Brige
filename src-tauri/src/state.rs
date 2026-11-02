@@ -149,7 +149,25 @@ impl AppState {
             }})), 0)
         }).map(|_| ())
     }
-    pub fn save_server(&self, mut server: Server, secret: Option<String>) -> Result<Server> {
+    pub fn save_server(&self, server: Server, secret: Option<String>) -> Result<Server> {
+        self.save_server_with_login_path(server, secret, None)
+    }
+
+    pub fn save_server_with_login_path(
+        &self,
+        mut server: Server,
+        secret: Option<String>,
+        login_path_update: Option<LoginPathUpdate>,
+    ) -> Result<Server> {
+        if let Some(path) = login_path_update
+            .as_ref()
+            .and_then(|update| update.value.as_ref())
+        {
+            anyhow::ensure!(
+                !path.contains('\0') && path.len() <= 65536,
+                "Invalid PATH: must not contain NUL or exceed 65536 bytes"
+            );
+        }
         if let Some(permissions) = &mut server.mcp_permissions {
             anyhow::ensure!(
                 permissions
@@ -189,12 +207,33 @@ impl AppState {
             server.id = uuid::Uuid::new_v4().to_string();
         }
         let mut config = self.config.lock().unwrap();
+        let identity_changed = config
+            .servers
+            .iter()
+            .find(|s| s.id == server.id)
+            .is_some_and(|old| {
+                old.host != server.host || old.port != server.port || old.username != server.username
+            });
         if let Some(old) = config.servers.iter().find(|s| s.id == server.id) {
+            server.login_path = old.login_path.clone();
+            server.login_path_synced_at = old.login_path_synced_at.clone();
+            if old.host != server.host || old.port != server.port || old.username != server.username {
+                server.login_path = None;
+                server.login_path_synced_at = None;
+            }
             if old.host != server.host || old.port != server.port {
                 server.fingerprint.clear();
             }
-        } else if !server.fingerprint.is_empty() {
-            bail!("Leave the fingerprint empty for a new server, then verify the host")
+        } else {
+            server.login_path = None;
+            server.login_path_synced_at = None;
+            if !server.fingerprint.is_empty() {
+                bail!("Leave the fingerprint empty for a new server, then verify the host")
+            }
+        }
+        if let Some(update) = login_path_update.filter(|_| !identity_changed) {
+            server.login_path = update.value;
+            server.login_path_synced_at = None;
         }
         if let Some(secret) = secret.filter(|s| !s.is_empty()) {
             keyring::Entry::new("dev.remotedesk.ssh", &server.id)?
@@ -219,6 +258,29 @@ impl AppState {
         *config = next;
         Ok(server)
     }
+    pub fn sync_login_path(&self, id: &str) -> Result<Server> {
+        let server = self.server(id)?;
+        anyhow::ensure!(server.enabled, "Server is disabled");
+        let settings = self.settings.lock().unwrap().clone();
+        let path = crate::ssh::sync_login_path(&server, &settings)?;
+        self.store_login_path(&server, path)
+    }
+
+    pub fn store_login_path(&self, expected: &Server, path: String) -> Result<Server> {
+        anyhow::ensure!(!path.contains('\0') && path.len() <= 65536, "Invalid login PATH");
+        let mut config = self.config.lock().unwrap();
+        let live = config.servers.iter_mut().find(|s| s.id == expected.id)
+            .context("Server was removed during PATH synchronization")?;
+        anyhow::ensure!(serde_json::to_value(&*live)? == serde_json::to_value(expected)?,
+            "Server configuration changed during PATH synchronization; retry");
+        let mut updated = live.clone();
+        updated.login_path = Some(path);
+        updated.login_path_synced_at = Some(chrono::Utc::now().to_rfc3339());
+        self.database.lock().unwrap().save_server(&updated)?;
+        *live = updated.clone();
+        Ok(updated)
+    }
+
     pub fn remove_server(&self, id: &str) -> Result<()> {
         if self
             .terminals

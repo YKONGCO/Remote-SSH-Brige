@@ -868,7 +868,7 @@ export function Settings() {
                     aria-label="命令白名单"
                     className="mono"
                     rows={10}
-                    placeholder="命令名或绝对路径，如 python3、/opt/venv/bin/python"
+                    placeholder="命令名或绝对路径，如 python3、/opt/venv/bin/python3"
                     value={allowedDraft}
                     disabled={saving}
                     onChange={(event) => setAllowedDraft(event.target.value)}

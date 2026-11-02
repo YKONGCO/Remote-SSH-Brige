@@ -16,6 +16,11 @@ export interface Server {
   mcp_enabled?: boolean;
   mcp_permissions?: string[] | null;
   root: string;
+  login_path?: string | null;
+  login_path_synced_at?: string | null;
+}
+export interface LoginPathUpdate {
+  value: string | null;
 }
 export interface Audit {
   id: string;

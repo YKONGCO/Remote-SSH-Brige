@@ -216,9 +216,9 @@ impl CommandPolicy {
                 anyhow::ensure!(
                     !name.is_empty()
                         && name.chars().count() <= 512
-                        && name
+                        && (name == ":" || name
                             .chars()
-                            .all(|c| c.is_alphanumeric() || "_.+-/".contains(c))
+                            .all(|c| c.is_alphanumeric() || "_.+-/".contains(c)))
                         && (!name.contains('/')
                             || (name.starts_with('/')
                                 && name
@@ -253,6 +253,13 @@ pub struct Server {
     pub mcp_enabled: bool,
     pub mcp_permissions: Option<Vec<String>>,
     pub root: String,
+    pub login_path: Option<String>,
+    pub login_path_synced_at: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct LoginPathUpdate {
+    pub value: Option<String>,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -274,6 +281,8 @@ impl Default for Server {
             mcp_enabled: true,
             mcp_permissions: None,
             root: "/".into(),
+            login_path: None,
+            login_path_synced_at: None,
         }
     }
 }

@@ -278,7 +278,7 @@ test("command presets merge into existing grants, support search and preserve th
   ).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "全选常用命令" }));
   expect(new Set(parseCommandList(allowed.value))).toEqual(
-    new Set(["/opt/custom", ...defaultAllowedCommands]),
+    new Set(["/opt/custom", "python", ...defaultAllowedCommands]),
   );
   fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -341,6 +341,26 @@ test("both command lists accept the expanded limit and reject overflow", () => {
   expect(validCommandLists([], [...commands, "extra"])).toBe(false);
 });
 
+test("shell presets and the colon builtin validate without allowing arbitrary colons", () => {
+  for (const name of [
+    "true",
+    "false",
+    ":",
+    "yes",
+    "set",
+    "bash",
+    "sh",
+    "python3",
+  ]) {
+    expect(defaultAllowedCommands).toContain(name);
+  }
+  expect(defaultAllowedCommands).toContain("python");
+  expect(validCommandLists(defaultAllowedCommands, [":"])).toBe(true);
+  expect(parseCommandList("true false : yes set bash sh")).toContain(":");
+  expect(validCommandLists(["bad:name"], [])).toBe(false);
+  expect(validCommandLists(["/tmp/bad:name"], [])).toBe(false);
+});
+
 test("preset selection can be reversed globally, by category and within search results", async () => {
   vi.mocked(api).mockResolvedValueOnce({
     ...defaultRuntimeSettings,
@@ -363,9 +383,7 @@ test("preset selection can be reversed globally, by category and within search r
   expect(parseCommandList(allowed.value)).toHaveLength(
     defaultAllowedCommands.length + 1,
   );
-  fireEvent.click(
-    screen.getByRole("button", { name: "取消全选" }),
-  );
+  fireEvent.click(screen.getByRole("button", { name: "取消全选" }));
   expect(parseCommandList(allowed.value)).toEqual(["/opt/custom"]);
   fireEvent.change(allowed, { target: { value: "/opt/custom\nnode\npython" } });
   fireEvent.change(screen.getByRole("textbox", { name: "搜索常用命令" }), {
