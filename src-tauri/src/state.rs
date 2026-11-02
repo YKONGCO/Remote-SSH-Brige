@@ -212,12 +212,15 @@ impl AppState {
             .iter()
             .find(|s| s.id == server.id)
             .is_some_and(|old| {
-                old.host != server.host || old.port != server.port || old.username != server.username
+                old.host != server.host
+                    || old.port != server.port
+                    || old.username != server.username
             });
         if let Some(old) = config.servers.iter().find(|s| s.id == server.id) {
             server.login_path = old.login_path.clone();
             server.login_path_synced_at = old.login_path_synced_at.clone();
-            if old.host != server.host || old.port != server.port || old.username != server.username {
+            if old.host != server.host || old.port != server.port || old.username != server.username
+            {
                 server.login_path = None;
                 server.login_path_synced_at = None;
             }
@@ -267,12 +270,20 @@ impl AppState {
     }
 
     pub fn store_login_path(&self, expected: &Server, path: String) -> Result<Server> {
-        anyhow::ensure!(!path.contains('\0') && path.len() <= 65536, "Invalid login PATH");
+        anyhow::ensure!(
+            !path.contains('\0') && path.len() <= 65536,
+            "Invalid login PATH"
+        );
         let mut config = self.config.lock().unwrap();
-        let live = config.servers.iter_mut().find(|s| s.id == expected.id)
+        let live = config
+            .servers
+            .iter_mut()
+            .find(|s| s.id == expected.id)
             .context("Server was removed during PATH synchronization")?;
-        anyhow::ensure!(serde_json::to_value(&*live)? == serde_json::to_value(expected)?,
-            "Server configuration changed during PATH synchronization; retry");
+        anyhow::ensure!(
+            serde_json::to_value(&*live)? == serde_json::to_value(expected)?,
+            "Server configuration changed during PATH synchronization; retry"
+        );
         let mut updated = live.clone();
         updated.login_path = Some(path);
         updated.login_path_synced_at = Some(chrono::Utc::now().to_rfc3339());

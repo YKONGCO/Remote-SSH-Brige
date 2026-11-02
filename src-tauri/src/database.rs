@@ -308,8 +308,10 @@ fn save_server(connection: &Connection, s: &Server) -> Result<()> {
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth=excluded.auth,key_path=excluded.key_path,fingerprint=excluded.fingerprint,group_name=excluded.group_name,color=excluded.color,enabled=excluded.enabled,allow_exec=excluded.allow_exec,allow_write=excluded.allow_write,allow_terminal=excluded.allow_terminal,root=excluded.root,mcp_enabled=excluded.mcp_enabled,mcp_permissions_json=excluded.mcp_permissions_json",
         params![s.id,s.name,s.host,s.port,s.username,s.auth,s.key_path,s.fingerprint,s.group,s.color,s.enabled,s.allow_exec,s.allow_write,s.allow_terminal,s.root,s.mcp_enabled,permissions])?;
-    connection.execute("UPDATE servers SET login_path=?1,login_path_synced_at=?2 WHERE id=?3",
-        params![s.login_path,s.login_path_synced_at,s.id])?;
+    connection.execute(
+        "UPDATE servers SET login_path=?1,login_path_synced_at=?2 WHERE id=?3",
+        params![s.login_path, s.login_path_synced_at, s.id],
+    )?;
     Ok(())
 }
 fn insert_audit(connection: &Connection, a: &Audit) -> Result<()> {

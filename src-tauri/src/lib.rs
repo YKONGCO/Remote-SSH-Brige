@@ -339,16 +339,19 @@ mod desktop {
         login_path_update: Option<model::LoginPathUpdate>,
     ) -> Result<model::Server, String> {
         let state = state.inner().clone();
-        tokio::task::spawn_blocking(move || state.save_server_with_login_path(server, secret, login_path_update))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))
+        tokio::task::spawn_blocking(move || {
+            state.save_server_with_login_path(server, secret, login_path_update)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
     async fn sync_login_path(state: Shared<'_>, id: String) -> Result<model::Server, String> {
         let state = state.inner().clone();
         tokio::task::spawn_blocking(move || state.sync_login_path(&id))
-            .await.map_err(|e| e.to_string())?
+            .await
+            .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]

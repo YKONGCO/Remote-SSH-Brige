@@ -29,23 +29,42 @@ pub fn sync_login_path(server: &Server, settings: &RuntimeSettings) -> Result<St
     channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
     let marker = format!("remote_path_{}", uuid::Uuid::new_v4().simple());
     let script = format!("printf '\\000{marker}\\000%s\\000' \"$PATH\"");
-    channel.exec(&format!("exec \"${{SHELL:-/bin/sh}}\" -lc '{}'", script.replace('\'', "'\\''")))?;
+    channel.exec(&format!(
+        "exec \"${{SHELL:-/bin/sh}}\" -lc '{}'",
+        script.replace('\'', "'\\''")
+    ))?;
     let mut output = Vec::new();
-    Read::by_ref(&mut channel).take(1024 * 1024 + 1).read_to_end(&mut output)?;
-    anyhow::ensure!(output.len() <= 1024 * 1024, "Login shell output exceeds limit");
+    Read::by_ref(&mut channel)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut output)?;
+    anyhow::ensure!(
+        output.len() <= 1024 * 1024,
+        "Login shell output exceeds limit"
+    );
     channel.wait_close()?;
-    anyhow::ensure!(channel.exit_status()? == 0, "Login shell failed to synchronize PATH");
+    anyhow::ensure!(
+        channel.exit_status()? == 0,
+        "Login shell failed to synchronize PATH"
+    );
     parse_login_path(&output, &marker)
 }
 
 fn parse_login_path(output: &[u8], marker: &str) -> Result<String> {
     let prefix = format!("\0{marker}\0");
-    let start = output.windows(prefix.len()).position(|bytes| bytes == prefix.as_bytes())
-        .context("Login shell did not return PATH")? + prefix.len();
-    let end = output[start..].iter().position(|byte| *byte == 0)
-        .context("Login shell returned incomplete PATH")? + start;
+    let start = output
+        .windows(prefix.len())
+        .position(|bytes| bytes == prefix.as_bytes())
+        .context("Login shell did not return PATH")?
+        + prefix.len();
+    let end = output[start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("Login shell returned incomplete PATH")?
+        + start;
     anyhow::ensure!(end - start <= 65536, "Login PATH exceeds limit");
-    Ok(std::str::from_utf8(&output[start..end]).context("Login PATH is not UTF-8")?.to_owned())
+    Ok(std::str::from_utf8(&output[start..end])
+        .context("Login PATH is not UTF-8")?
+        .to_owned())
 }
 
 #[cfg(test)]
@@ -58,13 +77,20 @@ mod login_path_tests {
         let command = "python --version; pip --version\nprintf done";
         assert_eq!(command_with_login_path(&server, command), command);
         server.login_path = Some("/opt/a'b:$(touch /tmp/injected):/usr/bin\n/tools".into());
-        assert_eq!(command_with_login_path(&server, command),
-            format!("export PATH='/opt/a'\\''b:$(touch /tmp/injected):/usr/bin\n/tools'\n{command}"));
+        assert_eq!(
+            command_with_login_path(&server, command),
+            format!(
+                "export PATH='/opt/a'\\''b:$(touch /tmp/injected):/usr/bin\n/tools'\n{command}"
+            )
+        );
     }
 
     #[test]
     fn login_output_ignores_startup_messages_and_preserves_path_bytes() {
-        assert_eq!(parse_login_path(b"welcome\n\0marker\0/opt/a b:/bin\n\0goodbye", "marker").unwrap(), "/opt/a b:/bin\n");
+        assert_eq!(
+            parse_login_path(b"welcome\n\0marker\0/opt/a b:/bin\n\0goodbye", "marker").unwrap(),
+            "/opt/a b:/bin\n"
+        );
         assert_eq!(parse_login_path(b"\0marker\0\0", "marker").unwrap(), "");
         assert!(parse_login_path(b"welcome /bin", "marker").is_err());
         assert!(parse_login_path(b"\0marker\0/bin", "marker").is_err());
