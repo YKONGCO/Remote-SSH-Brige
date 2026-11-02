@@ -143,6 +143,12 @@ export default function App() {
     media?.addEventListener("change", apply);
     return () => media?.removeEventListener("change", apply);
   }, [preferences.theme, preferences.density, preferences.motion]);
+  useEffect(() => {
+    const disableContextMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener("contextmenu", disableContextMenu);
+    return () =>
+      document.removeEventListener("contextmenu", disableContextMenu);
+  }, []);
   const [data, setData] = useState<Snapshot>(empty),
     [page, setPage] = useState<Page>(() => readPreferences().startPage as Page),
     [search, setSearch] = useState(""),
@@ -558,7 +564,8 @@ export default function App() {
                   ? "settings-page"
                   : page === "files"
                     ? "files-page"
-                    : "")
+                    : "") +
+            (page === "audit" ? " audit-records-page" : "")
           }
         >
           {!desktop && (

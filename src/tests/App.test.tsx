@@ -36,6 +36,24 @@ beforeAll(() => {
 });
 afterEach(cleanup);
 
+test("disables the native context menu while the app is mounted", () => {
+  const view = render(<App />);
+  const blocked = new MouseEvent("contextmenu", {
+    bubbles: true,
+    cancelable: true,
+  });
+  document.body.dispatchEvent(blocked);
+  expect(blocked.defaultPrevented).toBe(true);
+
+  view.unmount();
+  const restored = new MouseEvent("contextmenu", {
+    bubbles: true,
+    cancelable: true,
+  });
+  document.body.dispatchEvent(restored);
+  expect(restored.defaultPrevented).toBe(false);
+});
+
 test("server PATH synchronization refreshes its timestamp and preserves state on failure", async () => {
   localStorage.clear();
   const realApi = remoteApi.api;
