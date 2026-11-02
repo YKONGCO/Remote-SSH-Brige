@@ -141,3 +141,80 @@ test("native transfers pass only file-selection parameters and never file conten
     vi.mocked(operate).mock.calls.every(([op]) => op.kind === "list_files"),
   ).toBe(true);
 });
+
+test("shows transfer history only after opening the toolbar transfer menu", async () => {
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "runtime_settings")
+      return { ...defaultRuntimeSettings } as never;
+    if (command === "transfer")
+      return {
+        transfers: [
+          {
+            transfer_id: "transfer_active",
+            server_id: "server",
+            direction: "download",
+            local_path: "C:\\Downloads\\archive.bin",
+            remote_path: "/workspace/archive.bin",
+            status: "running",
+            phase: "transferring",
+            transferred_bytes: 512,
+            total_bytes: 1024,
+            bytes_per_second: 256,
+            elapsed_ms: 2000,
+            version: 2,
+            error: null,
+          },
+          {
+            transfer_id: "transfer_completed",
+            server_id: "server",
+            direction: "download",
+            local_path: "C:\\Downloads\\finished.zip",
+            remote_path: "/workspace/finished.zip",
+            status: "completed",
+            phase: "completed",
+            transferred_bytes: 2048,
+            total_bytes: 2048,
+            bytes_per_second: 1024,
+            elapsed_ms: 2000,
+            version: 3,
+            error: null,
+          },
+        ],
+      } as never;
+    return null as never;
+  });
+  vi.mocked(operate).mockResolvedValue({ path: "/workspace", entries: [] });
+  const user = userEvent.setup();
+  const view = render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/workspace" }}
+      refresh={vi.fn()}
+      notify={vi.fn()}
+    />,
+  );
+
+  const trigger = await screen.findByRole("button", { name: "传输任务" });
+  await waitFor(() =>
+    expect(trigger.querySelector(".transfer-menu-badge")).toBeTruthy(),
+  );
+  expect(view.container.querySelector(".file-transfer-item")).toBeNull();
+
+  await user.click(trigger);
+  const task = await screen.findByText("archive.bin");
+  const menu = task.closest(".transfer-menu") as HTMLElement;
+  expect(menu).toBeTruthy();
+  expect(within(menu).getByText("512 B / 1.0 KiB · 256 B/s")).toBeTruthy();
+  const completed = within(menu)
+    .getByText("finished.zip")
+    .closest(".file-transfer-item") as HTMLElement;
+  expect(completed.querySelector("progress")).toBeNull();
+  await user.click(
+    within(completed).getByRole("button", {
+      name: "打开 finished.zip 所在文件夹",
+    }),
+  );
+  expect(api).toHaveBeenCalledWith("reveal_transfer", {
+    serverId: "server",
+    transferId: "transfer_completed",
+  });
+});

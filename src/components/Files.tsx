@@ -283,6 +283,11 @@ export function Files({
             onChange={(e) => setFilter(e.target.value)}
           />
         </div>
+        <TransferPanel
+          serverId={server.id}
+          onComplete={() => void load()}
+          notify={notify}
+        />
         <Button
           variant="outline"
           size="sm"
@@ -384,11 +389,6 @@ export function Files({
           </Button>
         </div>
       )}
-      <TransferPanel
-        serverId={server.id}
-        onComplete={() => void load()}
-        notify={notify}
-      />
       <div className="file-surface">
         <div className="file-list-scroll">
           <table className="data-table file-table">

@@ -1,7 +1,7 @@
 [package]
 name = "remote-ssh-brige"
 default-run = "remote-ssh-brige"
-version = "0.5.2"
+version = "0.5.3"
 license = "MIT"
 description = "Permission-controlled remote server access for AI agents over MCP and SSH"
 edition = "2021"

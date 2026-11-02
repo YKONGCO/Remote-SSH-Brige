@@ -174,6 +174,36 @@ impl TransferManager {
                 .is_none_or(|t| t.elapsed() < RETENTION)
         });
     }
+    pub fn completed_local_file(&self, server_id: &str, transfer_id: &str) -> Result<PathBuf> {
+        let item = self
+            .items
+            .lock()
+            .unwrap()
+            .get(transfer_id)
+            .filter(|handle| handle.snapshot().server_id == server_id)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    "TRANSFER_NOT_FOUND",
+                    "Transfer does not exist or has expired",
+                )
+            })?;
+        let snapshot = item.snapshot();
+        anyhow::ensure!(
+            snapshot.status == "completed",
+            "TRANSFER_NOT_COMPLETED: Transfer has not completed"
+        );
+        let path = PathBuf::from(snapshot.local_path);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "INVALID_ARGUMENT: Local path is not absolute"
+        );
+        let path = path
+            .canonicalize()
+            .context("Completed transfer file no longer exists")?;
+        anyhow::ensure!(path.is_file(), "Completed transfer path is not a file");
+        Ok(path)
+    }
     fn insert(&self, server: &Server, op: &Operation) -> Result<Arc<Handle>> {
         self.prune();
         let mut items = self.items.lock().unwrap();
@@ -786,6 +816,34 @@ mod tests {
         assert!(!h.request_cancel());
         h.complete(&Ok(json!({})));
         assert_eq!(h.snapshot().status, "completed");
+    }
+    #[test]
+    fn completed_local_file_only_returns_an_existing_completed_transfer_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("download.bin");
+        std::fs::write(&file, b"complete").unwrap();
+        let manager = TransferManager::default();
+        let handle = manager
+            .insert(
+                &Server {
+                    id: "server".into(),
+                    ..Default::default()
+                },
+                &Operation {
+                    kind: "download_file".into(),
+                    transfer_request: Some(spec(&file)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let id = handle.snapshot().transfer_id;
+        assert!(manager.completed_local_file("server", &id).is_err());
+        handle.complete(&Ok(json!({})));
+        assert_eq!(
+            manager.completed_local_file("server", &id).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert!(manager.completed_local_file("other", &id).is_err());
     }
     #[test]
     fn cancellation_and_source_changes_never_enter_commit() {

@@ -252,6 +252,39 @@ mod desktop {
             .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
+    fn reveal_transfer(
+        state: Shared<'_>,
+        server_id: String,
+        transfer_id: String,
+    ) -> Result<(), String> {
+        let file = state
+            .transfers
+            .completed_local_file(&server_id, &transfer_id)
+            .map_err(|e| format!("{e:#}"))?;
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("explorer.exe");
+            command.arg("/select,").arg(&file);
+            command
+        };
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut command = std::process::Command::new("open");
+            command.arg("-R").arg(&file);
+            command
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = {
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(file.parent().ok_or("文件没有所在目录")?);
+            command
+        };
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("无法打开文件所在目录：{e}"))
+    }
+    #[tauri::command]
     fn runtime_settings(state: Shared<'_>) -> model::RuntimeSettings {
         state.settings.lock().unwrap().clone()
     }
@@ -468,6 +501,7 @@ mod desktop {
                 upload_file,
                 pick_local_directories,
                 transfer,
+                reveal_transfer,
                 mcp_clients,
                 configure_mcp_client,
                 runtime_settings,
