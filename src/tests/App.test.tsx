@@ -571,7 +571,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(17);
+  expect(screen.getAllByRole("combobox")).toHaveLength(24);
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");

@@ -23,3 +23,6 @@ CREATE TABLE IF NOT EXISTS audit_entries (
 );
 CREATE INDEX IF NOT EXISTS audit_server_sequence ON audit_entries(server_id,sequence DESC);
 CREATE INDEX IF NOT EXISTS audit_kind_sequence ON audit_entries(kind,sequence DESC);
+CREATE TABLE IF NOT EXISTS transfer_tasks (
+    id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, record_json TEXT NOT NULL
+);

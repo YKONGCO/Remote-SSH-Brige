@@ -30,27 +30,41 @@ pub fn success(kind: &str, mut value: Value) -> CallToolResult {
 
 pub fn failure(op: &Operation, error: &anyhow::Error) -> CallToolResult {
     let response = operation_error::error_response(error, op);
-    let text = if op.kind == "exec" {
-        command_policy_json(&response).unwrap_or_else(|| error_text(&response))
-    } else {
-        error_text(&response)
-    };
-    CallToolResult::error(vec![ContentBlock::text(text)])
+    let mut compact = compact_error(&response);
+    compact["retryable"] = Value::Bool(operation_error::retryable(error));
+    CallToolResult::error(vec![ContentBlock::text(compact.to_string())])
 }
 
-fn command_policy_json(error: &Value) -> Option<String> {
-    if error["code"] != "COMMAND_POLICY_DENIED" {
-        return None;
+pub fn compact_error(error: &Value) -> Value {
+    let code = error["code"].as_str().unwrap_or("OPERATION_FAILED");
+    let mut value = serde_json::json!({"code":code,"message":error_text(error),"retryable":matches!(code,"SSH_TIMEOUT"|"IO_TIMEOUT"|"CONNECTION_LOST"|"CONNECTION_REFUSED"|"SSH_CONNECT_FAILED")});
+    let details = &error["details"];
+    for key in [
+        "missing_permissions",
+        "partial",
+        "outcome_unknown",
+        "removed_entries",
+    ] {
+        if let Some(field) = details.get(key) {
+            value[key] = field.clone();
+        }
     }
-    let command = error["details"]["command"].as_str()?;
-    Some(
-        serde_json::json!({
-            "code":"COMMAND_POLICY_DENIED",
-            "details":{"command":command},
-            "message":error_text(error),
-        })
-        .to_string(),
-    )
+    let hint = match code {
+        "COMMAND_POLICY_DENIED" => {
+            Some("Review this executable or shell rule in server command settings")
+        }
+        "MCP_PERMISSION_DENIED" | "PERMISSION_DENIED" => {
+            Some("Check the operation's server permissions")
+        }
+        "LOCAL_PATH_DENIED" => Some("Configure the local transfer roots in Settings"),
+        "PATH_OUTSIDE_ROOT" => Some("Use a path inside the server file root"),
+        "COMMIT_STATUS_UNKNOWN" => Some("Inspect the destination before retrying"),
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        value["hint"] = Value::String(hint.into());
+    }
+    value
 }
 
 /// Full diagnostics stay in audit records; MCP only needs the actionable cause.
@@ -139,7 +153,8 @@ pub fn normalize_tool_result(mut result: CallToolResult) -> CallToolResult {
             .join("; ");
         let policy_json = serde_json::from_str::<Value>(&text)
             .ok()
-            .and_then(|error| command_policy_json(&error));
+            .filter(|error| error.get("code").is_some())
+            .map(|error| error.to_string());
         let message = if let Some(json) = policy_json {
             // Bound the message, never truncate the JSON or the original command.
             json
@@ -161,7 +176,7 @@ fn compact_errors(value: &mut Value) {
             for (key, value) in object {
                 if matches!(key.as_str(), "error" | "audit_error" | "last_error") {
                     if value.get("message").and_then(Value::as_str).is_some() {
-                        *value = Value::String(error_text(value));
+                        *value = compact_error(value);
                     } else if let Some(text) = value.as_str() {
                         *value = Value::String(short_line(text));
                     }
@@ -234,7 +249,11 @@ mod tests {
         ));
         assert_eq!(result["isError"], true);
         assert!(result.get("structuredContent").is_none());
-        assert_eq!(result["content"][0]["text"], "File not found");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()
+                ["message"],
+            "File not found"
+        );
     }
 
     #[test]
@@ -264,7 +283,7 @@ mod tests {
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(
             data,
-            json!({"code":"COMMAND_POLICY_DENIED", "details":{"command":command}, "message":"find delete and execute actions are blocked"})
+            json!({"code":"COMMAND_POLICY_DENIED", "retryable":false,"hint":"Review this executable or shell rule in server command settings", "message":"find delete and execute actions are blocked"})
         );
     }
 
@@ -284,7 +303,8 @@ mod tests {
         let result = wire(normalize_tool_result(failure(&op, &error)));
         let data: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(data["details"], json!({"command":command}));
+        assert!(data.get("details").is_none());
+        assert!(result["content"][0]["text"].as_str().unwrap().len() < 400);
         assert_eq!(data["message"], "Command 'ls' is blocked by the denylist");
         assert!(data.get("stage").is_none());
     }
@@ -301,7 +321,7 @@ mod tests {
         let data: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(
-            data["error"],
+            data["error"]["message"],
             "Deletion failed; removed entries: 1, inspect the target before retrying"
         );
         assert_eq!(data["status"], "failed");
@@ -350,14 +370,19 @@ mod tests {
             },
             &std::io::Error::from_raw_os_error(access_denied).into(),
         ));
-        assert_eq!(result["content"][0]["text"], "File access denied: /private");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()
+                ["message"],
+            "File access denied: /private"
+        );
         let result = wire(failure(
             &Operation::default(),
             &anyhow::Error::from(std::io::Error::from_raw_os_error(access_denied))
                 .context("Cannot resolve SSH server address"),
         ));
         assert_eq!(
-            result["content"][0]["text"],
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()
+                ["message"],
             "Cannot resolve SSH server address"
         );
     }

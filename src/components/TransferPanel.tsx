@@ -9,6 +9,9 @@ import {
   Search,
   Trash2,
   XCircle,
+  Pause,
+  Play,
+  RotateCcw,
 } from "lucide-react";
 import { api, desktop } from "../api";
 import { formatBytes, type FileTransfer } from "../transfers";
@@ -31,6 +34,15 @@ const phases: Record<string, string> = {
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
+  queued: "排队中",
+  connecting: "正在连接",
+  retrying: "等待自动重试",
+  paused: "已暂停",
+  pausing: "正在暂停",
+  hashing: "正在计算校验值",
+  verifying: "正在校验文件",
+  reconciling: "正在确认提交结果",
+  skipped: "内容相同，已跳过",
 };
 
 export function TransferPanel({
@@ -47,6 +59,7 @@ export function TransferPanel({
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [busy, setBusy] = useState<Set<string>>(new Set());
   const callbacks = useRef({ onComplete, notify });
   callbacks.current = { onComplete, notify };
   useEffect(() => {
@@ -105,8 +118,12 @@ export function TransferPanel({
           .includes(search.toLocaleLowerCase())),
   );
   const activeCount = visibleItems.filter(
-    (item) => !terminal(item.status),
+    (item) => !terminal(item.status) && item.status !== "paused",
   ).length;
+  const groups = new Map<string, FileTransfer[]>();
+  for (const item of visibleItems)
+    if (item.group_id)
+      groups.set(item.group_id, [...(groups.get(item.group_id) || []), item]);
   const latestCompleted = items.find(
     (item) => item.status === "completed" && !dismissed.has(item.transfer_id),
   );
@@ -115,6 +132,35 @@ export function TransferPanel({
       serverId,
       transferId: item.transfer_id,
     }).catch((e) => callbacks.current.notify(String(e), true));
+  const control = async (item: FileTransfer, action: string, patch = {}) => {
+    setBusy((current) => new Set(current).add(item.transfer_id));
+    try {
+      const result = await api<FileTransfer>("transfer", {
+        serverId,
+        action,
+        transferId: item.transfer_id,
+        ...patch,
+      });
+      if (action === "cleanup")
+        setItems((current) =>
+          current.filter((x) => x.transfer_id !== item.transfer_id),
+        );
+      else
+        setItems((current) =>
+          current.map((x) =>
+            x.transfer_id === result.transfer_id ? result : x,
+          ),
+        );
+    } catch (e) {
+      callbacks.current.notify(String(e), true);
+    } finally {
+      setBusy((current) => {
+        const next = new Set(current);
+        next.delete(item.transfer_id);
+        return next;
+      });
+    }
+  };
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -138,7 +184,9 @@ export function TransferPanel({
         aria-label="文件传输任务"
       >
         <div className="transfer-menu-header">
-          <strong>下载</strong>
+          <strong>
+            文件传输{activeCount ? ` · ${activeCount} 项进行中` : ""}
+          </strong>
           <div className="transfer-menu-header-actions">
             <Button
               variant="ghost"
@@ -183,9 +231,28 @@ export function TransferPanel({
         )}
         {!visibleItems.length && !error && (
           <div className="transfer-menu-empty">
-            {search ? "没有匹配的下载任务" : "暂无下载任务"}
+            {search ? "没有匹配的传输任务" : "暂无传输任务"}
           </div>
         )}
+        {[...groups].slice(0, 5).map(([id, tasks]) => {
+          const bytes = tasks.reduce((sum, t) => sum + t.transferred_bytes, 0);
+          const total = tasks.reduce((sum, t) => sum + (t.total_bytes || 0), 0);
+          return (
+            <div className="transfer-group-progress" key={id}>
+              <small title={id}>
+                批次 {id.slice(0, 8)} · 已完成{" "}
+                {tasks.filter((t) => t.status === "completed").length}/
+                {tasks.length} · {formatBytes(bytes)}
+                {total ? ` / ${formatBytes(total)}` : ""}
+              </small>
+              <progress
+                aria-label={`批次 ${id} 进度`}
+                max={total || 1}
+                value={bytes}
+              />
+            </div>
+          );
+        })}
         {[
           ...visibleItems.filter((item) => !terminal(item.status)),
           ...visibleItems.filter((item) => terminal(item.status)),
@@ -211,6 +278,50 @@ export function TransferPanel({
                   </div>
                 </div>
                 <div className="file-transfer-actions">
+                  {["paused", "failed"].includes(item.status) && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="icon-btn"
+                      disabled={busy.has(item.transfer_id)}
+                      aria-label={`${item.status === "paused" ? "继续" : "重试"} ${item.remote_path.split("/").pop()}`}
+                      title={
+                        item.status === "paused"
+                          ? "校验断点并继续"
+                          : "从断点重试"
+                      }
+                      onClick={() =>
+                        void control(
+                          item,
+                          item.status === "paused" ? "resume" : "retry",
+                        )
+                      }
+                    >
+                      {item.status === "paused" ? (
+                        <Play size={17} />
+                      ) : (
+                        <RotateCcw size={17} />
+                      )}
+                    </Button>
+                  )}
+                  {!terminal(item.status) && item.status !== "paused" && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="icon-btn"
+                      disabled={
+                        busy.has(item.transfer_id) ||
+                        ["committing", "pausing", "cancelling"].includes(
+                          item.phase,
+                        )
+                      }
+                      aria-label={`暂停 ${item.remote_path.split("/").pop()}`}
+                      title="暂停并保存断点"
+                      onClick={() => void control(item, "pause")}
+                    >
+                      <Pause size={17} />
+                    </Button>
+                  )}
                   {item.status === "completed" && (
                     <Button
                       variant="ghost"
@@ -296,12 +407,17 @@ export function TransferPanel({
                       {item.bytes_per_second > 0
                         ? ` · ${formatBytes(item.bytes_per_second)}/s`
                         : ""}
+                      {item.bytes_per_second > 0 &&
+                      item.total_bytes !== null &&
+                      item.status === "running"
+                        ? ` · 剩余约 ${Math.ceil(Math.max(0, item.total_bytes - item.transferred_bytes) / item.bytes_per_second)} 秒`
+                        : ""}
                     </span>
                     {item.status === "failed" && (
                       <XCircle className="transfer-status-error" size={16} />
                     )}
                     {item.status === "cancelled" && <CheckCircle2 size={16} />}
-                    {!terminal(item.status) && (
+                    {!terminal(item.status) && item.status !== "paused" && (
                       <LoaderCircle
                         className="spinning transfer-status-active"
                         size={16}
@@ -312,6 +428,84 @@ export function TransferPanel({
               )}
               {item.error && (
                 <p className="error-inline">{item.error.message}</p>
+              )}
+              {!!item.retry_count && (
+                <small>
+                  已自动重试 {item.retry_count} 次
+                  {item.next_retry_at
+                    ? ` · 下次 ${new Date(item.next_retry_at).toLocaleTimeString()}`
+                    : ""}
+                </small>
+              )}
+              {!!item.resumed_bytes && (
+                <small>已复用 {formatBytes(item.resumed_bytes)} 断点数据</small>
+              )}
+              {item.group_id && (
+                <small title={item.group_id}>
+                  批次 {item.group_id.slice(0, 8)}
+                </small>
+              )}
+              {item.sha256 && (
+                <small title={item.sha256}>
+                  SHA-256 {item.sha256.slice(0, 16)}…
+                </small>
+              )}
+              {item.status !== "completed" && (
+                <details className="transfer-task-options">
+                  <summary>传输设置</summary>
+                  <label>
+                    优先级{" "}
+                    <select
+                      aria-label={`优先级 ${item.transfer_id}`}
+                      value={item.priority || 0}
+                      disabled={busy.has(item.transfer_id)}
+                      onChange={(e) =>
+                        void control(item, "configure", {
+                          priority: Number(e.target.value),
+                        })
+                      }
+                    >
+                      {[...new Set([-10, -5, 0, 5, 10, item.priority || 0])]
+                        .sort((a, b) => a - b)
+                        .map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label>
+                    限速 KiB/s（0 跟随全局设置）{" "}
+                    <Input
+                      type="number"
+                      min={0}
+                      max={1048576}
+                      aria-label={`限速 ${item.transfer_id}`}
+                      key={`${item.transfer_id}-${item.bandwidth_kib || 0}`}
+                      defaultValue={item.bandwidth_kib || 0}
+                      onBlur={(e) => {
+                        const n = Number(e.target.value);
+                        if (
+                          Number.isInteger(n) &&
+                          n >= 0 &&
+                          n <= 1048576 &&
+                          n !== (item.bandwidth_kib || 0)
+                        )
+                          void control(item, "configure", { bandwidthKib: n });
+                      }}
+                    />
+                  </label>
+                  {(terminal(item.status) || item.status === "paused") && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy.has(item.transfer_id)}
+                      onClick={() => void control(item, "cleanup")}
+                    >
+                      清理临时文件及记录
+                    </Button>
+                  )}
+                </details>
               )}
               {item.audit_error && (
                 <p className="error-inline">

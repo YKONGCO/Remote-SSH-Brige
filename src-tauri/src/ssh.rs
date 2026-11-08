@@ -121,12 +121,16 @@ pub fn handshake_with_settings(server: &Server, settings: &RuntimeSettings) -> R
         )
     })?;
     tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(settings.handshake_timeout_secs)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(settings.handshake_timeout_secs)))?;
+    let socket = tcp.try_clone()?;
     let mut session = Session::new()?;
     session.set_tcp_stream(tcp);
-    session.set_timeout((settings.io_timeout_secs * 1000) as u32);
+    session.set_timeout((settings.handshake_timeout_secs * 1000) as u32);
     session.handshake()?;
+    socket.set_read_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
+    session.set_timeout((settings.io_timeout_secs * 1000) as u32);
     Ok(session)
 }
 pub fn fingerprint(session: &Session) -> Result<String> {
@@ -240,7 +244,7 @@ pub(crate) fn remote_path(
     }
     Ok(resolved)
 }
-fn create_parent_directories(sftp: &Sftp, server: &Server, value: &str) -> Result<()> {
+pub(crate) fn create_parent_directories(sftp: &Sftp, server: &Server, value: &str) -> Result<()> {
     // Validate the entire request before creating anything. Resolve the nearest
     // existing ancestor first, so symlinks outside the root cannot cause writes.
     if !value.starts_with('/')
@@ -681,7 +685,12 @@ fn mutation_result(result: std::result::Result<(), ssh2::Error>) -> Result<()> {
 
 /// Use an explicit OpenSSH extension: libssh2's generic rename flags are only
 /// preferences and do not guarantee an atomic overwrite on an SFTP v3 server.
-fn commit_extension(session: &Session, extension: &str, from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn commit_extension(
+    session: &Session,
+    extension: &str,
+    from: &Path,
+    to: &Path,
+) -> Result<()> {
     fn packet(channel: &mut ssh2::Channel, payload: &[u8]) -> Result<()> {
         channel.write_all(&(payload.len() as u32).to_be_bytes())?;
         channel.write_all(payload)?;
@@ -868,127 +877,6 @@ fn atomic_write_using(
         return Err(error);
     }
     Ok(existing.is_none())
-}
-
-pub(crate) fn transfer_file(
-    state: &crate::state::AppState,
-    server: &Server,
-    op: &Operation,
-    settings: &RuntimeSettings,
-    source: &str,
-    local: &Path,
-    local_file: Option<std::fs::File>,
-    handle: &crate::transfers::Handle,
-) -> Result<Value> {
-    use crate::transfers::{copy_file, unchanged, validate_commit};
-    let spec = op
-        .transfer_request
-        .as_ref()
-        .context("Missing transfer request")?;
-    handle.check_cancelled()?;
-    let session = connect_with_settings(server, settings)?;
-    let sftp = session.sftp()?;
-    let upload = op.kind == "upload_file";
-    let remote = remote_path(&sftp, server, &spec.remote_path, upload)?;
-    let limit = settings.transfer_limit(&op.kind);
-    if upload {
-        let mut input = local_file.context("Missing selected upload file")?;
-        let before = input.metadata()?;
-        anyhow::ensure!(
-            Some(before.len()) == spec.size,
-            "SOURCE_CHANGED: Local file size changed"
-        );
-        if !spec.overwrite {
-            match sftp.lstat(&remote) {
-                Ok(_) => {
-                    return Err(crate::operation_error::error(
-                        "ALREADY_EXISTS",
-                        "Remote target already exists; overwrite is disabled",
-                    ))
-                }
-                Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let mode = if spec.overwrite {
-            WriteMode::Overwrite
-        } else {
-            WriteMode::Create
-        };
-        atomic_write_using(
-            &session,
-            &sftp,
-            &remote,
-            mode,
-            |output| {
-                let hash = copy_file(&mut input, output, before.len(), limit, handle)?;
-                anyhow::ensure!(
-                    unchanged(&before, &input.metadata()?),
-                    "SOURCE_CHANGED: Local source changed during transfer"
-                );
-                if let Some(expected) = &spec.sha256 {
-                    anyhow::ensure!(
-                        *expected == hash,
-                        "SOURCE_CHANGED: Upload content differs from the approved file"
-                    );
-                }
-                Ok(())
-            },
-            || {
-                validate_commit(state, server, op, source, local)?;
-                anyhow::ensure!(
-                    remote_path(&sftp, server, &spec.remote_path, true)? == remote,
-                    "Remote target path changed"
-                );
-                handle.begin_commit()
-            },
-        )?;
-        Ok(json!({"written_bytes":before.len()}))
-    } else {
-        let mut input = sftp.open(&remote)?;
-        let before = input.stat()?;
-        anyhow::ensure!(
-            before.is_file(),
-            "INVALID_ARGUMENT: remote_path must be a regular file"
-        );
-        let size = before.size.context("Remote file size is unavailable")?;
-        if size > limit {
-            return Err(crate::operation_error::error(
-                "PAYLOAD_TOO_LARGE",
-                "File exceeds the download limit",
-            ));
-        }
-        let mut temp =
-            tempfile::NamedTempFile::new_in(local.parent().context("Invalid local parent")?)?;
-        copy_file(&mut input, temp.as_file_mut(), size, limit, handle)?;
-        let after = input.stat()?;
-        anyhow::ensure!(
-            after.size == before.size && after.mtime == before.mtime,
-            "SOURCE_CHANGED: Remote source changed during transfer"
-        );
-        temp.as_file().sync_all()?;
-        validate_commit(state, server, op, source, local)?;
-        anyhow::ensure!(
-            remote_path(&sftp, server, &spec.remote_path, false)? == remote,
-            "Remote source path changed"
-        );
-        handle.begin_commit()?;
-        if spec.overwrite {
-            temp.persist(local).map_err(|e| e.error)?;
-        } else {
-            temp.persist_noclobber(local).map_err(|e| {
-                if e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    crate::operation_error::error(
-                        "ALREADY_EXISTS",
-                        "Local target already exists; overwrite is disabled",
-                    )
-                } else {
-                    e.error.into()
-                }
-            })?;
-        }
-        Ok(json!({"downloaded_bytes":size}))
-    }
 }
 
 pub fn validate_payload(op: &Operation, settings: &RuntimeSettings) -> Result<()> {

@@ -4773,3 +4773,27 @@
     font-size: 12px;
   }
 }
+/* Per-task controls stay compact inside the transfer menu. */
+.transfer-task-options {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.transfer-task-options summary {
+  cursor: pointer;
+  color: var(--muted-foreground);
+}
+.transfer-task-options label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0;
+}
+.transfer-task-options input {
+  width: 110px;
+}
+.file-transfer-item > small {
+  display: block;
+  overflow-wrap: anywhere;
+  margin-top: 4px;
+}

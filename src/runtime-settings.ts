@@ -98,10 +98,30 @@ export interface RuntimeSettings {
   local_download_roots: string[];
   connect_timeout_secs: number;
   io_timeout_secs: number;
+  handshake_timeout_secs: number;
+  transfers: TransferSettings;
   command_timeout_secs: number;
   exec_timeout_to_job: boolean;
   max_terminals: number;
 }
+export interface TransferSettings {
+  max_concurrent: number;
+  per_server_concurrent: number;
+  max_retries: number;
+  retry_base_secs: number;
+  io_timeout_secs: number;
+  idle_timeout_secs: number;
+  bandwidth_kib: number;
+}
+export const defaultTransferSettings: TransferSettings = {
+  max_concurrent: 4,
+  per_server_concurrent: 2,
+  max_retries: 5,
+  retry_base_secs: 1,
+  io_timeout_secs: 30,
+  idle_timeout_secs: 120,
+  bandwidth_kib: 0,
+};
 export const defaultRuntimeSettings: RuntimeSettings = {
   close_to_tray: true,
   deletion_protection: true,
@@ -115,6 +135,8 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   local_download_roots: [],
   connect_timeout_secs: 8,
   io_timeout_secs: 15,
+  handshake_timeout_secs: 15,
+  transfers: { ...defaultTransferSettings },
   command_timeout_secs: 30,
   exec_timeout_to_job: false,
   max_terminals: 32,

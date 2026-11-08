@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct AppState {
     pub dir: PathBuf,
-    database: Mutex<Database>,
+    pub(crate) database: Mutex<Database>,
     pub config: Mutex<Config>,
     pub settings: Mutex<RuntimeSettings>,
     pub jobs: crate::jobs::JobManager,
@@ -50,6 +50,7 @@ impl AppState {
             cancel: Mutex::new(None),
             service_lock: tokio::sync::Mutex::new(()),
         });
+        state.transfers.restore(&state)?;
         let weak = Arc::downgrade(&state);
         std::thread::Builder::new()
             .name("job-cleanup".into())
@@ -349,6 +350,9 @@ impl AppState {
                 format!("已转入 Job: {}", v["job_id"])
             }
             Ok(v) if op.kind == "job" => format!("Job {}: {}", op.job_id, v["status"]),
+            Ok(v) if op.kind == "transfer" && op.transfer_action != "list" => {
+                format!("Transfer {}: {}", op.transfer_id, v["status"])
+            }
             Ok(v) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
                 format!("{}: {}", op.transfer_id, v["status"])
             }
@@ -485,7 +489,28 @@ pub async fn execute_with_progress(
             } else if op.kind.starts_with("terminal_") {
                 crate::terminal::operate(&state, &live, &op)
             } else {
-                crate::ssh::operate_with_settings(&live, &op, &settings)
+                let mut attempts = 0;
+                loop {
+                    let result = crate::ssh::operate_with_settings(&live, &op, &settings);
+                    let safe = matches!(op.kind.as_str(), "list_files" | "stat_file" | "read_file");
+                    if attempts >= 2
+                        || !safe
+                        || !result
+                            .as_ref()
+                            .err()
+                            .is_some_and(crate::operation_error::retryable)
+                    {
+                        break result;
+                    }
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(250 * (1 << attempts)));
+                    let current = state.server(&op.server_id)?;
+                    anyhow::ensure!(
+                        serde_json::to_value(&current)? == serde_json::to_value(&live)?,
+                        "Server configuration changed during retry"
+                    );
+                    validate_operation(&state, &current, &op, source)?;
+                }
             }
         });
         if (source == "mcp"
@@ -631,7 +656,7 @@ fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
             json!({"transfer_id":op.transfer_id,"server_id":op.server_id,"direction":if op.kind == "upload_file" {"upload"} else {"download"},"local_path":spec.map(|s| &s.local_path),"remote_path":spec.map(|s| &s.remote_path),"overwrite":spec.map(|s| s.overwrite),"status":"failed","transferred_bytes":0,"error":crate::operation_error::error_response(e, op)})
         }
         Ok(value) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
-            json!({"transfer_id":value["transfer_id"],"direction":value["direction"],"server_id":op.server_id,"local_path":value["local_path"],"remote_path":value["remote_path"],"overwrite":value["overwrite"],"status":value["status"],"total_bytes":value["total_bytes"],"transferred_bytes":value["transferred_bytes"],"created_at":value["created_at"],"finished_at":value["finished_at"],"elapsed_ms":value["elapsed_ms"],"error":value["error"]})
+            json!({"transfer_id":value["transfer_id"],"direction":value["direction"],"server_id":op.server_id,"local_path":value["local_path"],"remote_path":value["remote_path"],"overwrite":value["overwrite"],"status":value["status"],"total_bytes":value["total_bytes"],"transferred_bytes":value["transferred_bytes"],"created_at":value["created_at"],"finished_at":value["finished_at"],"elapsed_ms":value["elapsed_ms"],"retry_count":value["retry_count"],"resumed_bytes":value["resumed_bytes"],"sha256":value["sha256"],"group_id":value["group_id"],"phase":value["phase"],"error":value["error"]})
         }
         Err(error) => {
             let mut response = crate::operation_error::error_response(error, op);

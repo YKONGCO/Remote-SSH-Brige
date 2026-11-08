@@ -57,6 +57,8 @@ const fixture = {
   transferReadDelay: 0,
   transferWriteDelay: 0,
   dropTransferRead: false,
+  dropTransferReadAfter: 0,
+  dropTransferWriteAfter: 0,
 };
 const canonical = (p) => (p === "/" ? "/" : p.replace(/\/+$/, ""));
 const stats = (p) => {
@@ -192,6 +194,17 @@ const ssh = new Server(
           channel.on("SETSTAT", (id, p) =>
             entries.has(p) ? ok(id) : fail(id),
           );
+          channel.on("FSETSTAT", (id, h, attrs) => {
+            const handle = handles.get(h.toString("hex"));
+            if (!handle) return fail(id);
+            const bytes = entries.get(handle.path);
+            if (typeof attrs.size === "number" && Buffer.isBuffer(bytes)) {
+              const resized = Buffer.alloc(attrs.size);
+              bytes.copy(resized);
+              entries.set(handle.path, resized);
+            }
+            ok(id);
+          });
           channel.on("FSTAT", (id, h) => {
             const handle = handles.get(h.toString("hex"));
             if (!handle) return fail(id);
@@ -235,6 +248,14 @@ const ssh = new Server(
             makeHandle(id, { path: p });
           });
           channel.on("READ", (id, h, offset, length) => {
+            if (
+              fixture.dropTransferReadAfter &&
+              offset >= fixture.dropTransferReadAfter
+            ) {
+              fixture.dropTransferReadAfter = 0;
+              client.end();
+              return;
+            }
             const handle = handles.get(h.toString("hex"));
             if (!handle) return fail(id);
             const bytes = entries.get(handle.path);
@@ -253,6 +274,14 @@ const ssh = new Server(
             else reply();
           });
           channel.on("WRITE", (id, h, offset, data) => {
+            if (
+              fixture.dropTransferWriteAfter &&
+              offset >= fixture.dropTransferWriteAfter
+            ) {
+              fixture.dropTransferWriteAfter = 0;
+              client.end();
+              return;
+            }
             const handle = handles.get(h.toString("hex"));
             if (!handle) return fail(id);
             const old = entries.get(handle.path);
@@ -596,11 +625,13 @@ try {
   );
   const tools = await mcp.listTools();
   check(
-    "MCP exposes exactly 14 focused tools",
+    "MCP exposes 16 focused tools",
     JSON.stringify(tools.tools.map((t) => t.name).sort()) ===
       JSON.stringify(
         [
           "list_servers",
+          "server_info",
+          "transfer_batch",
           "exec",
           "job",
           "port_forward",
@@ -641,14 +672,9 @@ try {
         assert.ok(!text.includes('"command_policy"'));
         if (text.startsWith("{")) {
           const denial = JSON.parse(text);
-          assert.equal(name, "exec");
-          assert.equal(denial.code, "COMMAND_POLICY_DENIED");
-          assert.deepEqual(Object.keys(denial).sort(), [
-            "code",
-            "details",
-            "message",
-          ]);
-          assert.deepEqual(denial.details, { command: args.command });
+          assert.equal(typeof denial.code, "string");
+          assert.equal(typeof denial.retryable, "boolean");
+          assert.ok(!denial.details);
           assert.ok([...denial.message].length <= 240);
         } else {
           assert.ok([...text].length <= 240);
@@ -714,8 +740,20 @@ try {
     write_file: ["server_id", "path", "content", "mode", "create_parents"],
     edit_file: ["server_id", "path", "edits"],
     exec: ["server_id", "command", "timeout_secs"],
-    upload_file: ["server_id", "local_path", "remote_path", "overwrite"],
-    download_file: ["server_id", "local_path", "remote_path", "overwrite"],
+    upload_file: [
+      "server_id",
+      "local_path",
+      "remote_path",
+      "overwrite",
+      "request_id",
+    ],
+    download_file: [
+      "server_id",
+      "local_path",
+      "remote_path",
+      "overwrite",
+      "request_id",
+    ],
     remove_path: ["server_id", "path", "recursive", "missing_ok"],
   })) {
     const schema = tools.tools.find((tool) => tool.name === name).inputSchema;
@@ -781,6 +819,35 @@ try {
     );
   }
   const hosts = await value("list_servers", {});
+  const commandInfo = await value("server_info", { topic: "commands" });
+  const compactBytes = Buffer.byteLength(JSON.stringify(hosts));
+  const expandedLowerBound =
+    compactBytes +
+    hosts.length * Buffer.byteLength(JSON.stringify(commandInfo));
+  check(
+    "Default server discovery contains only identity and root fields",
+    hosts.every(
+      (host) =>
+        JSON.stringify(Object.keys(host).sort()) ===
+        JSON.stringify(["host", "id", "name", "root"]),
+    ),
+  );
+  check(
+    "Discovery payload is over 80 percent smaller than repeated command policies",
+    compactBytes < expandedLowerBound * 0.2,
+  );
+  await writeFile(
+    resolve(work, "mcp-size.json"),
+    JSON.stringify(
+      {
+        compactBytes,
+        expandedLowerBound,
+        reduction: 1 - compactBytes / expandedLowerBound,
+      },
+      null,
+      2,
+    ),
+  );
   const listing = await value("list_files", { path: "/workspace", limit: 1 });
   check(
     "Directory listing is paginated and contains metadata",
@@ -846,9 +913,11 @@ try {
   );
   check(
     "Discovery exposes independently configured Shell policy",
-    hosts[0].security.command_policy.allow_pipes &&
-      hosts[0].security.command_policy.allow_scripts &&
-      hosts[0].security.command_protection,
+    (await value("server_info", { topic: "commands" })).command_policy
+      .allow_pipes &&
+      (await value("server_info", { topic: "commands" })).command_policy
+        .allow_scripts &&
+      (await value("server_info", { topic: "commands" })).command_protection,
   );
   for (const command of [
     "ls | head",
@@ -892,7 +961,10 @@ try {
     "MCP-disabled host rejects calls by known ID",
     hidden.error && hidden.value.includes("Missing MCP permission"),
   );
-  const limitedHost = hosts.find((host) => host.id === "limited-host");
+  const limitedHost = await value("server_info", {
+    server_id: "limited-host",
+    topic: "permissions",
+  });
   check(
     "Discovery exposes precise tool permissions",
     limitedHost.mcp_permissions.includes("read_file") &&
@@ -908,7 +980,8 @@ try {
   });
   check(
     "Limited file grants do not imply shell permission",
-    limitedText.content === "limited read" && !limitedHost.allow_exec,
+    limitedText.content === "limited read" &&
+      !limitedHost.mcp_permissions.includes("exec"),
   );
   for (const [kind, args] of [
     ["write_file", { path: "/workspace/limited.txt", content: "denied" }],
@@ -1148,8 +1221,9 @@ try {
     cleanup.removed &&
       cleanup.removed_entries === 1 &&
       !entries.has("/workspace/mcp_test_remote_ssh.txt") &&
-      !hosts[0].security.deletion_protection &&
-      hosts[0].security.command_protection,
+      !(await value("server_info", { topic: "permissions" }))
+        .deletion_protection &&
+      (await value("server_info", { topic: "commands" })).command_protection,
   );
   const repeated = await value("remove_path", {
     path: "/workspace/mcp_test_remote_ssh.txt",

@@ -1,6 +1,6 @@
 # MCP 工具参考
 
-协议名称和客户端配置键为 `remote-ssh`。当前提供 14 个工具；每个工具及管理动作都有独立 Schema，拒绝无关字段。先调用 `list_servers` 获取服务器 ID、`mcp_permissions`、`terminal_actions`、`file_transfer`、`port_forwarding` 和 `security` 策略。
+协议名称和客户端配置键为 `remote-ssh`。当前提供 16 个工具。先调用 `list_servers` 获取精简的服务器识别信息；需要权限、传输配置或命令规则时调用 `server_info`，分别指定 `topic=permissions/transfers/commands`。完整白名单不在发现阶段返回。详细恢复行为见 [传输与恢复](TRANSFER_RECOVERY.md)。
 
 ## 参数
 
@@ -34,22 +34,24 @@
 
 `?` 表示可省略，其余字段必填。文件工具使用远端 POSIX 绝对路径，禁止 NUL、反斜杠和 `..`，解析后须位于服务器的文件根目录内。`exec` 和终端不受文件根目录限制。
 
-| 工具            | 参数                                               | 默认值与行为                                              |
-| --------------- | -------------------------------------------------- | --------------------------------------------------------- |
-| `list_servers`  | `{}`                                               | 仅返回已启用且开放 MCP 的服务器，不包含凭据               |
-| `exec`          | `server_id, command, timeout_secs?`                | 省略或 `0` 使用应用默认超时，否则为 1–300 秒              |
-| `job`           | `server_id, action` 及对应参数                     | 列出、增量读取或关闭超时后保留的执行会话                  |
-| `port_forward`  | `server_id, action` 及对应参数                     | 创建、列出、查看或关闭本地 TCP 转发                       |
-| `read_file`     | `server_id, path, offset?, limit?`                 | `offset=1`，`limit=2000`，最多 50 KiB 正文                |
-| `list_files`    | `server_id, path, offset?, limit?`                 | 目录分页，`offset=0`、`limit=200`，最多 1000 项及 50 KiB  |
-| `stat_file`     | `server_id, path`                                  | 查询文件或目录属性，不读取正文                            |
-| `write_file`    | `server_id, path, content, mode?, create_parents?` | `mode=overwrite`；`create` 拒绝已有目标；默认不创建父目录 |
-| `edit_file`     | `server_id, path, edits`                           | 1–100 组 `old_text/new_text`，全部成功后提交              |
-| `remove_path`   | `server_id, path, recursive?, missing_ok?`         | `recursive=false`，`missing_ok=true`                      |
-| `terminal`      | `action` 及对应参数                                | 见终端动作表                                              |
-| `upload_file`   | `server_id, local_path, remote_path, overwrite?`   | 启动文件流上传，默认不覆盖                                |
-| `download_file` | `server_id, local_path, remote_path, overwrite?`   | 启动文件流下载，默认不覆盖                                |
-| `transfer`      | `server_id, action` 及对应参数                     | 读取传输列表、进度和结果，或请求取消                      |
+| 工具             | 参数                                                                               | 默认值与行为                                              |
+| ---------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `list_servers`   | `{}`                                                                               | 仅返回已启用且开放 MCP 的服务器，不包含凭据               |
+| `server_info`    | `server_id, topic?`                                                                | 按需查看权限、传输设置或命令规则                          |
+| `transfer_batch` | `server_id, direction, items, recursive?, overwrite?, skip_existing?, request_id?` | 批量或递归传输，返回分组与子任务                          |
+| `exec`           | `server_id, command, timeout_secs?`                                                | 省略或 `0` 使用应用默认超时，否则为 1–300 秒              |
+| `job`            | `server_id, action` 及对应参数                                                     | 列出、增量读取或关闭超时后保留的执行会话                  |
+| `port_forward`   | `server_id, action` 及对应参数                                                     | 创建、列出、查看或关闭本地 TCP 转发                       |
+| `read_file`      | `server_id, path, offset?, limit?`                                                 | `offset=1`，`limit=2000`，最多 50 KiB 正文                |
+| `list_files`     | `server_id, path, offset?, limit?`                                                 | 目录分页，`offset=0`、`limit=200`，最多 1000 项及 50 KiB  |
+| `stat_file`      | `server_id, path`                                                                  | 查询文件或目录属性，不读取正文                            |
+| `write_file`     | `server_id, path, content, mode?, create_parents?`                                 | `mode=overwrite`；`create` 拒绝已有目标；默认不创建父目录 |
+| `edit_file`      | `server_id, path, edits`                                                           | 1–100 组 `old_text/new_text`，全部成功后提交              |
+| `remove_path`    | `server_id, path, recursive?, missing_ok?`                                         | `recursive=false`，`missing_ok=true`                      |
+| `terminal`       | `action` 及对应参数                                                                | 见终端动作表                                              |
+| `upload_file`    | `server_id, local_path, remote_path, overwrite?, request_id?`                      | 启动可恢复上传，默认不覆盖                                |
+| `download_file`  | `server_id, local_path, remote_path, overwrite?, request_id?`                      | 启动可恢复下载，默认不覆盖                                |
+| `transfer`       | `server_id, action` 及对应参数                                                     | 读取传输列表、进度和结果，或请求取消                      |
 
 标识、路径、命令和 `old_text` 不得为空；`content` 和 `new_text` 可为空。`list_files` 和 `stat_file` 通过 SFTP 查询，不要求 `exec`，各需同名权限，界面归入“文件读取”。已有显式授权列表不会自动增加这两项权限，可在服务器设置中重新勾选“文件读取”。
 
@@ -76,11 +78,15 @@
 
 启动通过本地参数校验后返回 `status=queued`、`transfer_id` 和初始元数据，随后由本地 worker 直接在磁盘与 SFTP 之间传输，不携带文件正文。远端路径、SSH 连接或提交失败可能在后台返回；只有最终 `completed` 才表示文件提交成功。
 
-| `transfer.action` | 参数                                           | 行为                                                                                                |
-| ----------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `list`            | `server_id`                                    | 返回 `transfers` 元数据列表                                                                         |
-| `read`            | `server_id, transfer_id, version?, wait_secs?` | `wait_secs` 默认 0，范围 0–30；不带版本时等待结束或超时，带当前版本时等待下一次变化，旧版本立即返回 |
-| `cancel`          | `server_id, transfer_id`                       | `cancel_requested=true` 表示接受取消；继续读取最终结果，提交阶段拒绝取消                            |
+| `transfer.action`  | 参数                                                | 行为                                                                                                |
+| ------------------ | --------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `list`             | `server_id`                                         | 返回 `transfers` 元数据列表                                                                         |
+| `read`             | `server_id, transfer_id, version?, wait_secs?`      | `wait_secs` 默认 0，范围 0–30；不带版本时等待结束或超时，带当前版本时等待下一次变化，旧版本立即返回 |
+| `cancel`           | `server_id, transfer_id`                            | `cancel_requested=true` 表示接受取消；继续读取最终结果，提交阶段拒绝取消                            |
+| `pause`            | `server_id, transfer_id`                            | 请求暂停，等待最终 `paused`                                                                         |
+| `resume` / `retry` | `server_id, transfer_id`                            | 重新校验并恢复暂停或失败任务                                                                        |
+| `configure`        | `server_id, transfer_id, priority?, bandwidth_kib?` | 调整优先级和每任务限速                                                                              |
+| `cleanup`          | `server_id, transfer_id`                            | 停止后显式清理临时文件和记录；远端清理需要删除授权                                                  |
 
 ```json
 {
@@ -92,17 +98,17 @@
 }
 ```
 
-快照包括 `status`、`phase`、`transferred_bytes`、`total_bytes`、`bytes_per_second`、`elapsed_ms`、`version`、路径和错误摘要。完成后 `bytes_per_second` 保留最后的流传输平均速度，不含审批、连接和提交耗时；空文件为 0。状态为 `queued/running/completed/failed/cancelled`；阶段包括 `preparing/awaiting_approval/transferring/committing/cancelling`。100% 字节进度仍可能正在提交，不能当成完成。`read` 可配合 MCP progress token 通知，可靠结果以返回快照为准。
+快照包括 `status`、`phase`、字节计数、速度、耗时、版本、路径和错误摘要，另有 `retry_count/next_retry_at/resumed_bytes/priority/bandwidth_kib/sha256/group_id`。完成后保留最后的流传输平均速度；空文件为 0。状态为 `queued/running/retrying/paused/completed/failed/cancelled`，阶段还包括等待审批、连接、校验和提交。100% 字节进度仍可能正在提交，不能当成完成。可靠结果以返回快照为准。
 
-每次管理操作检查服务器权限，ID 不能跨服务器访问。应用最多同时进行 4 个传输，同一目标只允许一个活动传输；完成记录保留 30 分钟，内存记录最多 1024 条，重启不恢复传输。大小上限支持 MiB/GiB 和 0（不限大小），默认沿用原配置；文本、编辑和旧式内联传输另有 256 MiB 内存保护，不能通过提高文件上限取消。生产桌面上传和下载不再使用 Base64。
+每次管理操作检查服务器权限，ID 不能跨服务器访问。默认全局运行 4 个任务，每台主机运行 2 个，其余排队；同一目标只允许一个活动任务。SQLite 持久化最多 1024 个任务，重启后中断任务恢复为暂停。成功记录保留 7 天，失败及暂停任务保留至显式清理。大小上限支持 MiB/GiB 和 0（不限大小）；文本和旧式内联传输另有 256 MiB 保护。
 
-每个传输使用固定 1 MiB 缓冲，以便 SFTP 管线化读取和写入，不把整个文件放入内存。下载先写用户指定位置旁的临时文件，落盘后提交；上传先写远端同目录临时文件，再通过 OpenSSH SFTP 原子扩展提交。失败或取消不会发布半个目标文件，清理临时文件采取尽力而为；远端断线时可能遗留隐藏临时文件。提交回复丢失时结果可能未知，应核验目标后再重试。取消可能等待正在进行的网络 I/O 超时。审批启用时上传先流式计算源文件摘要，实际上传摘要必须匹配；下载和上传都纳入适用的审批策略。
+传输使用固定文件缓冲并持久化分块摘要，失败或暂停保留临时文件用于续传。网络故障自动退避重试；源文件变化、权限或空间错误停止。恢复时校验保留块，回退未确认尾部。文件完整且通过 SHA-256 校验后才提交正式路径。上传使用 OpenSSH SFTP 原子扩展。提交结果未知时，手动重试先核验目标摘要，避免重复覆盖。审批继续生效，取消或暂停可能等待当前 I/O 超时。
 
 数据库仅保存传输参数、开始和结束时间、字节数、状态及错误摘要，不存正文、Base64 或分块。最终审计在文件提交后写入；若审计写入失败，保留实际文件结果并返回 `audit_error`。
 
 ## 命令执行
 
-`exec` 返回 `stdout`、`stderr`、`exit_code` 和 `truncated`。调用前检查 `list_servers.security.command_policy`；管道、重定向、组合命令、脚本和命令替换分别授权。高危拦截开启时，即使允许 Shell 功能，也会拒绝已知高危命令。
+`exec` 返回 `stdout`、`stderr`、`exit_code` 和 `truncated`。权限在运行时校验，命令规则可通过 `server_info(topic=commands)` 按需查看。管道、重定向、组合命令、脚本和命令替换分别授权。高危拦截开启时，即使允许 Shell 功能，也会拒绝已知高危命令。
 
 设置中的「命令超时后保留为 Job」（`exec_timeout_to_job`）默认关闭，仅影响之后启动的命令。开启且服务器独立授予 `job` 权限后，等待超时将保留同一个 SSH Session / Channel，成功返回 `job_id`、`status`、已收到的输出及 `next_stdout_cursor` / `next_stderr_cursor`。成功表示会话已保留，命令是否成功仍以最终 `exit_code` 为准。命令只执行一次，无需远端后台进程、文件或重新连接。
 
@@ -213,7 +219,7 @@ MCP `content` 仅提供原始文本；`structuredContent` 提供 `path`、`start
 
 ## 返回格式
 
-普通数据在 `content` 的单个文本块中返回 JSON；业务错误只返回一句简短文字，不复制到 `structuredContent`。`read_file` 和 `terminal.read` 的文本块只包含原始正文，分页、截断和游标信息放在 `structuredContent`，不向正文追加提示。读取文件时检查 `has_more` 和 `next_offset`；`first_line_exceeds_limit` 或 `truncated_by=scan_bytes` 时，可在已授权的情况下改用有界 `exec` 检查。
+普通数据及运行时业务错误在 `content` 的单个文本块中返回 JSON，不复制到 `structuredContent`。`read_file` 和 `terminal.read` 的文本块只包含原始正文，分页、截断和游标信息放在 `structuredContent`，不向正文追加提示。读取文件时检查 `has_more` 和 `next_offset`；`first_line_exceeds_limit` 或 `truncated_by=scan_bytes` 时，可在已授权的情况下改用有界 `exec` 检查。
 
 `isError` 表示工具调用是否失败。命令返回非零 `exit_code`、状态查询返回 `failed/cancelled/disconnected`，不等同于查询调用失败。传输进度以返回快照为准，不另发送相同的完整快照通知。
 
@@ -222,19 +228,24 @@ MCP `content` 仅提供原始文本；`structuredContent` 提供 `path`、`start
 `exec` 被命令策略拒绝时，返回精简 JSON，例如：
 
 ```json
-{"code":"COMMAND_POLICY_DENIED","details":{"command":"ls; true"},"message":"Compound commands are not allowed"}
+{
+  "code": "COMMAND_POLICY_DENIED",
+  "message": "Compound commands are not allowed",
+  "retryable": false,
+  "hint": "Review this executable or shell rule in server command settings"
+}
 ```
 
-只包含错误码、原始命令和简短英文原因，不返回完整策略、保护开关、错误链或结构化副本。原始命令保留完整内容，消息仍有界；不会截断整个 JSON。审计中的策略拒绝也不再保存整份策略配置。其他业务错误继续使用简短英文文本。
+包含错误码、简短英文原因、可重试标记和必要提示。不回显完整长命令、策略配置、保护开关或错误链。审计中保留命令和诊断，策略拒绝不保存整份策略配置。
 
-除上述 exec 策略拒绝外，业务错误使用 `isError=true`，`content[0].text` 直接用英文说明具体原因，例如 `Redirection is not allowed`、`Missing MCP permission: list_files`。不返回错误 JSON、完整命令、策略配置、权限列表或错误链。文字为单行，最多 240 个字符。删除部分完成或结果未知时，保留失败路径及简短核验提示。Schema 错误保留具体参数和预期类型，删除冗长的候选字段列表，例如 ``Invalid arguments: missing field `path` ``。
+其他运行时业务错误同样使用 `isError=true` 及精简 JSON。`message` 为单行，最多 240 个字符。必要时包含缺少的权限名；删除部分完成或结果未知时保留核验提示和部分结果字段。Schema 错误仍使用简短参数说明，删除冗长候选字段列表，例如 ``Invalid arguments: missing field `path` ``。
 
 HTTP 拒绝保持原状态码，并返回简短英文正文，例如 401 的 `Missing or invalid MCP bearer token`、403 的 `Browser-origin MCP requests are not allowed`、413 的 `Request body exceeds the configured size limit`。远端程序的 stdout/stderr、文件正文和用户提供的路径保持原样。
 
-后台传输和会话查询仍保留正常 JSON 状态字段，但其中的 `error`、`audit_error`、`last_error` 也只返回简短文字。完整诊断信息留在审计记录，包含 `code`、`stage`、`message`、`details`；界面兼容旧记录。
+后台传输和会话查询保留正常 JSON 状态字段；对象形式的 `error`、`last_error` 压缩为相同的错误 JSON，原本为字符串的错误保持简短文字。完整诊断留在审计记录，包含 `code`、`stage`、`message`、`details`。
 
 审计中的权限拒绝记录保留缺失授权及服务器开关，执行错误保留 SSH/SFTP 或系统错误码及相关操作标识。MCP 错误提示只说明缺少的授权或具体执行原因。
 
-审批超过 `list_servers.security.approval_timeout_secs`（1–120 秒，默认 120）自动拒绝，错误提示说明审批超时；用户主动拒绝时说明审批已拒绝。完整策略可从 `list_servers` 查询，不在每次错误中重复发送。
+审批超过 `server_info(topic=permissions)` 返回的 `approval_timeout_secs`（1–120 秒，默认 120）自动拒绝。用户主动拒绝时说明审批已拒绝。完整策略按需查询，不在每次错误中重复发送。
 
 编辑审批展示替换请求前 8192 个字符；删除审批展示递归与缺失处理选项。完整请求绑定到单次审批。审计不保存直接文件正文、编辑原文、新文本或 diff，但会保存命令及其有界输出。完整策略见 [安全控制](SECURITY_CONTROLS.md)。

@@ -68,33 +68,33 @@ npm run test:e2e
 
 ## 代码结构
 
-| 路径                                             | 职责                                     |
-| ------------------------------------------------ | ---------------------------------------- |
-| `src/App.tsx`                                    | 工作区与页面导航                         |
-| `src/components/`                                | 服务器、文件、终端、审批、审计与设置界面 |
-| `src/components/ui/`                             | shadcn/ui 基础组件                       |
-| `src/tests/`                                    | 前端界面测试，统一存放 `*.test.tsx`，运行 `npm run test:ui` |
-| `src/api.ts`                                     | Tauri IPC 与浏览器演示                   |
-| `src/theme-tokens.css`                           | 亮暗主题与语义颜色                       |
-| `src/styles.css`、`src/fluent.css`               | 布局与组件样式                           |
-| `src-tauri/src/model.rs`                         | 配置、设置与操作数据类型                 |
-| `src-tauri/src/database.rs`、`schema.sql`        | SQLite 持久化与当前表结构                |
-| `src-tauri/src/state.rs`                         | 共享状态、权限校验、执行入口和审计       |
-| `src-tauri/src/jobs.rs`                          | 本地 SSH 执行 worker、Job 缓冲与生命周期 |
-| `src-tauri/src/tunnels.rs`                       | SSH 本地 TCP 转发、连接限额与生命周期    |
-| `src-tauri/src/mcp.rs`、`mcp_args.rs`            | MCP 服务、工具路由与参数 Schema          |
-| `src-tauri/src/mcp_response.rs`                  | MCP JSON 与原始正文返回封装              |
-| `src-tauri/src/operation_error.rs`               | 通用错误分类、阶段、消息及诊断详情       |
-| `src-tauri/src/clients.rs`                       | 客户端配置检测、备份和写入               |
-| `src-tauri/src/ssh.rs`、`terminal.rs`            | SSH / SFTP 与 PTY 会话                   |
-| `src-tauri/src/file_tools.rs`、`safe_remove.rs`  | 文本读写编辑与删除预检                   |
-| `src-tauri/src/security.rs`、`command_policy.rs` | 只读保护、审批与命令策略                 |
-| `src-tauri/src/lib.rs`                           | 桌面命令、窗口和托盘入口                 |
-| `src-tauri/tests/`、`scripts/integration.mjs`    | 后端与协议测试                           |
+| 路径                                             | 职责                                                        |
+| ------------------------------------------------ | ----------------------------------------------------------- |
+| `src/App.tsx`                                    | 工作区与页面导航                                            |
+| `src/components/`                                | 服务器、文件、终端、审批、审计与设置界面                    |
+| `src/components/ui/`                             | shadcn/ui 基础组件                                          |
+| `src/tests/`                                     | 前端界面测试，统一存放 `*.test.tsx`，运行 `npm run test:ui` |
+| `src/api.ts`                                     | Tauri IPC 与浏览器演示                                      |
+| `src/theme-tokens.css`                           | 亮暗主题与语义颜色                                          |
+| `src/styles.css`、`src/fluent.css`               | 布局与组件样式                                              |
+| `src-tauri/src/model.rs`                         | 配置、设置与操作数据类型                                    |
+| `src-tauri/src/database.rs`、`schema.sql`        | SQLite 持久化与当前表结构                                   |
+| `src-tauri/src/state.rs`                         | 共享状态、权限校验、执行入口和审计                          |
+| `src-tauri/src/jobs.rs`                          | 本地 SSH 执行 worker、Job 缓冲与生命周期                    |
+| `src-tauri/src/tunnels.rs`                       | SSH 本地 TCP 转发、连接限额与生命周期                       |
+| `src-tauri/src/mcp.rs`、`mcp_args.rs`            | MCP 服务、工具路由与参数 Schema                             |
+| `src-tauri/src/mcp_response.rs`                  | MCP JSON 与原始正文返回封装                                 |
+| `src-tauri/src/operation_error.rs`               | 通用错误分类、阶段、消息及诊断详情                          |
+| `src-tauri/src/clients.rs`                       | 客户端配置检测、备份和写入                                  |
+| `src-tauri/src/ssh.rs`、`terminal.rs`            | SSH / SFTP 与 PTY 会话                                      |
+| `src-tauri/src/file_tools.rs`、`safe_remove.rs`  | 文本读写编辑与删除预检                                      |
+| `src-tauri/src/security.rs`、`command_policy.rs` | 只读保护、审批与命令策略                                    |
+| `src-tauri/src/lib.rs`                           | 桌面命令、窗口和托盘入口                                    |
+| `src-tauri/tests/`、`scripts/integration.mjs`    | 后端与协议测试                                              |
 
 桌面 IPC 和 MCP 请求共用后端操作入口，依次校验服务器状态、权限和安全策略，再执行 SSH 操作并记录审计。浏览器演示与真实工作区隔离。
 
-表结构集中保存在 `schema.sql`，应用初始化和协议测试共用，当前版本为 SQLite schema v3，支持从 v2 自动升级，新增每台服务器的登录 PATH 与同步时间。修改数据库格式时应明确版本边界，避免静默创建空工作区或改变已有权限。
+表结构集中保存在 `schema.sql`，应用初始化和协议测试共用。当前为 SQLite schema v4，支持从 v2/v3 自动升级，包含登录 PATH 缓存及持久化传输任务和检查点。修改数据库格式时应明确版本边界，避免静默创建空工作区或改变已有权限。
 
 ## 贡献约定
 

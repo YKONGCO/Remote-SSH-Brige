@@ -22,9 +22,11 @@ pub struct RuntimeSettings {
     pub local_download_roots: Vec<String>,
     pub connect_timeout_secs: u64,
     pub io_timeout_secs: u64,
+    pub handshake_timeout_secs: u64,
     pub command_timeout_secs: u64,
     pub exec_timeout_to_job: bool,
     pub max_terminals: usize,
+    pub transfers: crate::transfers::TransferSettings,
 }
 impl Default for RuntimeSettings {
     fn default() -> Self {
@@ -42,9 +44,11 @@ impl Default for RuntimeSettings {
             local_download_roots: vec![],
             connect_timeout_secs: 8,
             io_timeout_secs: 15,
+            handshake_timeout_secs: 15,
             command_timeout_secs: 30,
             exec_timeout_to_job: false,
             max_terminals: 32,
+            transfers: crate::transfers::TransferSettings::default(),
         }
     }
 }
@@ -79,6 +83,7 @@ impl RuntimeSettings {
         policy
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.transfers.validate()?;
         if let Some(policy) = &self.command_policy {
             policy.validate()?;
         }
@@ -115,6 +120,10 @@ impl RuntimeSettings {
         anyhow::ensure!(
             (1..=120).contains(&self.connect_timeout_secs),
             "Connection timeout must be 1-120 seconds"
+        );
+        anyhow::ensure!(
+            (1..=120).contains(&self.handshake_timeout_secs),
+            "Handshake timeout must be 1-120 seconds"
         );
         anyhow::ensure!(
             (1..=300).contains(&self.io_timeout_secs)
@@ -407,6 +416,10 @@ pub struct Operation {
     pub transfer_request: Option<crate::transfers::TransferSpec>,
     pub transfer_id: String,
     pub transfer_action: String,
+    pub priority: Option<i32>,
+    pub bandwidth_kib: Option<u64>,
+    pub request_id: Option<String>,
+    pub transfer_group: Option<String>,
     pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_request: Option<FileRequest>,

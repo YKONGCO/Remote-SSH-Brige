@@ -296,6 +296,7 @@ export async function api<T = unknown>(
       download_limit_mib: [0, MAX_TRANSFER_MIB],
       connect_timeout_secs: [1, 120],
       io_timeout_secs: [1, 300],
+      handshake_timeout_secs: [1, 120],
       command_timeout_secs: [1, 300],
       max_terminals: [1, 64],
     };

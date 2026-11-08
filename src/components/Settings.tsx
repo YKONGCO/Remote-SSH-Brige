@@ -5,6 +5,7 @@ import type {
   NumericRuntimeSetting,
 } from "../runtime-settings";
 import {
+  defaultTransferSettings,
   effectiveCommandPolicy,
   commandMode,
   advancedShell,
@@ -185,6 +186,37 @@ export function Settings() {
             {n} {unit}
           </option>
         ))}
+      </SelectField>
+    );
+  }
+  function transferSelect(
+    name: keyof typeof defaultTransferSettings,
+    label: string,
+    values: number[],
+    unit: string,
+  ) {
+    const current = runtime?.transfers?.[name] ?? defaultTransferSettings[name];
+    return (
+      <SelectField
+        className="setting-select"
+        aria-label={label}
+        disabled={!runtime || saving}
+        value={String(current)}
+        onValueChange={(value) =>
+          void updateRuntime("transfers", {
+            ...defaultTransferSettings,
+            ...runtime?.transfers,
+            [name]: Number(value),
+          })
+        }
+      >
+        {[...new Set([...values, current])]
+          .sort((a, b) => a - b)
+          .map((n) => (
+            <option key={n} value={n}>
+              {n} {unit}
+            </option>
+          ))}
       </SelectField>
     );
   }
@@ -499,7 +531,21 @@ export function Settings() {
               "秒",
             )}
           </Row>
-          <Row title="读写超时" description="SSH 连接与传输的单次等待上限。">
+          <Row
+            title="握手超时"
+            description="等待 SSH 握手与服务器横幅的最长时间。"
+          >
+            {runtimeSelect(
+              "handshake_timeout_secs",
+              "握手超时",
+              [5, 15, 30, 60, 120],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="读写超时"
+            description="普通 SSH 操作的单次等待上限，文件传输使用下方独立设置。"
+          >
             {runtimeSelect(
               "io_timeout_secs",
               "读写超时",
@@ -544,6 +590,66 @@ export function Settings() {
       <section className="settings-section">
         <h2 className="settings-group-title">远程文件</h2>
         <div className="settings-card">
+          <Row title="同时传输任务数" description="其余任务自动排队。">
+            {transferSelect(
+              "max_concurrent",
+              "同时传输任务数",
+              [1, 2, 4, 8, 16],
+              "个",
+            )}
+          </Row>
+          <Row
+            title="每台服务器并发"
+            description="同一主机的别名共享并发限制。"
+          >
+            {transferSelect(
+              "per_server_concurrent",
+              "每台服务器并发",
+              [1, 2, 4, 8],
+              "个",
+            )}
+          </Row>
+          <Row
+            title="自动重试次数"
+            description="网络中断后退避重试；权限或文件变化错误会停止。"
+          >
+            {transferSelect(
+              "max_retries",
+              "自动重试次数",
+              [0, 1, 3, 5, 10],
+              "次",
+            )}
+          </Row>
+          <Row title="传输 I/O 超时" description="单次读写等待时间。">
+            {transferSelect(
+              "io_timeout_secs",
+              "传输 I/O 超时",
+              [5, 15, 30, 60, 120, 300],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="传输无进度超时"
+            description="持续有进展的大文件传输不受总耗时限制。"
+          >
+            {transferSelect(
+              "idle_timeout_secs",
+              "传输无进度超时",
+              [15, 30, 60, 120, 300, 600],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="默认传输限速"
+            description="每个任务的默认速度上限，0 表示不限。"
+          >
+            {transferSelect(
+              "bandwidth_kib",
+              "默认传输限速",
+              [0, 128, 512, 1024, 4096, 16384],
+              "KiB/s",
+            )}
+          </Row>
           <Row title="显示隐藏文件" description="显示 .ssh 等以点开头的文件。">
             {toggle("showHidden", "显示隐藏文件")}
           </Row>

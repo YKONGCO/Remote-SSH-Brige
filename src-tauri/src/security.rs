@@ -60,10 +60,25 @@ pub(crate) fn check_diagnostic_words(words: &[String]) -> Result<()> {
     // These otherwise diagnostic tools also expose mutating options.
     anyhow::ensure!(
         executable != "date"
-            || words
-                .iter()
-                .skip(1)
-                .all(|s| s == "-u" || s == "--utc" || s == "--iso-8601" || s.starts_with("+")),
+            || words.iter().skip(1).all(|s| matches!(
+                s.as_str(),
+                "-u" | "--utc"
+                    | "--universal"
+                    | "-I"
+                    | "-Id"
+                    | "-Ih"
+                    | "-Im"
+                    | "-Is"
+                    | "-Ins"
+                    | "--iso-8601"
+                    | "--iso-8601=date"
+                    | "--iso-8601=hours"
+                    | "--iso-8601=minutes"
+                    | "--iso-8601=seconds"
+                    | "--iso-8601=ns"
+                    | "-R"
+                    | "--rfc-email"
+            ) || s.starts_with("+")),
         "date may only query or format time"
     );
     anyhow::ensure!(

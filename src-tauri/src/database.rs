@@ -156,10 +156,10 @@ impl Database {
         let mut connection = Connection::open(database_path).context("无法打开 SQLite 数据库")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 3 {
+        if version > 4 {
             bail!("数据库版本较新，请使用新版应用打开")
         }
-        if version != 0 && version != 2 && version != 3 {
+        if version != 0 && version != 2 && version != 3 && version != 4 {
             bail!("不再支持此数据库版本，请先使用旧版应用升级至 SQLite 版本 2")
         }
         if version == 0 {
@@ -183,7 +183,7 @@ impl Database {
             transaction.execute_batch("ALTER TABLE servers ADD COLUMN login_path TEXT; ALTER TABLE servers ADD COLUMN login_path_synced_at TEXT;")?;
         }
         transaction.execute_batch(include_str!("schema.sql"))?;
-        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.pragma_update(None, "user_version", 4)?;
         transaction.commit().context("SQLite 初始化提交失败")?;
         Ok(Self { connection })
     }
@@ -193,6 +193,22 @@ impl Database {
         ))?;
         let rows = statement.query_map([], server_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn save_transfer(&self, id: &str, record: &serde_json::Value) -> Result<()> {
+        self.connection.execute("INSERT INTO transfer_tasks(id,updated_at,record_json) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,record_json=excluded.record_json", params![id, chrono::Utc::now().to_rfc3339(), record.to_string()])?;
+        Ok(())
+    }
+    pub fn transfers(&self) -> Result<Vec<serde_json::Value>> {
+        let mut query = self.connection.prepare(
+            "SELECT record_json FROM transfer_tasks ORDER BY updated_at DESC LIMIT 1024",
+        )?;
+        let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+    pub fn delete_transfer(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM transfer_tasks WHERE id=?1", [id])?;
+        Ok(())
     }
     pub fn save_server(&mut self, server: &Server) -> Result<()> {
         let transaction = self.connection.transaction()?;

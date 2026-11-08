@@ -836,7 +836,7 @@ fn json_workspaces_are_rejected_without_creating_a_database_or_changing_files() 
 
 #[test]
 fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
-    for version in [0, 1, 4] {
+    for version in [0, 1, 5] {
         let dir = workspace();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remote-desk.sqlite3");

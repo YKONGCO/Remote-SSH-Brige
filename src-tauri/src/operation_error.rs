@@ -35,6 +35,21 @@ pub fn error(code: &'static str, message: &'static str) -> anyhow::Error {
     }
     .into()
 }
+
+/// Only transport failures may be replayed. Never replay an uncertain mutation.
+pub fn retryable(error: &anyhow::Error) -> bool {
+    match error_code(error) {
+        "SSH_TIMEOUT" | "IO_TIMEOUT" | "CONNECTION_LOST" | "CONNECTION_REFUSED" => true,
+        "SSH_CONNECT_FAILED" => true,
+        "SSH_ERROR" => error.downcast_ref::<ssh2::Error>().is_some_and(|e| {
+            matches!(
+                e.code(),
+                ssh2::ErrorCode::Session(-2 | -3 | -13 | -26 | -43 | -7)
+            )
+        }),
+        _ => false,
+    }
+}
 pub fn error_with_details(
     code: &'static str,
     message: &'static str,
@@ -77,6 +92,8 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
             std::io::ErrorKind::PermissionDenied => "PERMISSION_DENIED",
             std::io::ErrorKind::AlreadyExists => "ALREADY_EXISTS",
             std::io::ErrorKind::TimedOut => "IO_TIMEOUT",
+            std::io::ErrorKind::StorageFull => "NO_SPACE",
+            std::io::ErrorKind::QuotaExceeded => "QUOTA_EXCEEDED",
             std::io::ErrorKind::ConnectionRefused => "CONNECTION_REFUSED",
             std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
                 "CONNECTION_LOST"
@@ -93,6 +110,10 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
         "NOT_FOUND",
         "PERMISSION_DENIED",
         "SERVER_DISABLED",
+        "IO_TIMEOUT",
+        "CHECKSUM_MISMATCH",
+        "TRANSFER_PAUSED",
+        "COMMIT_STATUS_UNKNOWN",
     ] {
         if error
             .chain()

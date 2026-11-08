@@ -6,6 +6,22 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct EmptyArgs {}
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServerInfoArgs {
+    pub server_id: String,
+    #[serde(default)]
+    pub topic: ServerInfoTopic,
+}
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerInfoTopic {
+    #[default]
+    Permissions,
+    Transfers,
+    Commands,
+}
+
 macro_rules! args {
     ($name:ident { $($(#[$attr:meta])* $field:ident: $ty:ty),* $(,)? }) => {
         #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -104,62 +120,103 @@ args!(TransferStartArgs {
     remote_path: String,
     /// Default false. Replace the destination only after the complete transfer succeeds.
     overwrite: Option<bool>,
+    /// Optional retry-safe request identifier.
+    request_id: Option<String>,
 });
-into_op!(TransferStartArgs, a, { transfer_request: Some(crate::transfers::TransferSpec {local_path:a.local_path,remote_path:a.remote_path,overwrite:a.overwrite.unwrap_or(false),size:None,sha256:None}) });
+into_op!(TransferStartArgs, a, { request_id:a.request_id, transfer_request: Some(crate::transfers::TransferSpec {local_path:a.local_path,remote_path:a.remote_path,overwrite:a.overwrite.unwrap_or(false),size:None,sha256:None,create_parents:false,skip_existing:false,directory:false}) });
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(extend("type" = "object"))]
 pub enum TransferArgs {
     List {
-        #[schemars(length(min = 1, max = 128))]
         server_id: String,
     },
     Read {
-        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        #[schemars(length(min = 1, max = 128))]
         transfer_id: String,
         version: Option<u64>,
         #[schemars(range(max = 30))]
         wait_secs: Option<u64>,
     },
     Cancel {
-        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        #[schemars(length(min = 1, max = 128))]
         transfer_id: String,
+    },
+    Pause {
+        server_id: String,
+        transfer_id: String,
+    },
+    Resume {
+        server_id: String,
+        transfer_id: String,
+    },
+    Retry {
+        server_id: String,
+        transfer_id: String,
+    },
+    Cleanup {
+        server_id: String,
+        transfer_id: String,
+    },
+    Configure {
+        server_id: String,
+        transfer_id: String,
+        #[schemars(range(min=-10,max=10))]
+        priority: Option<i32>,
+        #[schemars(range(max = 1048576))]
+        bandwidth_kib: Option<u64>,
     },
 }
 impl From<TransferArgs> for Operation {
     fn from(a: TransferArgs) -> Self {
         let mut op = Self::default();
-        match a {
-            TransferArgs::List { server_id } => {
-                op.server_id = server_id;
-                op.transfer_action = "list".into();
-            }
+        let (server, id, action) = match a {
+            TransferArgs::List { server_id } => (server_id, String::new(), "list"),
             TransferArgs::Read {
                 server_id,
                 transfer_id,
                 version,
                 wait_secs,
             } => {
-                op.server_id = server_id;
-                op.transfer_id = transfer_id;
                 op.version = version;
                 op.wait_secs = wait_secs.unwrap_or(0);
-                op.transfer_action = "read".into();
+                (server_id, transfer_id, "read")
             }
             TransferArgs::Cancel {
                 server_id,
                 transfer_id,
+            } => (server_id, transfer_id, "cancel"),
+            TransferArgs::Pause {
+                server_id,
+                transfer_id,
+            } => (server_id, transfer_id, "pause"),
+            TransferArgs::Resume {
+                server_id,
+                transfer_id,
+            } => (server_id, transfer_id, "resume"),
+            TransferArgs::Retry {
+                server_id,
+                transfer_id,
+            } => (server_id, transfer_id, "retry"),
+            TransferArgs::Cleanup {
+                server_id,
+                transfer_id,
+            } => (server_id, transfer_id, "cleanup"),
+            TransferArgs::Configure {
+                server_id,
+                transfer_id,
+                priority,
+                bandwidth_kib,
             } => {
-                op.server_id = server_id;
-                op.transfer_id = transfer_id;
-                op.transfer_action = "cancel".into();
+                op.priority = priority;
+                op.bandwidth_kib = bandwidth_kib;
+                (server_id, transfer_id, "configure")
             }
-        }
+        };
+        op.server_id = server;
+        op.transfer_id = id;
+        op.transfer_action = action.into();
         op
     }
 }

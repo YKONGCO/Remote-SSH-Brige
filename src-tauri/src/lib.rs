@@ -14,6 +14,8 @@ pub mod security;
 pub mod ssh;
 pub mod state;
 pub mod terminal;
+pub mod transfer_batch;
+pub(crate) mod transfer_io;
 pub mod transfers;
 pub mod tunnels;
 
@@ -158,6 +160,9 @@ mod desktop {
             overwrite: true,
             size: None,
             sha256: None,
+            create_parents: false,
+            skip_existing: false,
+            directory: false,
         };
         transfers::start(
             state.inner().clone(),
@@ -209,6 +214,9 @@ mod desktop {
             overwrite: false,
             size: None,
             sha256: None,
+            create_parents: false,
+            skip_existing: false,
+            directory: false,
         };
         transfers::start(
             state.inner().clone(),
@@ -232,6 +240,8 @@ mod desktop {
         transfer_id: Option<String>,
         version: Option<u64>,
         wait_secs: Option<u64>,
+        priority: Option<i32>,
+        bandwidth_kib: Option<u64>,
     ) -> Result<serde_json::Value, String> {
         state
             .transfers
@@ -244,11 +254,96 @@ mod desktop {
                     transfer_id: transfer_id.unwrap_or_default(),
                     version,
                     wait_secs: wait_secs.unwrap_or(0),
+                    priority,
+                    bandwidth_kib,
                     ..Default::default()
                 },
                 "desktop",
             )
             .await
+            .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn pick_transfer_batch(
+        state: Shared<'_>,
+        window: tauri::WebviewWindow,
+        server_id: String,
+        remote_path: String,
+        direction: String,
+        directory: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        use tauri_plugin_dialog::DialogExt;
+        let upload = direction == "upload";
+        if !upload && direction != "download" {
+            return Err("Invalid transfer direction".into());
+        }
+        let selected =
+            tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, String> {
+                let dialog = window.dialog().file().set_parent(&window);
+                let paths = if directory || !upload {
+                    dialog.blocking_pick_folder().map(|p| vec![p])
+                } else {
+                    dialog.blocking_pick_files()
+                };
+                paths
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.into_path().map_err(|e| e.to_string()))
+                    .collect()
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let mut items = Vec::new();
+        for path in selected {
+            let name = if upload {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or("Invalid filename")?
+                    .to_owned()
+            } else {
+                remote_path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                    .ok_or("Invalid remote directory name")?
+                    .to_owned()
+            };
+            if name.contains(['\\', '/', '\0']) {
+                return Err("Invalid filename".into());
+            }
+            items.push(transfer_batch::BatchItem {
+                local_path: if upload {
+                    path.to_string_lossy().into_owned()
+                } else {
+                    path.join(&name).to_string_lossy().into_owned()
+                },
+                remote_path: if upload {
+                    format!("{}/{}", remote_path.trim_end_matches('/'), name)
+                } else {
+                    remote_path.clone()
+                },
+            });
+        }
+        let args = transfer_batch::BatchArgs {
+            server_id,
+            direction: if upload {
+                transfer_batch::Direction::Upload
+            } else {
+                transfer_batch::Direction::Download
+            },
+            items,
+            recursive: directory,
+            overwrite: false,
+            skip_existing: true,
+            request_id: None,
+        };
+        transfer_batch::start(state.inner().clone(), args, "desktop")
+            .await
+            .map(Some)
             .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
@@ -501,6 +596,7 @@ mod desktop {
                 upload_file,
                 pick_local_directories,
                 transfer,
+                pick_transfer_batch,
                 reveal_transfer,
                 mcp_clients,
                 configure_mcp_client,
@@ -526,7 +622,7 @@ mod desktop {
             .run(|app, event| {
                 if matches!(event, tauri::RunEvent::Exit) {
                     app.state::<Arc<state::AppState>>().jobs.close_all();
-                    app.state::<Arc<state::AppState>>().transfers.cancel_all();
+                    app.state::<Arc<state::AppState>>().transfers.pause_all();
                     app.state::<Arc<state::AppState>>().tunnels.stop_all();
                 }
             });

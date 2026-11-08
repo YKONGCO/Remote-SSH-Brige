@@ -6,6 +6,28 @@ use remote_ssh_brige_lib::{
 use std::sync::Arc;
 
 #[test]
+fn iso_time_queries_are_allowed_but_time_mutations_stay_blocked() {
+    let settings = RuntimeSettings::default();
+    for command in ["date -Is", "date --iso-8601=seconds", "date -u +%FT%TZ"] {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_ok(),
+            "{command}"
+        );
+    }
+    for command in [
+        "date -s now",
+        "date --set=tomorrow",
+        "date -Is -s now",
+        "date 010100002026",
+    ] {
+        assert!(
+            security::check_command_with_settings(command, &settings).is_err(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn shell_defaults_and_trusted_paths_have_explicit_rules() {
     use remote_ssh_brige_lib::model::{default_allowed_commands, CommandPolicy};
     let mut settings = RuntimeSettings {

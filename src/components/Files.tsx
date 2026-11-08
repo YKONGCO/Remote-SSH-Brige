@@ -331,6 +331,38 @@ export function Files({
           <Upload size={15} />
           上传
         </Button>
+        {desktop &&
+          [false, true].map((directory) => (
+            <Button
+              key={String(directory)}
+              variant="outline"
+              size="sm"
+              className="btn"
+              disabled={security?.remote_read_only}
+              onClick={() =>
+                void api<{
+                  tasks: unknown[];
+                  queued?: number;
+                  rejected?: number;
+                } | null>("pick_transfer_batch", {
+                  serverId: server.id,
+                  remotePath: path,
+                  direction: "upload",
+                  directory,
+                })
+                  .then((batch) => {
+                    if (batch)
+                      notify(
+                        `已提交 ${batch.queued ?? batch.tasks.length} 个传输任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
+                        !!batch.rejected,
+                      );
+                  })
+                  .catch((e) => notify(String(e), true))
+              }
+            >
+              {directory ? "上传文件夹" : "批量上传"}
+            </Button>
+          ))}
         {!desktop && (
           <input
             hidden
@@ -445,6 +477,36 @@ export function Files({
                           className="icon-btn"
                           title="下载"
                           onClick={() => void download(e)}
+                        >
+                          <Download size={15} />
+                        </Button>
+                      )}
+                      {desktop && e.is_dir && !e.is_symlink && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="icon-btn"
+                          title="下载文件夹"
+                          onClick={() =>
+                            void api<{
+                              tasks: unknown[];
+                              queued?: number;
+                              rejected?: number;
+                            } | null>("pick_transfer_batch", {
+                              serverId: server.id,
+                              remotePath: e.path,
+                              direction: "download",
+                              directory: true,
+                            })
+                              .then((batch) => {
+                                if (batch)
+                                  notify(
+                                    `已提交 ${batch.queued ?? batch.tasks.length} 个下载任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
+                                    !!batch.rejected,
+                                  );
+                              })
+                              .catch((err) => notify(String(err), true))
+                          }
                         >
                           <Download size={15} />
                         </Button>

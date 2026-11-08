@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { runRecoveryChecks } from "./transfer-recovery-checks.mjs";
 
 export async function runTransferChecks({
   binary,
@@ -79,7 +80,7 @@ export async function runTransferChecks({
     }),
   );
   db.close();
-  const proc = spawn(binary, [dir, "18930"], {
+  let proc = spawn(binary, [dir, "18930"], {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -95,9 +96,9 @@ export async function runTransferChecks({
   const status = JSON.parse(
     stderr.split("\n").find((l) => l.includes('"token"')),
   );
-  const client = new Client({ name: "streamed-file-tests", version: "1" });
+  let client = new Client({ name: "streamed-file-tests", version: "1" });
   const url = new URL(`http://127.0.0.1:${status.port}/mcp`);
-  const transport = new StreamableHTTPClientTransport(url, {
+  let transport = new StreamableHTTPClientTransport(url, {
     requestInit: { headers: { Authorization: "Bearer " + status.token } },
   });
   const call = async (name, args) =>
@@ -151,14 +152,18 @@ export async function runTransferChecks({
       name: "list_servers",
       arguments: {},
     });
-    const protectedServer = JSON.parse(discovered.content[0].text).find(
-      (s) => s.id === "delete-protected",
+    const protectedServer = JSON.parse(
+      (
+        await client.callTool({
+          name: "server_info",
+          arguments: { server_id: "delete-protected", topic: "permissions" },
+        })
+      ).content[0].text,
     );
     check(
       "Deletion protection hides effective MCP deletion permission",
-      protectedServer.security.deletion_protection &&
-        !protectedServer.mcp_permissions.includes("remove_path") &&
-        protectedServer.security.deletion_protection_scope === "sftp_remove",
+      protectedServer.deletion_protection &&
+        !protectedServer.mcp_permissions.includes("remove_path"),
     );
     const tools = await client.listTools();
     check(
@@ -459,9 +464,11 @@ export async function runTransferChecks({
       overwrite: true,
     });
     check(
-      "Disconnect fails without publishing a partial local file",
-      (await wait(disconnected.transfer_id)).status === "failed" &&
-        (await readFile(destination, "utf8")) === "replacement",
+      "Disconnect retries and commits the complete local file",
+      (await wait(disconnected.transfer_id)).status === "completed" &&
+        (await readFile(destination)).equals(
+          entries.get("/workspace/stream-slow.bin"),
+        ),
     );
     fixture.rejectCommit = true;
     await writeFile(small, "THIS_REPLACEMENT_MUST_NOT_BE_COMMITTED");
@@ -478,11 +485,51 @@ export async function runTransferChecks({
     );
     fixture.rejectCommit = false;
     check(
-      "Remote upload temporary files are cleaned up",
-      ![...entries.keys()].some((k) =>
-        k.startsWith("/workspace/.remote-ssh-brige-"),
-      ),
+      "Failed upload retains only its task-owned temporary file for retry",
+      [...entries.keys()]
+        .filter((k) => k.startsWith("/workspace/.remote-ssh-brige-"))
+        .every((k) => k.includes(failedUpload.transfer_id)),
     );
+    await runRecoveryChecks({
+      value,
+      wait,
+      entries,
+      fixture,
+      uploads,
+      downloads,
+      check,
+      restart: async () => {
+        await client.close();
+        const exited = new Promise((r) => proc.once("exit", r));
+        proc.kill();
+        await exited;
+        let log = "";
+        proc = spawn(binary, [dir, "18930"], {
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        proc.stderr.on("data", (b) => (log += b));
+        proc.on("error", (e) => (log += e.message));
+        const until = Date.now() + 15000;
+        while (!log.includes('"token"')) {
+          assert.ok(
+            proc.exitCode === null && Date.now() < until,
+            "Restart failed: " + log,
+          );
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const restarted = JSON.parse(
+          log.split("\n").find((l) => l.includes('"token"')),
+        );
+        client = new Client({ name: "restarted-transfer-tests", version: "1" });
+        transport = new StreamableHTTPClientTransport(url, {
+          requestInit: {
+            headers: { Authorization: "Bearer " + restarted.token },
+          },
+        });
+        await client.connect(transport);
+      },
+    });
     await new Promise((r) => setTimeout(r, 100));
     const audit = new DatabaseSync(databasePath, { readOnly: true });
     const logs = audit
