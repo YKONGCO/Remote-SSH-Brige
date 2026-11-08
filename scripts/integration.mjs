@@ -57,7 +57,7 @@ const fixture = {
   transferReadDelay: 0,
   transferWriteDelay: 0,
   dropTransferRead: false,
-  dropTransferReadAfter: 0,
+  transferReadGate: null,
   dropTransferWriteAfter: 0,
 };
 const canonical = (p) => (p === "/" ? "/" : p.replace(/\/+$/, ""));
@@ -248,14 +248,6 @@ const ssh = new Server(
             makeHandle(id, { path: p });
           });
           channel.on("READ", (id, h, offset, length) => {
-            if (
-              fixture.dropTransferReadAfter &&
-              offset >= fixture.dropTransferReadAfter
-            ) {
-              fixture.dropTransferReadAfter = 0;
-              client.end();
-              return;
-            }
             const handle = handles.get(h.toString("hex"));
             if (!handle) return fail(id);
             const bytes = entries.get(handle.path);
@@ -269,9 +261,21 @@ const ssh = new Server(
               if (!channel.destroyed)
                 channel.data(id, bytes.subarray(offset, offset + length));
             };
-            if (fixture.transferReadDelay)
-              setTimeout(reply, fixture.transferReadDelay);
-            else reply();
+            const send = () => {
+              if (fixture.transferReadDelay)
+                setTimeout(reply, fixture.transferReadDelay);
+              else reply();
+            };
+            if (
+              fixture.transferReadGate?.hold({
+                path: handle.path,
+                offset,
+                client,
+                reply: send,
+              })
+            )
+              return;
+            send();
           });
           channel.on("WRITE", (id, h, offset, data) => {
             if (
@@ -554,8 +558,12 @@ const transport = new StreamableHTTPClientTransport(url, {
   requestInit: { headers: { Authorization: "Bearer " + status.token } },
 });
 const checks = [];
-const check = (label, value) => {
-  assert.ok(value, label);
+let failure;
+const check = (label, value, diagnostics) => {
+  assert.ok(
+    value,
+    diagnostics ? `${label}\n${JSON.stringify(diagnostics)}` : label,
+  );
   checks.push(label);
   console.log("PASS " + label);
 };
@@ -1770,19 +1778,29 @@ try {
     fixture,
     check,
   });
-  await writeFile(
-    resolve(work, "report.json"),
-    JSON.stringify({ passed: checks.length, checks }, null, 2),
-  );
   console.log(
     "\n" +
       checks.length +
       " protocol integration checks passed. Report: " +
       work,
   );
+} catch (error) {
+  failure = { message: error.message, stack: error.stack };
+  throw error;
 } finally {
-  await mcp.close().catch(() => {});
-  proc.kill();
-  for (const client of clients) client.end();
-  await new Promise((r) => ssh.close(r));
+  try {
+    await writeFile(
+      resolve(work, "report.json"),
+      JSON.stringify(
+        { passed: checks.length, checks, ...(failure ? { failure } : {}) },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await mcp.close().catch(() => {});
+    proc.kill();
+    for (const client of clients) client.end();
+    await new Promise((r) => ssh.close(r));
+  }
 }

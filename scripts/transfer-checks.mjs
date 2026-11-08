@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { runRecoveryChecks } from "./transfer-recovery-checks.mjs";
+import { createTransferReadGate } from "./transfer-read-gate.mjs";
 
 export async function runTransferChecks({
   binary,
@@ -420,9 +421,12 @@ export async function runTransferChecks({
       "/workspace/stream-slow.bin",
       Buffer.alloc(2 * 1024 * 1024, 0x5a),
     );
-    // Keep the transfer active beyond the 200 ms progress publication interval;
-    // otherwise the first nonzero snapshot can already be entering commit.
-    fixture.transferReadDelay = 150;
+    // A gated tail prevents fast CI workers from committing before cancellation.
+    const cancelGate = createTransferReadGate(
+      "/workspace/stream-slow.bin",
+      1024 * 1024,
+    );
+    fixture.transferReadGate = cancelGate;
     const cancelled = await value("download_file", {
       local_path: destination,
       remote_path: "/workspace/stream-slow.bin",
@@ -438,6 +442,7 @@ export async function runTransferChecks({
         running.version > cancelled.version &&
         running.transferred_bytes > 0,
     );
+    await cancelGate.waitUntilBlocked();
     check(
       "Cancel acknowledges the request",
       (
@@ -447,6 +452,8 @@ export async function runTransferChecks({
         })
       ).cancel_requested,
     );
+    fixture.transferReadGate = null;
+    cancelGate.release();
     check(
       "Cancelled download preserves the original local destination",
       (await wait(cancelled.transfer_id)).status === "cancelled" &&
@@ -498,6 +505,18 @@ export async function runTransferChecks({
       uploads,
       downloads,
       check,
+      readCheckpoint: (id) => {
+        const db = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          db.exec("PRAGMA busy_timeout=5000");
+          const row = db
+            .prepare("SELECT record_json FROM transfer_tasks WHERE id=?")
+            .get(id);
+          return row ? JSON.parse(row.record_json).checkpoint.hashes.length : 0;
+        } finally {
+          db.close();
+        }
+      },
       restart: async () => {
         await client.close();
         const exited = new Promise((r) => proc.once("exit", r));
@@ -560,6 +579,8 @@ export async function runTransferChecks({
     fixture.transferReadDelay = 0;
     fixture.transferWriteDelay = 0;
     fixture.dropTransferRead = false;
+    fixture.transferReadGate?.release();
+    fixture.transferReadGate = null;
     fixture.rejectCommit = false;
     await client.close().catch(() => {});
     proc.kill();

@@ -17,7 +17,7 @@
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
     "build:headless": "cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --bin remote-ssh-brige-headless",
-    "test:e2e": "node scripts/integration.mjs",
+    "test:e2e": "node --test scripts/transfer-read-gate.test.mjs && node scripts/integration.mjs",
     "test:ui": "vitest run",
     "format": "prettier --write src scripts/integration.mjs vite.config.ts README.md docs"
   },

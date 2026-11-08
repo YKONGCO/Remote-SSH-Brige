@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { createTransferReadGate } from "./transfer-read-gate.mjs";
 
 export async function runRecoveryChecks({
   value,
@@ -11,6 +12,7 @@ export async function runRecoveryChecks({
   downloads,
   check,
   restart,
+  readCheckpoint,
 }) {
   const bytes = Buffer.alloc(8 * 1024 * 1024 + 17, 0x73);
   const source = resolve(uploads, "recover.bin");
@@ -40,20 +42,56 @@ export async function runRecoveryChecks({
     ).transfer_id === upload.transfer_id,
   );
 
-  fixture.dropTransferReadAfter = 2 * 1024 * 1024;
-  const download = await value("download_file", {
-    local_path: resolve(downloads, "recover.bin"),
-    remote_path: "/workspace/recover.bin",
-    request_id: "recover-download",
-  });
-  const downloaded = await wait(download.transfer_id);
-  assert.equal(downloaded.status, "completed", JSON.stringify(downloaded));
-  check(
-    "Interrupted download reuses verified blocks and validates complete checksum",
-    downloaded.retry_count > 0 &&
-      downloaded.resumed_bytes >= 1024 * 1024 &&
-      (await readFile(resolve(downloads, "recover.bin"))).equals(bytes),
-  );
+  let download;
+  // READ offsets include speculative requests, not confirmed client progress.
+  // Hold the tail until transfer.read proves a complete block was retained.
+  for (const delay of [0, 50]) {
+    const gate = createTransferReadGate(
+      "/workspace/recover.bin",
+      2 * 1024 * 1024,
+    );
+    fixture.transferReadGate = gate;
+    fixture.transferReadDelay = delay;
+    try {
+      const destination = resolve(
+        downloads,
+        delay ? "recover-delayed.bin" : "recover.bin",
+      );
+      const task = await value("download_file", {
+        local_path: destination,
+        remote_path: "/workspace/recover.bin",
+        request_id: delay ? "recover-delayed" : "recover-download",
+      });
+      if (!delay) download = task;
+      const retained = await wait(
+        task.transfer_id,
+        (s) =>
+          s.transferred_bytes >= 1024 * 1024 ||
+          ["failed", "completed", "cancelled"].includes(s.status),
+      );
+      assert.equal(retained.status, "running", JSON.stringify(retained));
+      assert.ok(
+        retained.transferred_bytes >= 1024 * 1024,
+        JSON.stringify(retained),
+      );
+      await gate.waitUntilBlocked();
+      gate.disconnect();
+      const downloaded = await wait(task.transfer_id);
+      assert.equal(downloaded.status, "completed", JSON.stringify(downloaded));
+      const checksumMatches = (await readFile(destination)).equals(bytes);
+      check(
+        `Interrupted download reuses verified blocks and validates complete checksum (reply delay ${delay} ms)`,
+        downloaded.retry_count > 0 &&
+          downloaded.resumed_bytes >= 1024 * 1024 &&
+          checksumMatches,
+        { ...downloaded, checksum_matches: checksumMatches },
+      );
+    } finally {
+      fixture.transferReadGate = null;
+      fixture.transferReadDelay = 0;
+      gate.release();
+    }
+  }
   check(
     "Completed download request ID is safe to replay without overwrite",
     (
@@ -89,7 +127,11 @@ export async function runRecoveryChecks({
       fixture.commitCalls === commits,
   );
 
-  fixture.transferReadDelay = 25;
+  const pauseGate = createTransferReadGate(
+    "/workspace/recover.bin",
+    2 * 1024 * 1024,
+  );
+  fixture.transferReadGate = pauseGate;
   const paused = await value("download_file", {
     local_path: resolve(downloads, "paused.bin"),
     remote_path: "/workspace/recover.bin",
@@ -98,6 +140,7 @@ export async function runRecoveryChecks({
     paused.transfer_id,
     (s) => s.transferred_bytes >= 1024 * 1024 || s.status === "failed",
   );
+  await pauseGate.waitUntilBlocked();
   check(
     "Pause is acknowledged before the worker stops",
     (
@@ -107,6 +150,8 @@ export async function runRecoveryChecks({
       })
     ).pause_requested,
   );
+  fixture.transferReadGate = null;
+  pauseGate.release();
   const stopped = await wait(paused.transfer_id, (s) =>
     ["paused", "failed", "completed"].includes(s.status),
   );
@@ -227,6 +272,11 @@ export async function runRecoveryChecks({
     });
   await Promise.all(queued.map((t) => wait(t.transfer_id)));
 
+  const restartGate = createTransferReadGate(
+    "/workspace/recover.bin",
+    6 * 1024 * 1024,
+  );
+  fixture.transferReadGate = restartGate;
   const recovery = await value("download_file", {
     local_path: resolve(downloads, "restart.bin"),
     remote_path: "/workspace/recover.bin",
@@ -235,9 +285,18 @@ export async function runRecoveryChecks({
     recovery.transfer_id,
     (s) => s.transferred_bytes >= 4 * 1024 * 1024 || s.status === "failed",
   );
-  // Give the SQLite checkpoint following the progress update time to commit.
-  await new Promise((r) => setTimeout(r, 100));
+  const checkpointDeadline = Date.now() + 30000;
+  while (readCheckpoint(recovery.transfer_id) < 4) {
+    assert.ok(
+      Date.now() < checkpointDeadline,
+      "The transfer did not persist four verified blocks before restart",
+    );
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  await restartGate.waitUntilBlocked();
   await restart();
+  fixture.transferReadGate = null;
+  restartGate.release();
   const restored = await value("transfer", {
     action: "read",
     transfer_id: recovery.transfer_id,
