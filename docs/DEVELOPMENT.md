@@ -51,6 +51,8 @@ cargo check --manifest-path src-tauri/Cargo.toml
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```
 
+Vitest 的测试发现范围在 `vite.config.ts` 中限定为 `src/tests/**/*.test.{ts,tsx}`。`scripts/` 中使用 `node:test` 的协议辅助测试由 `npm run test:e2e` 执行，避免被界面测试运行器重复加载。
+
 协议测试先构建无窗口服务：
 
 ```sh
