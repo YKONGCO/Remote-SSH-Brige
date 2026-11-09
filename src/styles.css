@@ -4079,12 +4079,30 @@
 }
 .confirm-modal {
   padding: 24px;
-  gap: 20px;
+  gap: 12px;
+}
+.confirm-modal > h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.4;
 }
 .confirm-modal > p {
+  margin: 0;
+  font-size: 13px;
   line-height: 1.7;
   overflow-wrap: anywhere;
   color: var(--text-2);
+}
+.confirm-modal > .dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 12px;
+}
+.confirm-modal > .dialog-actions > .fluent-button {
+  min-width: 80px;
+  height: 32px;
+  padding: 0 14px;
 }
 @media (max-width: 1000px) {
   .tunnels-toolbar {

@@ -1,6 +1,6 @@
 {
   "name": "remote-ssh-brige",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Permission-controlled remote server access for AI agents over MCP and SSH",
   "license": "MIT",
   "private": true,

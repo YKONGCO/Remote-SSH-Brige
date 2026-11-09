@@ -357,6 +357,7 @@ export function PortForwards({
       {deleting && (
         <ModalFrame
           className="confirm-modal"
+          width={480}
           onClose={() => {
             if (!deleteBusy) setDeleting(null);
           }}
