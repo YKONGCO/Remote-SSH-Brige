@@ -11,8 +11,11 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../App";
+import { EditorView } from "@codemirror/view";
 import * as remoteApi from "../api";
 beforeAll(() => {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+  Range.prototype.getBoundingClientRect = () => new DOMRect();
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
     function (this: HTMLElement) {
       return this.classList.contains("table-scroll") ? 600 : 88;
@@ -470,11 +473,19 @@ test("workspace supports filtering, server creation, file editing and audit navi
   const readme = await screen.findByRole("button", { name: "README.md" });
   await user.click(readme);
   const preview = await screen.findByRole("textbox", { name: "文件预览" });
-  expect((preview as HTMLTextAreaElement).readOnly).toBe(true);
+  expect(preview.getAttribute("aria-readonly")).toBe("true");
   await user.click(screen.getByRole("button", { name: "编辑" }));
   const editor = await screen.findByRole("textbox", { name: "文件内容" });
-  await user.clear(editor);
-  await user.type(editor, "Updated from UI integration test");
+  const codeView = EditorView.findFromDOM(editor)!;
+  act(() =>
+    codeView.dispatch({
+      changes: {
+        from: 0,
+        to: codeView.state.doc.length,
+        insert: "Updated from UI integration test",
+      },
+    }),
+  );
   await user.click(screen.getByRole("button", { name: "保存更改" }));
   await waitFor(() =>
     expect(
@@ -482,6 +493,7 @@ test("workspace supports filtering, server creation, file editing and audit navi
         .disabled,
     ).toBe(true),
   );
+  await user.click(screen.getByRole("button", { name: "关闭文件预览" }));
   await user.click(screen.getByRole("button", { name: "操作记录" }));
   await screen.findByRole("columnheader", { name: "操作" });
   expect((await screen.findAllByText("写入文件")).length).toBeGreaterThan(0);

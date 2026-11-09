@@ -20,6 +20,56 @@ fn code(error: anyhow::Error) -> &'static str {
 }
 
 #[test]
+fn desktop_preview_supports_twenty_mib_and_bounded_utf8_prefixes() {
+    use file_tools::{read_preview, PREVIEW_BYTES};
+    let text = "x".repeat(3 * 1024 * 1024);
+    let full = read_preview(Cursor::new(&text), text.len() as u64, PREVIEW_BYTES).unwrap();
+    assert_eq!(full["content"], text);
+    assert_eq!(full["truncated"], false);
+    assert_eq!(full["preview_limit_bytes"], 20 * 1024 * 1024);
+    let mut source = Cursor::new("abc中文后续内容");
+    let prefix = read_preview(&mut source, 100, 7).unwrap();
+    assert_eq!(prefix["content"], "abc中");
+    assert_eq!(prefix["truncated"], true);
+    assert_eq!(source.position(), 8); // exactly one byte of lookahead
+    assert_eq!(
+        read_preview(Cursor::new("exact"), 5, 5).unwrap()["truncated"],
+        false
+    );
+    assert_eq!(
+        read_preview(Cursor::new(""), 0, PREVIEW_BYTES).unwrap()["content"],
+        ""
+    );
+    assert_eq!(
+        code(read_preview(Cursor::new(b"a\0b"), 3, 3).unwrap_err()),
+        "UNSUPPORTED_TEXT"
+    );
+    assert_eq!(
+        code(read_preview(Cursor::new([0xff]), 1, 1).unwrap_err()),
+        "UNSUPPORTED_TEXT"
+    );
+    assert_eq!(
+        code(read_preview(Cursor::new([0xe4]), 1, 1).unwrap_err()),
+        "UNSUPPORTED_TEXT"
+    );
+    assert_eq!(
+        code(read_preview(Cursor::new(""), 0, PREVIEW_BYTES + 1).unwrap_err()),
+        "INVALID_ARGUMENT"
+    );
+    let mut op = Operation {
+        kind: "read_file".into(),
+        file_request: Some(FileRequest::Preview),
+        ..Default::default()
+    };
+    file_tools::validate(&op, &RuntimeSettings::default()).unwrap();
+    op.kind = "write_file".into();
+    assert_eq!(
+        code(file_tools::validate(&op, &RuntimeSettings::default()).unwrap_err()),
+        "INVALID_ARGUMENT"
+    );
+}
+
+#[test]
 fn read_preserves_original_text_and_paginates_by_one_based_lines() {
     let bytes = "第一行\r\n\r\nthird\nlast";
     let first = read_page(Cursor::new(bytes), 1, 2, 1000).unwrap();

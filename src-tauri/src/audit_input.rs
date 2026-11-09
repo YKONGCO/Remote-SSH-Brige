@@ -90,6 +90,10 @@ pub fn capture(op: &Operation) -> AuditInput {
             }
             if let Some(request) = &op.file_request {
                 match request {
+                    FileRequest::Preview => {
+                        args["preview"] = json!(true);
+                        args["preview_limit_bytes"] = json!(crate::file_tools::PREVIEW_BYTES);
+                    }
                     FileRequest::Read { offset, limit } | FileRequest::List { offset, limit } => {
                         args["offset"] = json!(offset);
                         args["limit"] = json!(limit);

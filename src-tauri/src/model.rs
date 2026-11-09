@@ -436,6 +436,8 @@ pub enum FileRequest {
         offset: u64,
         limit: u64,
     },
+    /// Bounded desktop text preview; MCP line pagination stays unchanged.
+    Preview,
     List {
         offset: u64,
         limit: u64,

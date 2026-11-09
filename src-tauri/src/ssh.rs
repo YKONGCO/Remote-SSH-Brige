@@ -375,6 +375,22 @@ pub fn operate_with_settings(
             missing_ok,
         );
     }
+    if let Some(FileRequest::Preview) = op.file_request {
+        let p = remote_path(&sftp, server, &op.path, false)?;
+        let mut file = sftp.open(&p)?;
+        let stat = file.stat()?;
+        if !stat.is_file() {
+            return Err(file_tools::error(
+                "UNSUPPORTED_TEXT",
+                "Path is not a regular file",
+            ));
+        }
+        return file_tools::read_preview(
+            &mut file,
+            stat.size.unwrap_or(0),
+            file_tools::PREVIEW_BYTES.min(settings.transfer_limit("read_file")),
+        );
+    }
     if let Some(FileRequest::Read { offset, limit }) = op.file_request {
         let p = remote_path(&sftp, server, &op.path, false)?;
         let mut file = sftp.open(&p)?;

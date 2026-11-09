@@ -2,12 +2,17 @@
 use crate::model::{FileEdit, FileRequest, Operation, RuntimeSettings};
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::{fmt, io::BufRead, time::Duration};
+use std::{
+    fmt,
+    io::{BufRead, Read},
+    time::Duration,
+};
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_BYTES: usize = 50 * 1024;
 pub const MAX_LINES: u64 = 2000;
 pub const DIRECTORY_SCAN_LIMIT: usize = 10000;
+pub const PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
 
 // Keep the existing imports available to operation implementations and callers.
 pub use crate::operation_error::{
@@ -60,6 +65,7 @@ pub fn validate(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
             FileRequest::Read { offset, limit } => {
                 op.kind == "read_file" && *offset >= 1 && (1..=MAX_LINES).contains(limit)
             }
+            FileRequest::Preview => op.kind == "read_file",
             FileRequest::List { limit, .. } => {
                 op.kind == "list_files" && (1..=1000).contains(limit)
             }
@@ -103,6 +109,40 @@ pub fn validate(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Read a bounded prefix with one-byte lookahead, preserving UTF-8 boundaries.
+pub fn read_preview(reader: impl Read, size: u64, limit: u64) -> Result<Value> {
+    if limit == 0 || limit > PREVIEW_BYTES {
+        return Err(error("INVALID_ARGUMENT", "Invalid text preview size"));
+    }
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() as u64 > limit;
+    let observed_size = bytes.len() as u64;
+    bytes.truncate(limit as usize);
+    if bytes.contains(&0) {
+        return Err(error(
+            "UNSUPPORTED_TEXT",
+            "Not UTF-8 text; download the file to view it",
+        ));
+    }
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(e) if truncated && e.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap()
+        }
+        Err(_) => {
+            return Err(error(
+                "UNSUPPORTED_TEXT",
+                "Not UTF-8 text; download the file to view it",
+            ))
+        }
+    };
+    Ok(json!({
+        "kind": "text", "content": content, "bytes": size.max(observed_size),
+        "truncated": truncated, "preview_limit_bytes": limit,
+    }))
 }
 
 /// Stream without allocating the whole file or an unbounded single line.

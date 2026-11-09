@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, expect, test, vi } from "vitest";
+import { EditorView } from "@codemirror/view";
 import {
   cleanup,
   act,
@@ -18,6 +19,238 @@ import { TransferPanel } from "../components/TransferPanel";
 import type { FileTransfer } from "../transfers";
 
 vi.mock("../api", () => ({ desktop: true, api: vi.fn(), operate: vi.fn() }));
+
+beforeAll(() => {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+  Range.prototype.getBoundingClientRect = () => new DOMRect();
+});
+
+const codeEntry = {
+  name: "app.ts",
+  path: "/workspace/app.ts",
+  is_dir: false,
+  size: 128,
+  modified: 0,
+  permissions: "644",
+};
+const codePreview = {
+  kind: "text",
+  content: "const answer = 42;\n",
+  bytes: 128,
+  truncated: false,
+};
+
+function setupFilePreview(
+  options: { truncated?: boolean; readOnly?: boolean } = {},
+) {
+  vi.mocked(api).mockImplementation(async (command) =>
+    command === "runtime_settings"
+      ? ({
+          ...defaultRuntimeSettings,
+          remote_read_only: !!options.readOnly,
+        } as never)
+      : (null as never),
+  );
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "list_files")
+      return { path: "/workspace", entries: [codeEntry] } as never;
+    if (op.kind === "read_file")
+      return (
+        op.file_request
+          ? {
+              ...codePreview,
+              truncated: !!options.truncated,
+              preview_limit_bytes: 20 * 1024 * 1024,
+            }
+          : { content: "complete file\n" }
+      ) as never;
+    return {} as never;
+  });
+  return render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/workspace" }}
+      refresh={vi.fn()}
+      notify={vi.fn()}
+    />,
+  );
+}
+
+async function changeCode(value: string) {
+  const element = await screen.findByRole("textbox", { name: "文件内容" });
+  const view = EditorView.findFromDOM(element)!;
+  act(() =>
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: value },
+    }),
+  );
+  return view;
+}
+
+test("preview and editing share one dialog, document and undo history without rereading", async () => {
+  const user = userEvent.setup();
+  setupFilePreview();
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  const dialog = screen.getByRole("dialog");
+  const preview = await screen.findByRole("textbox", { name: "文件预览" });
+  const view = EditorView.findFromDOM(preview)!;
+  expect(view.state.readOnly).toBe(true);
+  await user.click(screen.getByRole("button", { name: "编辑" }));
+  await changeCode("const answer = 43;\n");
+  await user.click(screen.getByRole("button", { name: "预览" }));
+  expect(
+    screen.getByRole("textbox", { name: "文件预览" }).textContent,
+  ).toContain("43");
+  await user.click(screen.getByRole("button", { name: "编辑" }));
+  expect(
+    EditorView.findFromDOM(screen.getByRole("textbox", { name: "文件内容" })),
+  ).toBe(view);
+  expect(screen.getAllByRole("dialog")).toEqual([dialog]);
+  await user.keyboard("{Control>}z{/Control}");
+  expect(view.state.sliceDoc()).toBe(codePreview.content);
+  await user.keyboard("{Control>}{Shift>}z{/Shift}{/Control}");
+  expect(view.state.sliceDoc()).toBe("const answer = 43;\n");
+  expect(
+    vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "read_file"),
+  ).toHaveLength(1);
+  await user.keyboard("{Control>}s{/Control}");
+  await waitFor(() =>
+    expect(operate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "write_file",
+        path: codeEntry.path,
+        content: "const answer = 43;\n",
+      }),
+    ),
+  );
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: "保存更改" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true),
+  );
+  await user.click(screen.getByRole("button", { name: "关闭文件预览" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+test("unsaved changes are protected in the same dialog and failed saves retain the draft", async () => {
+  const user = userEvent.setup();
+  setupFilePreview();
+  const normal = vi.mocked(operate).getMockImplementation()!;
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "write_file") throw new Error("permission denied");
+    return normal(op);
+  });
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  await user.click(await screen.findByRole("button", { name: "编辑" }));
+  await changeCode("unsaved draft");
+  await user.keyboard("{Escape}");
+  expect(screen.getByText("修改尚未保存")).toBeTruthy();
+  expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  await user.click(screen.getByRole("button", { name: "保存并关闭" }));
+  expect(await screen.findByText(/permission denied/)).toBeTruthy();
+  expect(
+    screen.getByRole("textbox", { name: "文件预览" }).textContent,
+  ).toContain("unsaved draft");
+  await user.click(screen.getByRole("button", { name: "继续编辑" }));
+  expect(
+    (await screen.findByRole("textbox", { name: "文件内容" })).textContent,
+  ).toContain("unsaved draft");
+  await user.click(screen.getByRole("button", { name: "关闭文件预览" }));
+  await user.click(screen.getByRole("button", { name: "放弃修改" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+test("truncated previews cannot be saved and editing requires a successful full read", async () => {
+  const user = userEvent.setup();
+  setupFilePreview({ truncated: true });
+  const normal = vi.mocked(operate).getMockImplementation()!;
+  let failRead = true;
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "read_file" && !op.file_request && failRead)
+      throw new Error("read failed");
+    return normal(op);
+  });
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  expect(await screen.findByText(/仅预览前 20/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "编辑" }));
+  expect(await screen.findByText(/read failed/)).toBeTruthy();
+  expect(screen.queryByRole("textbox", { name: "文件内容" })).toBeNull();
+  expect(
+    (screen.getByRole("button", { name: "保存更改" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  failRead = false;
+  await user.click(screen.getByRole("button", { name: "编辑" }));
+  const editor = await screen.findByRole("textbox", { name: "文件内容" });
+  expect(editor.textContent).toContain("complete file");
+  await changeCode("complete updated file\n");
+  await user.click(screen.getByRole("button", { name: "保存更改" }));
+  await waitFor(() =>
+    expect(operate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "write_file",
+        content: "complete updated file\n",
+      }),
+    ),
+  );
+});
+
+test("closing a loading preview ignores its late response and errors can be retried", async () => {
+  const user = userEvent.setup();
+  setupFilePreview();
+  const normal = vi.mocked(operate).getMockImplementation()!;
+  let finish: (value: unknown) => void = () => {};
+  vi.mocked(operate).mockImplementation(async (op) =>
+    op.kind === "read_file"
+      ? new Promise((resolve) => {
+          finish = resolve;
+        })
+      : normal(op),
+  );
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  expect(screen.getByText("正在读取远程文件…")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "关闭文件预览" }));
+  await act(async () => finish(codePreview));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "read_file") throw new Error("offline");
+    return normal(op);
+  });
+  await user.click(screen.getByRole("button", { name: "app.ts" }));
+  expect(await screen.findByText(/offline/)).toBeTruthy();
+  vi.mocked(operate).mockImplementation(normal);
+  await user.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByRole("textbox", { name: "文件预览" })).toBeTruthy();
+});
+
+test("read-only mode hides editing and saving controls", async () => {
+  const user = userEvent.setup();
+  setupFilePreview({ readOnly: true });
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  const preview = await screen.findByRole("textbox", { name: "文件预览" });
+  expect(EditorView.findFromDOM(preview)!.state.readOnly).toBe(true);
+  expect(screen.queryByRole("button", { name: "编辑" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "保存更改" })).toBeNull();
+  await user.keyboard("{Control>}s{/Control}");
+  expect(
+    vi.mocked(operate).mock.calls.some(([op]) => op.kind === "write_file"),
+  ).toBe(false);
+});
+
+test("Escape closes editor search before closing the file dialog", async () => {
+  const user = userEvent.setup();
+  setupFilePreview();
+  await user.click(await screen.findByRole("button", { name: "app.ts" }));
+  const preview = await screen.findByRole("textbox", { name: "文件预览" });
+  act(() => preview.focus());
+  await user.keyboard("{Control>}f{/Control}");
+  expect(await screen.findByRole("textbox", { name: "Find" })).toBeTruthy();
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("textbox", { name: "Find" })).toBeNull();
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
 
 test("transfer controls pause, resume, retry and persist priority without replaying file selection", async () => {
   const tasks: FileTransfer[] = ["active", "failed"].map((id) => ({
@@ -162,6 +395,12 @@ test("native transfers pass only file-selection parameters and never file conten
     if (command === "runtime_settings")
       return { ...defaultRuntimeSettings } as never;
     if (command === "transfer") return { transfers: [] } as never;
+    if (command === "pick_transfer_batch")
+      return {
+        tasks: [{ transfer_id: "batch_test" }],
+        queued: 1,
+        rejected: 0,
+      } as never;
     return { transfer_id: "transfer_test", status: "queued" } as never;
   });
   vi.mocked(operate).mockResolvedValue({
@@ -188,13 +427,35 @@ test("native transfers pass only file-selection parameters and never file conten
   const row = (
     await screen.findByRole("button", { name: "archive.bin" })
   ).closest("tr")!;
+  expect(screen.queryByRole("button", { name: "批量上传" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "上传文件夹" })).toBeNull();
+  expect(screen.queryByRole("menuitem", { name: "上传文件" })).toBeNull();
   await user.click(screen.getByRole("button", { name: "上传" }));
+  expect(api).not.toHaveBeenCalledWith("upload_file", expect.anything());
+  await user.click(screen.getByRole("menuitem", { name: "上传文件" }));
   await waitFor(() =>
     expect(api).toHaveBeenCalledWith("upload_file", {
       serverId: "server",
       remoteDir: "/workspace",
     }),
   );
+  for (const directory of [false, true]) {
+    await user.click(screen.getByRole("button", { name: "上传" }));
+    await user.click(
+      screen.getByRole("menuitem", {
+        name: directory ? "上传文件夹" : "批量上传",
+      }),
+    );
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("pick_transfer_batch", {
+        serverId: "server",
+        remotePath: "/workspace",
+        direction: "upload",
+        directory,
+      }),
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
+  }
   await user.click(within(row).getByTitle("下载"));
   await waitFor(() =>
     expect(api).toHaveBeenCalledWith("download_file", {

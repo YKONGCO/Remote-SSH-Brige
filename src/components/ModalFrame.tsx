@@ -7,11 +7,13 @@ export function ModalFrame({
   onClose,
   className,
   width,
+  onEscapeKeyDown,
 }: {
   children: ReactNode;
   onClose: () => void;
   className?: string;
   width?: number;
+  onEscapeKeyDown?: (event: KeyboardEvent) => void;
 }) {
   const [opener] = useState(() =>
     document.activeElement instanceof HTMLElement
@@ -26,6 +28,7 @@ export function ModalFrame({
       }}
     >
       <DialogContent
+        onEscapeKeyDown={onEscapeKeyDown}
         style={{
           position: "fixed",
           left: "50%",

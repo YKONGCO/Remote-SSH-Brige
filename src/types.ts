@@ -87,6 +87,7 @@ export interface Operation {
   cols?: number;
   rows?: number;
   timeout_secs?: number;
+  file_request?: { type: "preview" };
 }
 export interface FileEntry {
   name: string;

@@ -1,9 +1,14 @@
 import { usePreferences } from "../preferences";
 import { CompactTime } from "./CompactTime";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
-import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { FilePreview } from "./FilePreview";
 import { useEffect, useState, useRef } from "react";
 import {
@@ -17,11 +22,10 @@ import {
   Download,
   Trash2,
   Pencil,
-  Save,
-  X,
   ChevronRight,
+  ChevronDown,
+  Files as FilesIcon,
   Search,
-  Code2,
 } from "lucide-react";
 import { api, desktop, operate } from "../api";
 import { TransferPanel } from "./TransferPanel";
@@ -42,7 +46,9 @@ export function Files({
   const preferences = usePreferences();
   const [preview, setPreview] = useState<{
     entry: FileEntry;
-    data: Preview;
+    data?: Preview;
+    loading: boolean;
+    error: string;
   } | null>(null);
   const [security, setSecurity] = useState<RuntimeSettings>();
   const [path, setPath] = useState(server?.root || "/"),
@@ -51,12 +57,9 @@ export function Files({
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [filter, setFilter] = useState("");
-  const [editor, setEditor] = useState<{
-      path: string;
-      content: string;
-      original: string;
-    } | null>(null),
-    [saving, setSaving] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const previewRequest = useRef(0);
+  const serverRequest = useRef(0);
   const [dialog, setDialog] = useState<{
     kind: string;
     name: string;
@@ -103,11 +106,15 @@ export function Files({
     listingBusy.current = false;
     setBusy(false);
     setEntries([]);
-    setEditor(null);
+    ++previewRequest.current;
+    const securityRequest = ++serverRequest.current;
     setPreview(null);
+    setSecurity(undefined);
     if (!server) return;
     void api<RuntimeSettings>("runtime_settings")
-      .then(setSecurity)
+      .then((settings) => {
+        if (serverRequest.current === securityRequest) setSecurity(settings);
+      })
       .catch(() => {});
     setPath(server?.root || "/");
     setInput(server?.root || "/");
@@ -124,6 +131,8 @@ export function Files({
   useEffect(
     () => () => {
       ++listingRequest.current;
+      ++previewRequest.current;
+      ++serverRequest.current;
     },
     [],
   );
@@ -133,51 +142,27 @@ export function Files({
     await operate({ kind, server_id: server.id, ...extra });
     refresh();
   };
-  const edit = async (e: FileEntry) => {
-    if (editor && editor.content !== editor.original) {
-      notify("请先保存或关闭当前编辑器", true);
-      return;
-    }
-    if (e.is_dir) {
-      void load(e.path);
-      return;
-    }
-    try {
-      const r = await operate<{ content: string }>({
-        kind: "read_file",
-        server_id: server!.id,
-        path: e.path,
-      });
-      setEditor({ path: e.path, content: r.content, original: r.content });
-      setPreview(null);
-      refresh();
-    } catch (e) {
-      notify(String(e), true);
-    }
-  };
   const open = async (entry: FileEntry) => {
     if (entry.is_dir) {
       void load(entry.path);
       return;
     }
+    if (!server) return;
+    const request = ++previewRequest.current;
+    setPreview({ entry, loading: true, error: "" });
     try {
-      const result = await operate<{ content: string }>({
+      const data = await operate<Preview>({
         kind: "read_file",
-        server_id: server!.id,
+        server_id: server.id,
         path: entry.path,
+        file_request: { type: "preview" },
       });
-      setPreview({
-        entry,
-        data: {
-          kind: "text",
-          content: result.content,
-          bytes: entry.size,
-          truncated: false,
-        },
-      });
+      if (request !== previewRequest.current) return;
+      setPreview({ entry, data, loading: false, error: "" });
       refresh();
     } catch (e) {
-      notify(String(e), true);
+      if (request === previewRequest.current)
+        setPreview({ entry, loading: false, error: String(e) });
     }
   };
   const download = async (entry: FileEntry) => {
@@ -308,61 +293,81 @@ export function Files({
           <Plus size={15} />
           新建文件
         </Button>
-        <Button
-          variant="default"
-          size="sm"
-          className="btn primary"
-          disabled={security?.remote_read_only}
-          onClick={() => {
-            if (!desktop) {
-              upload.current?.click();
-              return;
-            }
-            void api<FileTransfer | null>("upload_file", {
-              serverId: server.id,
-              remoteDir: path,
-            })
-              .then((transfer) => {
-                if (transfer) notify("上传任务已开始，进度见文件传输列表");
-              })
-              .catch((e) => notify(String(e), true));
-          }}
-        >
-          <Upload size={15} />
-          上传
-        </Button>
-        {desktop &&
-          [false, true].map((directory) => (
-            <Button
-              key={String(directory)}
-              variant="outline"
-              size="sm"
-              className="btn"
-              disabled={security?.remote_read_only}
-              onClick={() =>
-                void api<{
-                  tasks: unknown[];
-                  queued?: number;
-                  rejected?: number;
-                } | null>("pick_transfer_batch", {
-                  serverId: server.id,
-                  remotePath: path,
-                  direction: "upload",
-                  directory,
-                })
-                  .then((batch) => {
-                    if (batch)
-                      notify(
-                        `已提交 ${batch.queued ?? batch.tasks.length} 个传输任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
-                        !!batch.rejected,
-                      );
+        {desktop ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="default"
+                size="sm"
+                className="btn primary"
+                disabled={security?.remote_read_only}
+              >
+                <Upload size={15} />
+                上传
+                <ChevronDown size={13} />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-40">
+              <DropdownMenuItem
+                disabled={security?.remote_read_only}
+                onSelect={() => {
+                  void api<FileTransfer | null>("upload_file", {
+                    serverId: server.id,
+                    remoteDir: path,
                   })
-                  .catch((e) => notify(String(e), true))
-              }
-            >
-              {directory ? "上传文件夹" : "批量上传"}
-            </Button>
-          ))}
+                    .then((transfer) => {
+                      if (transfer)
+                        notify("上传任务已开始，进度见文件传输列表");
+                    })
+                    .catch((e) => notify(String(e), true));
+                }}
+              >
+                <FileText size={15} />
+                上传文件
+              </DropdownMenuItem>
+              {[false, true].map((directory) => (
+                <DropdownMenuItem
+                  key={String(directory)}
+                  disabled={security?.remote_read_only}
+                  onSelect={() =>
+                    void api<{
+                      tasks: unknown[];
+                      queued?: number;
+                      rejected?: number;
+                    } | null>("pick_transfer_batch", {
+                      serverId: server.id,
+                      remotePath: path,
+                      direction: "upload",
+                      directory,
+                    })
+                      .then((batch) => {
+                        if (batch)
+                          notify(
+                            `已提交 ${batch.queued ?? batch.tasks.length} 个传输任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
+                            !!batch.rejected,
+                          );
+                      })
+                      .catch((e) => notify(String(e), true))
+                  }
+                >
+                  {directory ? <Folder size={15} /> : <FilesIcon size={15} />}
+                  {directory ? "上传文件夹" : "批量上传"}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : (
+          <Button
+            variant="default"
+            size="sm"
+            className="btn primary"
+            disabled={security?.remote_read_only}
+            onClick={() => upload.current?.click()}
+          >
+            <Upload size={15} />
+            上传
+          </Button>
+        )}
         {!desktop && (
           <input
             hidden
@@ -553,80 +558,57 @@ export function Files({
           )}
         </div>
       </div>
-      {editor && (
-        <div className="editor-panel">
-          <div className="editor-head">
-            <span>
-              <Code2 size={17} />
-              {editor.path}
-              {editor.content !== editor.original && (
-                <span className="status-dot orange" />
-              )}
-            </span>
-            <div>
-              <Button
-                variant="default"
-                size="sm"
-                className="btn small primary"
-                disabled={saving || editor.content === editor.original}
-                onClick={async () => {
-                  setSaving(true);
-                  try {
-                    await act("write_file", {
-                      path: editor.path,
-                      content: editor.content,
-                    });
-                    setEditor({ ...editor, original: editor.content });
-                    notify("文件已保存");
-                    void load();
-                  } catch (e) {
-                    notify(String(e), true);
-                  } finally {
-                    setSaving(false);
-                  }
-                }}
-              >
-                <Save size={14} />
-                {saving ? "保存中…" : "保存更改"}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="icon-btn"
-                title="关闭编辑器"
-                onClick={() =>
-                  editor.content !== editor.original
-                    ? setDialog({ kind: "discard", name: "" })
-                    : setEditor(null)
-                }
-              >
-                <X size={16} />
-              </Button>
-            </div>
-          </div>
-          <Textarea
-            aria-label="文件内容"
-            className="code-editor"
-            spellCheck={false}
-            value={editor.content}
-            onChange={(e) => setEditor({ ...editor, content: e.target.value })}
-          />
-          <div className="editor-status">
-            UTF-8{" "}
-            <span>
-              {editor.content.split("\n").length} 行 · {editor.content.length}{" "}
-              字符
-            </span>
-          </div>
-        </div>
-      )}
       {preview && (
         <FilePreview
+          key={server.id + ":" + preview.entry.path}
           entry={preview.entry}
           data={preview.data}
-          readOnly={security?.remote_read_only ?? false}
-          onClose={() => setPreview(null)}
-          onEdit={() => void edit(preview.entry)}
+          loading={preview.loading}
+          error={preview.error}
+          readOnly={security?.remote_read_only ?? true}
+          onClose={() => {
+            ++previewRequest.current;
+            setPreview(null);
+          }}
+          onRetry={() => void open(preview.entry)}
+          onLoadFull={async () => {
+            const request = previewRequest.current;
+            const result = await operate<{ content: string }>({
+              kind: "read_file",
+              server_id: server.id,
+              path: preview.entry.path,
+            });
+            if (request !== previewRequest.current)
+              throw new Error("文件已关闭或服务器已切换");
+            if (
+              typeof result.content !== "string" ||
+              result.content.includes("\0")
+            )
+              throw new Error("文件不是 UTF-8 文本，请下载后查看");
+            const data: Preview = {
+              kind: "text",
+              content: result.content,
+              bytes: new TextEncoder().encode(result.content).length,
+              truncated: false,
+            };
+            setPreview({ ...preview, data });
+            refresh();
+            return data;
+          }}
+          onSave={async (content) => {
+            const request = previewRequest.current;
+            await operate({
+              kind: "write_file",
+              server_id: server.id,
+              path: preview.entry.path,
+              content,
+            });
+            if (request === previewRequest.current) {
+              notify("文件已保存");
+              refresh();
+              void load(path, true);
+            }
+          }}
           onDownload={() => void download(preview.entry)}
         />
       )}
@@ -642,11 +624,6 @@ export function Files({
             onSubmit={async (e) => {
               e.preventDefault();
               if (dialog.kind === "upload-conflict") {
-                setDialog(null);
-                return;
-              }
-              if (dialog.kind === "discard") {
-                setEditor(null);
                 setDialog(null);
                 return;
               }
@@ -688,7 +665,6 @@ export function Files({
                         rename: "重命名",
                         mkdir: "新建目录",
                         write_file: "新建文件",
-                        discard: "放弃未保存的修改？",
                         "upload-conflict": "同名文件已存在",
                       } as Record<string, string>
                     )[dialog.kind]
@@ -702,8 +678,6 @@ export function Files({
                   确定删除「{dialog.name}
                   」？此操作会直接修改远程服务器，目录必须为空。
                 </p>
-              ) : dialog.kind === "discard" ? (
-                <p>编辑器中的修改尚未保存。</p>
               ) : dialog.kind === "upload-conflict" ? (
                 <p>请先重命名或删除远程同名文件，再上传「{dialog.name}」。</p>
               ) : (

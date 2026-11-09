@@ -516,7 +516,24 @@ export async function operate<T = Record<string, unknown>>(
     }
     case "read_file":
       if (typeof files[p] !== "string") throw new Error("文件不存在");
-      result = { content: files[p] };
+      if (op.file_request?.type === "preview") {
+        const bytes = new TextEncoder().encode(files[p]);
+        const limit =
+          Math.min(20, demoSettings.download_limit_mib || 256) * 1024 * 1024;
+        const prefix = bytes.subarray(0, limit);
+        let end = prefix.length;
+        // Exclude an incomplete UTF-8 character at the preview boundary.
+        if (bytes.length > limit) {
+          while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+        }
+        result = {
+          kind: "text",
+          content: new TextDecoder().decode(prefix.subarray(0, end)),
+          bytes: bytes.length,
+          truncated: bytes.length > limit,
+          preview_limit_bytes: limit,
+        };
+      } else result = { content: files[p] };
       break;
     case "write_file":
       files[p] = op.content || "";
