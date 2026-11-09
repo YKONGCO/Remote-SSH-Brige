@@ -244,9 +244,9 @@ test("Escape closes editor search before closing the file dialog", async () => {
   const preview = await screen.findByRole("textbox", { name: "文件预览" });
   act(() => preview.focus());
   await user.keyboard("{Control>}f{/Control}");
-  expect(await screen.findByRole("textbox", { name: "Find" })).toBeTruthy();
+  expect(await screen.findByRole("textbox", { name: "查找" })).toBeTruthy();
   await user.keyboard("{Escape}");
-  expect(screen.queryByRole("textbox", { name: "Find" })).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "查找" })).toBeNull();
   expect(screen.getByRole("dialog")).toBeTruthy();
   await user.keyboard("{Escape}");
   expect(screen.queryByRole("dialog")).toBeNull();
