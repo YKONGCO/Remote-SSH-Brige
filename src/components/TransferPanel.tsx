@@ -1,20 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
+  ChevronDown,
   Download,
-  FileDown,
-  FileUp,
   FolderOpen,
+  Layers3,
   LoaderCircle,
-  Search,
-  Trash2,
-  XCircle,
   Pause,
-  Play,
-  RotateCcw,
+  Search,
+  XCircle,
 } from "lucide-react";
 import { api, desktop } from "../api";
 import { formatBytes, type FileTransfer } from "../transfers";
+import { TransferFileCard } from "./TransferFileCard";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import {
@@ -23,27 +21,92 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 
-const terminal = (s: string) =>
-  ["completed", "failed", "cancelled"].includes(s);
-const phases: Record<string, string> = {
-  preparing: "准备中",
-  awaiting_approval: "等待审批",
-  transferring: "传输中",
-  committing: "正在提交文件",
-  cancelling: "正在取消",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  queued: "排队中",
-  connecting: "正在连接",
-  retrying: "等待自动重试",
-  paused: "已暂停",
-  pausing: "正在暂停",
-  hashing: "正在计算校验值",
-  verifying: "正在校验文件",
-  reconciling: "正在确认提交结果",
-  skipped: "内容相同，已跳过",
+const PAGE_SIZE = 30;
+const terminal = (status: string) =>
+  ["completed", "failed", "cancelled"].includes(status);
+const groupStates = {
+  completed: { label: "已完成", icon: CheckCircle2 },
+  failed: { label: "有失败", icon: XCircle },
+  cancelled: { label: "已结束", icon: XCircle },
+  paused: { label: "已暂停", icon: Pause },
+  active: { label: "进行中", icon: LoaderCircle },
 };
+type TransferRow =
+  | { kind: "batch"; id: string; tasks: FileTransfer[]; expanded: boolean }
+  | { kind: "file"; item: FileTransfer; nested: boolean };
+
+function TransferBatchHeader({
+  id,
+  tasks,
+  expanded,
+  onToggle,
+}: {
+  id: string;
+  tasks: FileTransfer[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const bytes = tasks.reduce((sum, task) => sum + task.transferred_bytes, 0);
+  const total = tasks.reduce((sum, task) => sum + (task.total_bytes || 0), 0);
+  const completed = tasks.filter((task) => task.status === "completed").length;
+  const ended = tasks.every((task) => terminal(task.status));
+  const failed = tasks.some((task) => task.status === "failed");
+  const paused =
+    !ended &&
+    tasks.every((task) => terminal(task.status) || task.status === "paused");
+  const state =
+    completed === tasks.length
+      ? "completed"
+      : ended
+        ? failed
+          ? "failed"
+          : "cancelled"
+        : paused
+          ? "paused"
+          : "active";
+  const StateIcon = groupStates[state].icon;
+  return (
+    <div className="transfer-batch" data-state={state}>
+      <button
+        type="button"
+        className="transfer-batch-toggle"
+        aria-expanded={expanded}
+        aria-label={`批次 ${id}，${groupStates[state].label}，${completed}/${tasks.length} 个文件已完成`}
+        title={`批次 ${id} · ${completed}/${tasks.length} 个文件已完成 · ${formatBytes(bytes)} / ${formatBytes(total)}`}
+        onClick={onToggle}
+      >
+        <Layers3 size={15} aria-hidden="true" />
+        <span className="transfer-batch-name">批次 {id}</span>
+        <span className="transfer-batch-count">
+          {completed}/{tasks.length}
+        </span>
+        <span className="transfer-state-badge">
+          <StateIcon
+            size={12}
+            className={state === "active" ? "spinning" : undefined}
+          />
+          {groupStates[state].label}
+        </span>
+        <ChevronDown
+          size={14}
+          className={expanded ? "is-expanded" : ""}
+          aria-hidden="true"
+        />
+      </button>
+      {!ended && (
+        <progress
+          aria-label={`批次 ${id} 进度`}
+          max={total || 1}
+          value={
+            tasks.every((task) => task.total_bytes !== null)
+              ? Math.min(bytes, total || 1)
+              : undefined
+          }
+        />
+      )}
+    </div>
+  );
+}
 
 export function TransferPanel({
   serverId,
@@ -60,8 +123,16 @@ export function TransferPanel({
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Map<string, boolean>>(
+    new Map(),
+  );
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renderCount, setRenderCount] = useState(PAGE_SIZE);
+  const body = useRef<HTMLDivElement>(null);
+  const sentinel = useRef<HTMLDivElement>(null);
   const callbacks = useRef({ onComplete, notify });
   callbacks.current = { onComplete, notify };
+
   useEffect(() => {
     if (!desktop) return;
     let disposed = false,
@@ -71,6 +142,7 @@ export function TransferPanel({
     setDismissed(new Set());
     setSearch("");
     setSearchOpen(false);
+    setExpandedGroups(new Map());
     const poll = async () => {
       if (loading) return;
       loading = true;
@@ -108,49 +180,109 @@ export function TransferPanel({
       clearInterval(timer);
     };
   }, [serverId]);
-  if (!desktop) return null;
-  const visibleItems = items.filter(
-    (item) =>
-      !dismissed.has(item.transfer_id) &&
-      (!search ||
-        item.remote_path
-          .toLocaleLowerCase()
-          .includes(search.toLocaleLowerCase())),
+
+  const availableItems = useMemo(
+    () => items.filter((item) => !dismissed.has(item.transfer_id)),
+    [items, dismissed],
   );
-  const activeCount = visibleItems.filter(
+  const activeCount = availableItems.filter(
     (item) => !terminal(item.status) && item.status !== "paused",
   ).length;
-  const groups = new Map<string, FileTransfer[]>();
-  for (const item of visibleItems)
-    if (item.group_id)
-      groups.set(item.group_id, [...(groups.get(item.group_id) || []), item]);
-  const latestCompleted = items.find(
-    (item) => item.status === "completed" && !dismissed.has(item.transfer_id),
+  const rows = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    const matches = (item: FileTransfer) =>
+      !query ||
+      item.remote_path.toLocaleLowerCase().includes(query) ||
+      !!item.group_id?.toLocaleLowerCase().includes(query);
+    const ordered = [
+      ...availableItems.filter((item) => !terminal(item.status)),
+      ...availableItems.filter((item) => terminal(item.status)),
+    ];
+    const groups = new Map<string, FileTransfer[]>();
+    for (const item of ordered) {
+      if (!item.group_id) continue;
+      const group = groups.get(item.group_id);
+      if (group) group.push(item);
+      else groups.set(item.group_id, [item]);
+    }
+    const result: TransferRow[] = [];
+    const seen = new Set<string>();
+    for (const item of ordered) {
+      if (!item.group_id) {
+        if (matches(item)) result.push({ kind: "file", item, nested: false });
+        continue;
+      }
+      if (seen.has(item.group_id)) continue;
+      seen.add(item.group_id);
+      const tasks = groups.get(item.group_id)!;
+      const matching = tasks.filter(matches);
+      if (!matching.length) continue;
+      // Search also reaches files in unopened batches and outside loaded rows.
+      const expanded = expandedGroups.get(item.group_id) ?? !!query;
+      result.push({ kind: "batch", id: item.group_id, tasks, expanded });
+      if (expanded)
+        for (const task of matching)
+          result.push({ kind: "file", item: task, nested: true });
+    }
+    return result;
+  }, [availableItems, search, expandedGroups]);
+  const hasMore = renderCount < rows.length;
+  const loadMore = () =>
+    setRenderCount((count) => Math.min(rows.length, count + PAGE_SIZE));
+
+  useEffect(() => {
+    setRenderCount(PAGE_SIZE);
+    setExpandedGroups(new Map());
+    if (body.current) body.current.scrollTop = 0;
+  }, [serverId, search]);
+  useEffect(() => {
+    if (!menuOpen || !hasMore || !body.current || !sentinel.current) return;
+    const root = body.current;
+    if (root.clientHeight > 0 && root.scrollHeight <= root.clientHeight)
+      loadMore();
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore();
+      },
+      { root, rootMargin: "120px" },
+    );
+    observer.observe(sentinel.current);
+    return () => observer.disconnect();
+  }, [menuOpen, renderCount, rows.length, hasMore]);
+
+  const latestCompleted = availableItems.find(
+    (item) => item.status === "completed",
   );
-  const reveal = (item: FileTransfer) =>
-    api("reveal_transfer", {
+  const reveal = (item: FileTransfer) => {
+    void api("reveal_transfer", {
       serverId,
       transferId: item.transfer_id,
     }).catch((e) => callbacks.current.notify(String(e), true));
-  const control = async (item: FileTransfer, action: string, patch = {}) => {
+  };
+  const control = async (
+    item: FileTransfer,
+    action: string,
+    patch: Record<string, number> = {},
+  ) => {
     setBusy((current) => new Set(current).add(item.transfer_id));
     try {
-      const result = await api<FileTransfer>("transfer", {
-        serverId,
-        action,
-        transferId: item.transfer_id,
-        ...patch,
-      });
+      const result = await api<FileTransfer & { cancel_requested?: boolean }>(
+        "transfer",
+        { serverId, action, transferId: item.transfer_id, ...patch },
+      );
       if (action === "cleanup")
         setItems((current) =>
-          current.filter((x) => x.transfer_id !== item.transfer_id),
+          current.filter((task) => task.transfer_id !== item.transfer_id),
         );
       else
         setItems((current) =>
-          current.map((x) =>
-            x.transfer_id === result.transfer_id ? result : x,
+          current.map((task) =>
+            task.transfer_id === result.transfer_id ? result : task,
           ),
         );
+      if (action === "cancel" && !result.cancel_requested)
+        callbacks.current.notify("文件已结束或正在提交，请等待结果");
     } catch (e) {
       callbacks.current.notify(String(e), true);
     } finally {
@@ -161,8 +293,15 @@ export function TransferPanel({
       });
     }
   };
+  if (!desktop) return null;
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={menuOpen}
+      onOpenChange={(open) => {
+        setMenuOpen(open);
+        if (open) setRenderCount(PAGE_SIZE);
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
@@ -182,10 +321,16 @@ export function TransferPanel({
         className="transfer-menu"
         role="dialog"
         aria-label="文件传输任务"
+        aria-labelledby={undefined}
       >
         <div className="transfer-menu-header">
           <strong>
-            文件传输{activeCount ? ` · ${activeCount} 项进行中` : ""}
+            文件传输
+            {activeCount > 0 && (
+              <span className="transfer-header-count">
+                {activeCount} 项进行中
+              </span>
+            )}
           </strong>
           <div className="transfer-menu-header-actions">
             <Button
@@ -195,7 +340,7 @@ export function TransferPanel({
               aria-label="打开下载文件夹"
               title="打开下载文件夹"
               disabled={!latestCompleted}
-              onClick={() => latestCompleted && void reveal(latestCompleted)}
+              onClick={() => latestCompleted && reveal(latestCompleted)}
             >
               <FolderOpen size={17} />
             </Button>
@@ -203,10 +348,10 @@ export function TransferPanel({
               variant="ghost"
               size="icon"
               className="icon-btn"
-              aria-label="搜索下载任务"
-              title="搜索下载任务"
+              aria-label="搜索传输任务"
+              title="搜索传输任务"
               aria-pressed={searchOpen}
-              onClick={() => setSearchOpen((value) => !value)}
+              onClick={() => setSearchOpen(!searchOpen)}
             >
               <Search size={17} />
             </Button>
@@ -217,303 +362,75 @@ export function TransferPanel({
             <Search size={14} />
             <Input
               autoFocus
-              aria-label="搜索下载任务"
-              placeholder="搜索下载文件"
+              aria-label="搜索传输任务"
+              placeholder="搜索文件名、远程路径或批次"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
           </div>
         )}
-        {error && (
-          <p className="error-inline" role="alert">
-            {error}
-          </p>
-        )}
-        {!visibleItems.length && !error && (
-          <div className="transfer-menu-empty">
-            {search ? "没有匹配的传输任务" : "暂无传输任务"}
-          </div>
-        )}
-        {[...groups].slice(0, 5).map(([id, tasks]) => {
-          const bytes = tasks.reduce((sum, t) => sum + t.transferred_bytes, 0);
-          const total = tasks.reduce((sum, t) => sum + (t.total_bytes || 0), 0);
-          return (
-            <div className="transfer-group-progress" key={id}>
-              <small title={id}>
-                批次 {id.slice(0, 8)} · 已完成{" "}
-                {tasks.filter((t) => t.status === "completed").length}/
-                {tasks.length} · {formatBytes(bytes)}
-                {total ? ` / ${formatBytes(total)}` : ""}
-              </small>
-              <progress
-                aria-label={`批次 ${id} 进度`}
-                max={total || 1}
-                value={bytes}
+        <div
+          className="transfer-menu-body"
+          ref={body}
+          onScroll={(event) => {
+            const root = event.currentTarget;
+            if (
+              hasMore &&
+              root.scrollHeight - root.scrollTop - root.clientHeight < 120
+            )
+              loadMore();
+          }}
+        >
+          {error && (
+            <p className="error-inline" role="alert">
+              {error}
+            </p>
+          )}
+          {!rows.length && !error && (
+            <div className="transfer-menu-empty">
+              {search ? "没有匹配的传输任务" : "暂无传输任务"}
+            </div>
+          )}
+          {rows.slice(0, renderCount).map((row, index) =>
+            row.kind === "batch" ? (
+              <TransferBatchHeader
+                key={`batch:${row.id}`}
+                id={row.id}
+                tasks={row.tasks}
+                expanded={row.expanded}
+                onToggle={() => {
+                  setExpandedGroups((current) =>
+                    new Map(current).set(row.id, !row.expanded),
+                  );
+                  // Expanding the last loaded header should reveal its files immediately.
+                  if (!row.expanded && index + 1 === renderCount)
+                    setRenderCount((count) => count + PAGE_SIZE);
+                }}
               />
+            ) : (
+              <TransferFileCard
+                key={`file:${row.item.transfer_id}`}
+                item={row.item}
+                nested={row.nested}
+                busy={busy.has(row.item.transfer_id)}
+                onControl={(item, action, patch) =>
+                  void control(item, action, patch)
+                }
+                onReveal={reveal}
+                onDismiss={(item) =>
+                  setDismissed((current) =>
+                    new Set(current).add(item.transfer_id),
+                  )
+                }
+              />
+            ),
+          )}
+          {hasMore && (
+            <div ref={sentinel} className="transfer-load-more" role="status">
+              向下滚动加载更多
             </div>
-          );
-        })}
-        {[
-          ...visibleItems.filter((item) => !terminal(item.status)),
-          ...visibleItems.filter((item) => terminal(item.status)),
-        ]
-          .slice(0, 10)
-          .map((item) => (
-            <div className="file-transfer-item" key={item.transfer_id}>
-              <div className="file-transfer-card-row">
-                <div className="file-transfer-title">
-                  {item.direction === "upload" ? (
-                    <FileUp className="transfer-file-icon" size={22} />
-                  ) : (
-                    <FileDown className="transfer-file-icon" size={22} />
-                  )}
-                  <div>
-                    <span title={item.remote_path}>
-                      {item.remote_path.split("/").pop() || item.remote_path}
-                    </span>
-                    <small>
-                      {item.direction === "upload" ? "上传" : "下载"} ·{" "}
-                      {phases[item.phase] || item.phase}
-                    </small>
-                  </div>
-                </div>
-                <div className="file-transfer-actions">
-                  {["paused", "failed"].includes(item.status) && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="icon-btn"
-                      disabled={busy.has(item.transfer_id)}
-                      aria-label={`${item.status === "paused" ? "继续" : "重试"} ${item.remote_path.split("/").pop()}`}
-                      title={
-                        item.status === "paused"
-                          ? "校验断点并继续"
-                          : "从断点重试"
-                      }
-                      onClick={() =>
-                        void control(
-                          item,
-                          item.status === "paused" ? "resume" : "retry",
-                        )
-                      }
-                    >
-                      {item.status === "paused" ? (
-                        <Play size={17} />
-                      ) : (
-                        <RotateCcw size={17} />
-                      )}
-                    </Button>
-                  )}
-                  {!terminal(item.status) && item.status !== "paused" && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="icon-btn"
-                      disabled={
-                        busy.has(item.transfer_id) ||
-                        ["committing", "pausing", "cancelling"].includes(
-                          item.phase,
-                        )
-                      }
-                      aria-label={`暂停 ${item.remote_path.split("/").pop()}`}
-                      title="暂停并保存断点"
-                      onClick={() => void control(item, "pause")}
-                    >
-                      <Pause size={17} />
-                    </Button>
-                  )}
-                  {item.status === "completed" && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="icon-btn"
-                      aria-label={`打开 ${item.remote_path.split("/").pop() || item.remote_path} 所在文件夹`}
-                      title="打开所在文件夹"
-                      onClick={() => void reveal(item)}
-                    >
-                      <FolderOpen size={18} />
-                    </Button>
-                  )}
-                  {terminal(item.status) ? (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="icon-btn"
-                      aria-label={`从列表中移除 ${item.remote_path.split("/").pop() || item.remote_path}`}
-                      title="从列表中移除"
-                      onClick={() =>
-                        setDismissed((current) =>
-                          new Set(current).add(item.transfer_id),
-                        )
-                      }
-                    >
-                      <Trash2 size={17} />
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="icon-btn"
-                      aria-label={`取消 ${item.remote_path.split("/").pop() || item.remote_path}`}
-                      title="取消传输"
-                      disabled={["committing", "cancelling"].includes(
-                        item.phase,
-                      )}
-                      onClick={() =>
-                        void api<FileTransfer & { cancel_requested: boolean }>(
-                          "transfer",
-                          {
-                            serverId,
-                            action: "cancel",
-                            transferId: item.transfer_id,
-                          },
-                        )
-                          .then((result) => {
-                            setItems((current) =>
-                              current.map((x) =>
-                                x.transfer_id === result.transfer_id
-                                  ? result
-                                  : x,
-                              ),
-                            );
-                            if (!result.cancel_requested)
-                              callbacks.current.notify(
-                                "文件已结束或正在提交，请等待结果",
-                              );
-                          })
-                          .catch((e) =>
-                            callbacks.current.notify(String(e), true),
-                          )
-                      }
-                    >
-                      <Trash2 size={17} />
-                    </Button>
-                  )}
-                </div>
-              </div>
-              {item.status !== "completed" && (
-                <>
-                  <progress
-                    aria-label={`${item.direction === "upload" ? "上传" : "下载"} ${item.remote_path}`}
-                    max={item.total_bytes || 1}
-                    value={item.transferred_bytes}
-                  />
-                  <div className="file-transfer-description">
-                    <span>
-                      {formatBytes(item.transferred_bytes)} /{" "}
-                      {item.total_bytes === null
-                        ? "等待文件大小"
-                        : formatBytes(item.total_bytes)}
-                      {item.bytes_per_second > 0
-                        ? ` · ${formatBytes(item.bytes_per_second)}/s`
-                        : ""}
-                      {item.bytes_per_second > 0 &&
-                      item.total_bytes !== null &&
-                      item.status === "running"
-                        ? ` · 剩余约 ${Math.ceil(Math.max(0, item.total_bytes - item.transferred_bytes) / item.bytes_per_second)} 秒`
-                        : ""}
-                    </span>
-                    {item.status === "failed" && (
-                      <XCircle className="transfer-status-error" size={16} />
-                    )}
-                    {item.status === "cancelled" && <CheckCircle2 size={16} />}
-                    {!terminal(item.status) && item.status !== "paused" && (
-                      <LoaderCircle
-                        className="spinning transfer-status-active"
-                        size={16}
-                      />
-                    )}
-                  </div>
-                </>
-              )}
-              {item.error && (
-                <p className="error-inline">{item.error.message}</p>
-              )}
-              {!!item.retry_count && (
-                <small>
-                  已自动重试 {item.retry_count} 次
-                  {item.next_retry_at
-                    ? ` · 下次 ${new Date(item.next_retry_at).toLocaleTimeString()}`
-                    : ""}
-                </small>
-              )}
-              {!!item.resumed_bytes && (
-                <small>已复用 {formatBytes(item.resumed_bytes)} 断点数据</small>
-              )}
-              {item.group_id && (
-                <small title={item.group_id}>
-                  批次 {item.group_id.slice(0, 8)}
-                </small>
-              )}
-              {item.sha256 && (
-                <small title={item.sha256}>
-                  SHA-256 {item.sha256.slice(0, 16)}…
-                </small>
-              )}
-              {item.status !== "completed" && (
-                <details className="transfer-task-options">
-                  <summary>传输设置</summary>
-                  <label>
-                    优先级{" "}
-                    <select
-                      aria-label={`优先级 ${item.transfer_id}`}
-                      value={item.priority || 0}
-                      disabled={busy.has(item.transfer_id)}
-                      onChange={(e) =>
-                        void control(item, "configure", {
-                          priority: Number(e.target.value),
-                        })
-                      }
-                    >
-                      {[...new Set([-10, -5, 0, 5, 10, item.priority || 0])]
-                        .sort((a, b) => a - b)
-                        .map((n) => (
-                          <option key={n} value={n}>
-                            {n}
-                          </option>
-                        ))}
-                    </select>
-                  </label>
-                  <label>
-                    限速 KiB/s（0 跟随全局设置）{" "}
-                    <Input
-                      type="number"
-                      min={0}
-                      max={1048576}
-                      aria-label={`限速 ${item.transfer_id}`}
-                      key={`${item.transfer_id}-${item.bandwidth_kib || 0}`}
-                      defaultValue={item.bandwidth_kib || 0}
-                      onBlur={(e) => {
-                        const n = Number(e.target.value);
-                        if (
-                          Number.isInteger(n) &&
-                          n >= 0 &&
-                          n <= 1048576 &&
-                          n !== (item.bandwidth_kib || 0)
-                        )
-                          void control(item, "configure", { bandwidthKib: n });
-                      }}
-                    />
-                  </label>
-                  {(terminal(item.status) || item.status === "paused") && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={busy.has(item.transfer_id)}
-                      onClick={() => void control(item, "cleanup")}
-                    >
-                      清理临时文件及记录
-                    </Button>
-                  )}
-                </details>
-              )}
-              {item.audit_error && (
-                <p className="error-inline">
-                  文件结果已确认，但操作记录保存失败：{item.audit_error}
-                </p>
-              )}
-            </div>
-          ))}
+          )}
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
   );

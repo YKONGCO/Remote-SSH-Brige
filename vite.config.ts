@@ -13,7 +13,21 @@ export default defineConfig({
     },
   },
   clearScreen: false,
-  server: { port: 1420, strictPort: true },
+  server: {
+    host: "127.0.0.1",
+    port: 1420,
+    strictPort: true,
+    // Tauri watches Rust itself. Watching toolchains and build output can stall
+    // startup before the webview receives its first HTML/JS response.
+    watch: {
+      ignored: [
+        "**/src-tauri/**",
+        "**/.tools/**",
+        "**/.artifacts/**",
+        "**/dist/**",
+      ],
+    },
+  },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
     rollupOptions: {

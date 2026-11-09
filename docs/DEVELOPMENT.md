@@ -41,6 +41,9 @@ npm run build
 # React 界面测试
 npm run test:ui
 
+# 实际启动开发服务，检查首页、React 入口和样式请求
+npm run test:dev
+
 # Rust 后端测试，不编译桌面特性
 npm test
 
@@ -52,6 +55,8 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```
 
 Vitest 的测试发现范围在 `vite.config.ts` 中限定为 `src/tests/**/*.test.{ts,tsx}`。`scripts/` 中使用 `node:test` 的协议辅助测试由 `npm run test:e2e` 执行，避免被界面测试运行器重复加载。
+
+开发时，Tailwind 只扫描前端源码与 HTML 入口；Vite 不监听 Rust、工具链和构建产物目录，避免大型工作区拖慢初始样式编译而出现白屏。开发 CSP 单独允许 React 的启动脚本及本地热更新连接。`test:dev` 在独立进程中用临时端口验证真实 HTTP 响应，结束后释放端口，Windows 和 macOS CI 均运行此检查。
 
 协议测试先构建无窗口服务：
 

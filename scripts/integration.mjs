@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 // Protocol integration test: a disposable, in-memory SSH/SFTP fixture on loopback.
 // No user servers or SSH configuration are contacted.
 import assert from "node:assert/strict";
-import { generateKeyPairSync, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { connect } from "node:net";
 import { runForwardChecks } from "./forward-checks.mjs";
+import { createSshFixtureKey } from "./ssh-fixture-keys.mjs";
 import ssh2 from "ssh2";
 const { Server, utils } = ssh2;
 const sftpUtils = utils.sftp;
@@ -18,20 +19,16 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const work = resolve(root, ".artifacts", "integration-" + Date.now());
 await mkdir(work, { recursive: true });
-const key = () =>
-  generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs1", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  }).privateKey;
-const hostKey = utils.generateKeyPairSync("ed25519").private,
-  clientKey = utils.generateKeyPairSync("ed25519").private;
+const hostIdentity = createSshFixtureKey(),
+  clientIdentity = createSshFixtureKey();
+const hostKey = hostIdentity.privateKey,
+  clientKey = clientIdentity.privateKey;
 await writeFile(resolve(work, "client.pem"), clientKey);
-const publicKey = utils.parseKey(clientKey).getPublicSSH();
+const publicKey = clientIdentity.publicKey;
 const fingerprint =
   "SHA256:" +
   createHash("sha256")
-    .update(utils.parseKey(hostKey).getPublicSSH())
+    .update(hostIdentity.publicKey)
     .digest("base64")
     .replace(/=+$/, "");
 const entries = new Map([
@@ -105,9 +102,7 @@ const ssh = new Server(
         ctx.method === "publickey" &&
         ctx.key.data.equals(publicKey) &&
         (!ctx.signature ||
-          utils
-            .parseKey(clientKey)
-            .verify(ctx.blob, ctx.signature, ctx.hashAlgo))
+          clientIdentity.key.verify(ctx.blob, ctx.signature, ctx.hashAlgo))
       )
         ctx.accept();
       else ctx.reject();

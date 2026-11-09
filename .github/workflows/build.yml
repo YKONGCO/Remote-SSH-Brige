@@ -69,6 +69,9 @@ jobs:
       - name: Test user interface
         run: npm run test:ui
 
+      - name: Check development server startup
+        run: npm run test:dev
+
       - name: Test Rust backend
         run: npm test -- --locked
 
@@ -208,6 +211,9 @@ jobs:
 
       - name: Test user interface
         run: npm run test:ui
+
+      - name: Check development server startup
+        run: npm run test:dev
 
       - name: Test Rust backend and Keychain
         run: npm test -- --locked

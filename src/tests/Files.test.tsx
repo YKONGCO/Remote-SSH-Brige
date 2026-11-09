@@ -286,13 +286,18 @@ test("transfer controls pause, resume, retry and persist priority without replay
     <TransferPanel serverId="server" onComplete={vi.fn()} notify={vi.fn()} />,
   );
   await user.click(screen.getByRole("button", { name: "传输任务" }));
+  await user.click(
+    await screen.findByRole("button", { name: /^批次 group，/ }),
+  );
   await user.click(await screen.findByRole("button", { name: "暂停 active" }));
   await user.click(await screen.findByRole("button", { name: "继续 active" }));
   await user.click(screen.getByRole("button", { name: "重试 failed" }));
   const row = screen
     .getByText("active")
     .closest(".file-transfer-item") as HTMLElement;
-  await user.click(within(row).getByText("传输设置"));
+  await user.click(
+    within(row).getByRole("button", { name: "传输设置 active" }),
+  );
   fireEvent.change(within(row).getByLabelText("优先级 active"), {
     target: { value: "5" },
   });
@@ -545,4 +550,159 @@ test("shows transfer history only after opening the toolbar transfer menu", asyn
     serverId: "server",
     transferId: "transfer_completed",
   });
+});
+
+function makeTransfer(index: number, group?: string): FileTransfer {
+  return {
+    transfer_id: `transfer-${index}`,
+    server_id: "server",
+    direction: "download",
+    local_path: `C:/Downloads/file-${String(index).padStart(3, "0")}.txt`,
+    remote_path: `/workspace/file-${String(index).padStart(3, "0")}.txt`,
+    status: "completed",
+    phase: "completed",
+    transferred_bytes: 1024,
+    total_bytes: 1024,
+    bytes_per_second: 0,
+    elapsed_ms: 1000,
+    version: 1,
+    error: null,
+    group_id: group,
+  };
+}
+
+function renderTransfers(items: FileTransfer[]) {
+  vi.mocked(api).mockImplementation(
+    async () => ({ transfers: items.map((item) => ({ ...item })) }) as never,
+  );
+  return render(
+    <TransferPanel serverId="server" onComplete={vi.fn()} notify={vi.fn()} />,
+  );
+}
+
+function scrollTransfersToBottom() {
+  const body = screen
+    .getByRole("dialog", { name: "文件传输任务" })
+    .querySelector(".transfer-menu-body") as HTMLElement;
+  Object.defineProperties(body, {
+    scrollHeight: { configurable: true, value: 2500 },
+    clientHeight: { configurable: true, value: 500 },
+    scrollTop: { configurable: true, writable: true, value: 2000 },
+  });
+  fireEvent.scroll(body);
+}
+
+test("each batch expands independently and grouped files never appear as standalone cards", async () => {
+  const user = userEvent.setup();
+  renderTransfers([
+    makeTransfer(0, "demo-500"),
+    makeTransfer(1, "demo-500"),
+    makeTransfer(2, "other-batch"),
+    makeTransfer(3),
+  ]);
+  await user.click(screen.getByRole("button", { name: "传输任务" }));
+  const first = await screen.findByRole("button", { name: /^批次 demo-500，/ });
+  const other = screen.getByRole("button", { name: /^批次 other-batch，/ });
+  expect(first.getAttribute("aria-expanded")).toBe("false");
+  expect(screen.queryByText("file-000.txt")).toBeNull();
+  expect(screen.getByText("file-003.txt")).toBeTruthy();
+  expect(screen.queryByText("查看传输进度与历史记录")).toBeNull();
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  await user.click(first);
+  expect(screen.getAllByText("file-000.txt")).toHaveLength(1);
+  expect(screen.getAllByText("file-001.txt")).toHaveLength(1);
+  expect(other.getAttribute("aria-expanded")).toBe("false");
+  await user.click(other);
+  await user.click(first);
+  expect(screen.queryByText("file-000.txt")).toBeNull();
+  expect(screen.getByText("file-002.txt")).toBeTruthy();
+  expect(
+    screen
+      .getByText("file-003.txt")
+      .closest(".file-transfer-item")!
+      .classList.contains("is-batch-child"),
+  ).toBe(false);
+});
+
+test("scrolling loads all standalone transfers and all batches beyond the old limits", async () => {
+  const user = userEvent.setup();
+  const view = renderTransfers(
+    Array.from({ length: 95 }, (_, index) => makeTransfer(index)),
+  );
+  await user.click(screen.getByRole("button", { name: "传输任务" }));
+  await screen.findByText("file-000.txt");
+  expect(screen.queryByText("file-094.txt")).toBeNull();
+  for (let page = 0; page < 3; page++) scrollTransfersToBottom();
+  expect(screen.getByText("file-094.txt")).toBeTruthy();
+  expect(document.querySelectorAll(".file-transfer-item")).toHaveLength(95);
+  expect(screen.queryByText("向下滚动加载更多")).toBeNull();
+  view.unmount();
+
+  renderTransfers(
+    Array.from({ length: 45 }, (_, index) =>
+      makeTransfer(index, `batch-${index}`),
+    ),
+  );
+  await user.click(screen.getByRole("button", { name: "传输任务" }));
+  await screen.findByRole("button", { name: /^批次 batch-0，/ });
+  expect(screen.queryByRole("button", { name: /^批次 batch-44，/ })).toBeNull();
+  scrollTransfersToBottom();
+  expect(screen.getByRole("button", { name: /^批次 batch-44，/ })).toBeTruthy();
+  expect(document.querySelectorAll(".transfer-batch")).toHaveLength(45);
+  expect(document.querySelectorAll(".file-transfer-item")).toHaveLength(0);
+});
+
+test("expanded large batches load all their files on scroll and search reaches unloaded files", async () => {
+  const user = userEvent.setup();
+  renderTransfers(
+    Array.from({ length: 95 }, (_, index) =>
+      makeTransfer(index, "large-batch"),
+    ),
+  );
+  await user.click(screen.getByRole("button", { name: "传输任务" }));
+  await user.click(
+    await screen.findByRole("button", { name: /^批次 large-batch，/ }),
+  );
+  expect(screen.getByText("file-000.txt")).toBeTruthy();
+  expect(screen.queryByText("file-094.txt")).toBeNull();
+  for (let page = 0; page < 3; page++) scrollTransfersToBottom();
+  expect(screen.getByText("file-094.txt")).toBeTruthy();
+  expect(
+    document.querySelectorAll(".file-transfer-item.is-batch-child"),
+  ).toHaveLength(95);
+  await user.click(screen.getByRole("button", { name: /^批次 large-batch，/ }));
+  expect(screen.queryByText("file-094.txt")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "搜索传输任务" }));
+  await user.type(
+    screen.getByRole("textbox", { name: "搜索传输任务" }),
+    "file-094",
+  );
+  expect(
+    screen
+      .getByRole("button", { name: /^批次 large-batch，/ })
+      .getAttribute("aria-expanded"),
+  ).toBe("true");
+  expect(screen.getByText("file-094.txt")).toBeTruthy();
+  expect(document.querySelectorAll(".file-transfer-item")).toHaveLength(1);
+});
+
+test("expanding the last loaded batch reveals children and active progress stays bounded", async () => {
+  const user = userEvent.setup();
+  const items = Array.from({ length: 31 }, (_, index) => ({
+    ...makeTransfer(index, `batch-${index}`),
+    status: "running" as const,
+    phase: "transferring",
+    transferred_bytes: 2048,
+  }));
+  renderTransfers(items);
+  await user.click(screen.getByRole("button", { name: "传输任务" }));
+  const last = await screen.findByRole("button", { name: /^批次 batch-29，/ });
+  expect(screen.queryByText("file-029.txt")).toBeNull();
+  const progress = screen.getByRole("progressbar", {
+    name: "批次 batch-29 进度",
+  }) as HTMLProgressElement;
+  expect(progress.value).toBe(progress.max);
+  await user.click(last);
+  expect(screen.getByText("file-029.txt")).toBeTruthy();
+  expect(screen.getByRole("button", { name: /^批次 batch-30，/ })).toBeTruthy();
 });
