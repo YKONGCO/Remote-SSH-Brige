@@ -1,10 +1,10 @@
 use remote_ssh_brige_lib::{
-    database::{AuditQuery, Database},
+    database::{AuditDeleteRange, AuditQuery, Database},
     model::Audit,
 };
 
 #[test]
-fn time_range_filters_count_pages_and_export_across_dates_and_timezones() {
+fn time_range_filters_count_pages_export_and_delete_across_dates_and_timezones() {
     let dir = std::env::temp_dir().join(format!("audit-time-test-{}", uuid::Uuid::new_v4()));
     {
         let mut db = Database::open(&dir).unwrap();
@@ -63,6 +63,34 @@ fn time_range_filters_count_pages_and_export_across_dates_and_timezones() {
         assert_eq!(db.audit_page(&query).unwrap().total, 4);
         query.end_time = None;
         assert_eq!(db.audit_page(&query).unwrap().total, 5);
+        let range = AuditDeleteRange {
+            start_time: "2026-10-30T16:00:00.000Z".into(),
+            end_time: "2026-11-02T16:00:00.000Z".into(),
+            upper: page.upper,
+        };
+        // A new record in the same date range is outside the confirmed preview.
+        let mut later = db.audit("2").unwrap();
+        later.id = "later".into();
+        db.insert_audit(&later).unwrap();
+        let (deleted, recent) = db.delete_audits(&range).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "4", "later"]
+        );
+        assert!(db.audit("1").is_err());
+        assert!(db.audit("3").is_err());
+        assert_eq!(db.delete_audits(&range).unwrap().0, 0);
+        assert!(db
+            .delete_audits(&AuditDeleteRange {
+                start_time: range.end_time.clone(),
+                end_time: range.start_time.clone(),
+                upper: page.upper,
+            })
+            .is_err());
     }
     let target = dir.canonicalize().unwrap();
     assert!(target.starts_with(std::env::temp_dir().canonicalize().unwrap()));

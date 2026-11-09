@@ -84,6 +84,19 @@ export default function CodeEditor(props: {
         doc: latest.current.value,
         extensions: [
           basicSetup,
+          EditorState.phrases.of({
+            Find: "查找",
+            Replace: "替换为",
+            next: "下一处",
+            previous: "上一处",
+            all: "全部选中",
+            "match case": "区分大小写",
+            regexp: "正则表达式",
+            "by word": "全字匹配",
+            replace: "替换",
+            "replace all": "全部替换",
+            close: "关闭搜索",
+          }),
           EditorState.lineSeparator.of(
             latest.current.value.includes("\r\n")
               ? "\r\n"
@@ -141,17 +154,124 @@ export default function CodeEditor(props: {
               backgroundColor: "var(--bg-sidebar)",
               borderRight: "1px solid var(--border-default)",
             },
-            ".cm-activeLine, .cm-activeLineGutter": {
+            ".cm-activeLine": {
+              backgroundColor: "var(--code-active-line)",
+            },
+            ".cm-activeLineGutter": {
               backgroundColor: "var(--action-soft)",
             },
             "&.cm-focused": { outline: "none" },
-            "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection":
-              { backgroundColor: "var(--bg-selected)" },
+            ".cm-selectionBackground": {
+              backgroundColor: "var(--code-selection-inactive)",
+            },
+            "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground":
+              {
+                backgroundColor: "var(--code-selection)",
+              },
+            // CodeMirror draws selections behind the syntax-highlighted text.
+            // Override the global white selection foreground, including token spans.
+            ".cm-content ::selection, .cm-content::selection": {
+              color: "currentColor",
+              backgroundColor: "transparent",
+            },
             ".cm-cursor": { borderLeftColor: "var(--text-1)" },
             ".cm-panels": {
               color: "var(--text-1)",
               backgroundColor: "var(--bg-sidebar)",
             },
+            ".cm-panels-bottom": {
+              borderTop: "1px solid var(--border-default)",
+            },
+            ".cm-panel.cm-search": {
+              padding: "8px 48px 8px 14px",
+              fontFamily: "var(--font-interface)",
+              fontSize: "12px",
+              lineHeight: "36px",
+            },
+            ".cm-search input, .cm-search button, .cm-search label": {
+              margin: "3px 6px 3px 0",
+              verticalAlign: "middle",
+            },
+            ".cm-search .cm-textfield": {
+              width: "clamp(140px, 28vw, 260px)",
+              maxWidth: "100%",
+              height: "30px",
+              padding: "0 10px",
+              font: "inherit",
+              lineHeight: "normal",
+              borderRadius: "6px",
+            },
+            ".cm-search .cm-textfield::placeholder": {
+              color: "var(--text-3)",
+            },
+            ".cm-search .cm-textfield:focus": {
+              borderColor: "var(--action-bg)",
+              outline: "1px solid var(--action-bg)",
+              outlineOffset: "-1px",
+            },
+            ".cm-search .cm-button": {
+              height: "30px",
+              padding: "0 10px",
+              font: "inherit",
+              lineHeight: "normal",
+              borderRadius: "6px",
+              cursor: "pointer",
+            },
+            ".cm-search .cm-button:hover": {
+              color: "var(--action-text)",
+              background: "var(--action-soft)",
+              borderColor: "var(--action-bg)",
+            },
+            // Keep global form label/input rules out of the search options.
+            ".cm-search label": {
+              display: "inline-flex",
+              flexDirection: "row",
+              alignItems: "center",
+              gap: "6px",
+              marginRight: "12px",
+              color: "var(--text-2)",
+              fontSize: "12px",
+              lineHeight: "30px",
+              whiteSpace: "nowrap",
+              cursor: "pointer",
+            },
+            '.cm-search input[type="checkbox"]': {
+              appearance: "auto",
+              flex: "0 0 14px",
+              width: "14px",
+              height: "14px",
+              minHeight: "0",
+              margin: "0",
+              padding: "0",
+              accentColor: "var(--action-bg)",
+              cursor: "pointer",
+            },
+            '.cm-panel.cm-search button[name="close"]': {
+              top: "50%",
+              transform: "translateY(-50%)",
+              right: "12px",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "30px",
+              height: "30px",
+              padding: "0",
+              margin: "0",
+              borderRadius: "6px",
+              color: "var(--text-3)",
+              fontSize: "20px",
+              lineHeight: "1",
+              cursor: "pointer",
+            },
+            '.cm-panel.cm-search button[name="close"]:hover': {
+              color: "var(--text-1)",
+              background: "var(--bg-selected)",
+            },
+            '.cm-search button:focus-visible, .cm-search input[type="checkbox"]:focus-visible':
+              {
+                outline: "2px solid var(--action-bg)",
+                outlineOffset: "2px",
+              },
             ".cm-textfield, .cm-button": {
               color: "var(--text-1)",
               background: "var(--bg-card)",

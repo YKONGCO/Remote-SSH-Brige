@@ -1,11 +1,13 @@
 import { productName } from "./branding";
 import { McpPanel } from "./components/McpPanel";
 import { Settings } from "./components/Settings";
+import type { RuntimeSettings } from "./runtime-settings";
 import { ApprovalCenter } from "./components/ApprovalCenter";
 import { readPreferences, usePreferences } from "./preferences";
 import { CompactTime } from "./components/CompactTime";
 import { AuditDetails } from "./components/AuditDetails";
 import { AuditTimeFilter } from "./components/AuditTimeFilter";
+import { AuditDeleteDialog } from "./components/AuditDeleteDialog";
 import { Badge } from "./components/ui/badge";
 import {
   DropdownMenu,
@@ -186,6 +188,25 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
+    if (data.mcp.error) notify(data.mcp.error, true);
+  }, [data.mcp.error, notify]);
+  useEffect(() => {
+    let active = true;
+    void api<RuntimeSettings>("runtime_settings")
+      .then((settings) => {
+        if (active) {
+          setMcpHost(settings.mcp_host);
+          setPort(settings.mcp_port);
+        }
+      })
+      .catch((error) => {
+        if (active) notify(String(error), true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [notify]);
+  useEffect(() => {
     void refresh();
     if (preferences.refreshSeconds === "0") return;
     const timer = setInterval(
@@ -239,6 +260,7 @@ export default function App() {
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditError, setAuditError] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [confirmAuditDelete, setConfirmAuditDelete] = useState(false);
   const auditScroll = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const timer = setTimeout(
@@ -871,6 +893,14 @@ export default function App() {
                   </span>
                 </div>
                 <div className="audit-toolbar-controls">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="audit-delete-button"
+                    onClick={() => setConfirmAuditDelete(true)}
+                  >
+                    <Trash2 size={15} /> 批量删除
+                  </Button>
                   <AuditTimeFilter
                     query={auditQuery}
                     onChange={(range) =>
@@ -956,7 +986,11 @@ export default function App() {
                             tabIndex={0}
                             onClick={() => setAuditDetail(a)}
                             onKeyDown={(e) => {
-                              if (e.key === "Enter") setAuditDetail(a);
+                              if (
+                                e.key === "Enter" &&
+                                e.target === e.currentTarget
+                              )
+                                setAuditDetail(a);
                             }}
                           >
                             <td>
@@ -1217,6 +1251,23 @@ export default function App() {
             </div>
           </div>
         </ModalFrame>
+      )}
+      {confirmAuditDelete && (
+        <AuditDeleteDialog
+          initialRange={auditQuery}
+          onClose={() => setConfirmAuditDelete(false)}
+          onDeleted={(deleted) => {
+            setConfirmAuditDelete(false);
+            setAuditDetail(null);
+            setAuditPage({ entries: [], total: 0, upper: 0 });
+            setAuditQuery((query) => ({
+              ...query,
+              offset: 0,
+              upper: undefined,
+            }));
+            notify(`已删除 ${deleted} 条操作记录`);
+          }}
+        />
       )}
       {auditDetail && (
         <AuditDetails

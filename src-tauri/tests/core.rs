@@ -35,6 +35,140 @@ fn server() -> Server {
 }
 
 #[test]
+fn audit_recognizes_successful_port_forward_close_without_hiding_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().into()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    for source in ["mcp", "desktop"] {
+        for (kind, status, success) in [
+            ("port_forward_close", "closing", true),
+            ("port_forward_close", "closed", true),
+            ("port_forward_close", "failed", false),
+            ("port_forward_close", "disconnected", false),
+            ("port_forward_close", "cancelled", false),
+            ("port_forward_open", "closed", false),
+            ("job", "failed", false),
+            ("transfer", "cancelled", false),
+        ] {
+            let op = Operation {
+                kind: kind.into(),
+                tunnel_id: "closed-tunnel".into(),
+                ..Default::default()
+            };
+            state
+                .log(
+                    &saved,
+                    source,
+                    &op,
+                    &Ok(serde_json::json!({"status":status,"error":null})),
+                    0,
+                )
+                .unwrap();
+            let entry = state.audit.lock().unwrap().last().unwrap().clone();
+            assert_eq!(entry.success, success, "{source} {kind} {status}");
+            assert_eq!(state.audit_details(&entry.id).unwrap().success, success);
+        }
+        let op = Operation {
+            kind: "port_forward_close".into(),
+            tunnel_id: "missing-tunnel".into(),
+            ..Default::default()
+        };
+        state
+            .log(
+                &saved,
+                source,
+                &op,
+                &Err(anyhow::anyhow!("NOT_FOUND: Tunnel does not exist")),
+                0,
+            )
+            .unwrap();
+        assert!(!state.audit.lock().unwrap().last().unwrap().success);
+    }
+}
+
+#[test]
+fn audit_batch_delete_is_atomic_and_updates_pages_details_cache_and_restart() {
+    use remote_ssh_brige_lib::database::{AuditDeleteRange, AuditQuery, DATABASE_FILE};
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    for index in 0..3 {
+        state
+            .log(
+                &saved,
+                "desktop",
+                &Operation {
+                    kind: "exec".into(),
+                    command: format!("echo {index}"),
+                    ..Default::default()
+                },
+                &Ok(serde_json::json!({"exit_code":0})),
+                0,
+            )
+            .unwrap();
+    }
+    let ids: Vec<_> = state
+        .audit
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    let connection = rusqlite::Connection::open(dir.join(DATABASE_FILE)).unwrap();
+    connection
+        .execute(
+            "UPDATE audit_entries SET time='2026-11-01T12:00:00+08:00' WHERE id!=?1",
+            [&ids[2]],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE audit_entries SET time='2026-11-03T00:00:00+08:00' WHERE id=?1",
+            [&ids[2]],
+        )
+        .unwrap();
+    let range = AuditDeleteRange {
+        start_time: "2026-11-01T00:00:00+08:00".into(),
+        end_time: "2026-11-03T00:00:00+08:00".into(),
+        upper: i64::MAX,
+    };
+    connection.execute_batch("CREATE TRIGGER reject_batch BEFORE DELETE ON audit_entries WHEN old.detail='echo 1' BEGIN SELECT RAISE(ABORT, 'locked'); END;").unwrap();
+    assert!(state.delete_audits(&range).is_err());
+    assert_eq!(state.audit.lock().unwrap().len(), 3);
+    assert!(state.audit_details(&ids[0]).is_ok());
+    connection
+        .execute_batch("DROP TRIGGER reject_batch")
+        .unwrap();
+    assert_eq!(state.delete_audits(&range).unwrap(), 2);
+    assert!(state
+        .delete_audits(&AuditDeleteRange {
+            start_time: String::new(),
+            end_time: String::new(),
+            upper: 0,
+        })
+        .is_err());
+    assert_eq!(state.audit.lock().unwrap().len(), 1);
+    assert!(state.audit_details(&ids[0]).is_err());
+    assert_eq!(
+        state
+            .audit_page(&AuditQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap()
+            .total,
+        1
+    );
+    drop(connection);
+    drop(state);
+    let restored = AppState::open(dir.clone()).unwrap();
+    assert_eq!(restored.audit.lock().unwrap().len(), 1);
+    assert_eq!(restored.audit.lock().unwrap()[0].id, ids[2]);
+    drop(restored);
+    cleanup(dir);
+}
+
+#[test]
 fn manual_path_updates_persist_and_clear_without_stale_server_values_overwriting_them() {
     use remote_ssh_brige_lib::model::LoginPathUpdate;
     let dir = workspace();
@@ -836,7 +970,7 @@ fn json_workspaces_are_rejected_without_creating_a_database_or_changing_files() 
 
 #[test]
 fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
-    for version in [0, 1, 5] {
+    for version in [0, 1, 6] {
         let dir = workspace();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remote-desk.sqlite3");

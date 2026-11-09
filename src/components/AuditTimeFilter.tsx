@@ -1,12 +1,158 @@
 ﻿import { useLayoutEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { useCallback } from "react";
+import { useCallback, type ReactNode } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
 import type { AuditQuery } from "../types";
 import { Button } from "./ui/button";
 
 function dateKey(date: Date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `${String(date.getFullYear()).padStart(4, "0")}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function monthDate(year: number, month: number) {
+  const date = new Date(0);
+  date.setFullYear(year, month, 1);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function CalendarMonth({
+  current,
+  side,
+  onChange,
+  children,
+}: {
+  current: Date;
+  side: string;
+  onChange: (date: Date) => void;
+  children: ReactNode;
+}) {
+  const [view, setView] = useState<"days" | "months" | "years">("days");
+  const [yearPage, setYearPage] = useState(1);
+  const year = current.getFullYear();
+  const month = current.getMonth();
+  const now = new Date();
+  const maxYear = now.getFullYear();
+  const maxMonth = now.getMonth();
+  const navigate = (direction: number) => {
+    if (view === "years")
+      setYearPage((page) => Math.max(1, page + direction * 12));
+    else
+      onChange(
+        monthDate(
+          year + (view === "months" ? direction : 0),
+          month + (view === "days" ? direction : 0),
+        ),
+      );
+  };
+  const atStart =
+    view === "years"
+      ? yearPage === 1
+      : year === 1 && (view === "months" || month === 0);
+  const atEnd =
+    view === "years"
+      ? yearPage + 12 > maxYear
+      : year >= maxYear && (view === "months" || month >= maxMonth);
+  const navigationLabels =
+    view === "years"
+      ? ["前12年", "后12年"]
+      : view === "months"
+        ? ["上一年", "下一年"]
+        : ["上个月", "下个月"];
+
+  return (
+    <section
+      className="audit-calendar-month"
+      aria-label={`${side}日历：${year}年${month + 1}月`}
+    >
+      <div className="audit-calendar-month-header">
+        <button
+          type="button"
+          className="audit-calendar-nav"
+          aria-label={`${side}${navigationLabels[0]}`}
+          disabled={atStart}
+          onClick={() => navigate(-1)}
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <div className="audit-calendar-heading">
+          {view === "years" ? (
+            <span>
+              {yearPage}–{yearPage + 11}
+            </span>
+          ) : (
+            <>
+              <button
+                type="button"
+                aria-label={`${side}年份`}
+                onClick={() => {
+                  setYearPage(Math.floor((year - 1) / 12) * 12 + 1);
+                  setView("years");
+                }}
+              >
+                {year}年
+              </button>
+              <button
+                type="button"
+                aria-label={`${side}月份`}
+                onClick={() => setView(view === "months" ? "days" : "months")}
+              >
+                {month + 1}月
+              </button>
+            </>
+          )}
+        </div>
+        <button
+          type="button"
+          className="audit-calendar-nav"
+          aria-label={`${side}${navigationLabels[1]}`}
+          disabled={atEnd}
+          onClick={() => navigate(1)}
+        >
+          <ChevronRight size={16} />
+        </button>
+      </div>
+      {view === "days" ? (
+        children
+      ) : (
+        <div className="audit-calendar-options">
+          {Array.from({ length: 12 }, (_, index) => {
+            const value = view === "years" ? yearPage + index : index;
+            const label = `${view === "years" ? value : value + 1}${view === "years" ? "年" : "月"}`;
+            const unavailable =
+              view === "years"
+                ? value > maxYear
+                : year === maxYear && value > maxMonth;
+            return (
+              <button
+                type="button"
+                key={value}
+                className="audit-calendar-option"
+                aria-label={`${side}${label}`}
+                aria-pressed={
+                  view === "years" ? value === year : value === month
+                }
+                disabled={unavailable}
+                onClick={() => {
+                  onChange(
+                    view === "years"
+                      ? monthDate(
+                          value,
+                          value === maxYear ? Math.min(month, maxMonth) : month,
+                        )
+                      : monthDate(year, value),
+                  );
+                  setView(view === "years" ? "months" : "days");
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function localDate(value?: string, previousDay = false) {
@@ -19,9 +165,15 @@ function localDate(value?: string, previousDay = false) {
 export function AuditTimeFilter({
   query,
   onChange,
+  disabled = false,
+  placeholder = "时间范围",
+  onOpenChange,
 }: {
   query: AuditQuery;
   onChange: (range: Pick<AuditQuery, "start_time" | "end_time">) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const appliedStart = localDate(query.start_time);
   const appliedEnd = localDate(query.end_time, true);
@@ -29,7 +181,13 @@ export function AuditTimeFilter({
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [hover, setHover] = useState("");
-  const [month, setMonth] = useState(() => new Date());
+  const [months, setMonths] = useState(() => {
+    const now = new Date();
+    return [
+      monthDate(now.getFullYear(), now.getMonth() - 1),
+      monthDate(now.getFullYear(), now.getMonth()),
+    ];
+  });
   const [position, setPosition] = useState({ left: 0, top: 0 });
   const trigger = useRef<HTMLButtonElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -67,7 +225,7 @@ export function AuditTimeFilter({
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", place, true);
     };
-  }, [open, month, place]);
+  }, [open, months, place]);
 
   const changeOpen = (next: boolean) => {
     if (next) {
@@ -77,15 +235,27 @@ export function AuditTimeFilter({
       const initial = appliedStart
         ? new Date(`${appliedStart}T00:00:00`)
         : new Date();
-      setMonth(
-        new Date(
-          initial.getFullYear(),
-          initial.getMonth() - (appliedStart ? 0 : 1),
-          1,
-        ),
+      const now = new Date();
+      const thisMonth = monthDate(now.getFullYear(), now.getMonth());
+      let left = monthDate(
+        initial.getFullYear(),
+        initial.getMonth() - (appliedStart ? 0 : 1),
       );
+      const last = appliedEnd ? new Date(`${appliedEnd}T00:00:00`) : null;
+      let right =
+        last &&
+        (last.getFullYear() !== left.getFullYear() ||
+          last.getMonth() !== left.getMonth())
+          ? monthDate(last.getFullYear(), last.getMonth())
+          : monthDate(left.getFullYear(), left.getMonth() + 1);
+      if (right > thisMonth) {
+        right = thisMonth;
+        left = monthDate(now.getFullYear(), now.getMonth() - 1);
+      }
+      setMonths([left, right]);
     }
     setOpen(next);
+    onOpenChange?.(next);
   };
 
   const select = (key: string) => {
@@ -104,6 +274,7 @@ export function AuditTimeFilter({
       end_time: exclusiveEnd.toISOString(),
     });
     setOpen(false);
+    onOpenChange?.(false);
   };
 
   const previewEnd = end || hover || start;
@@ -116,7 +287,7 @@ export function AuditTimeFilter({
         ? `${appliedStart} 起`
         : appliedEnd
           ? `截至 ${appliedEnd}`
-          : "时间范围";
+          : placeholder;
 
   return (
     <Dialog.Root open={open} onOpenChange={changeOpen} modal={false}>
@@ -126,6 +297,7 @@ export function AuditTimeFilter({
           variant="outline"
           size="sm"
           className="audit-time-trigger"
+          disabled={disabled}
           aria-label={`时间范围：${label}`}
         >
           <CalendarDays size={15} />
@@ -141,49 +313,25 @@ export function AuditTimeFilter({
         >
           <Dialog.Title className="sr-only">选择操作记录日期范围</Dialog.Title>
           <div className="audit-calendar-months">
-            <button
-              type="button"
-              className="audit-calendar-nav previous"
-              aria-label="上个月"
-              onClick={() =>
-                setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))
-              }
-            >
-              <ChevronLeft size={18} />
-            </button>
-            <button
-              type="button"
-              className="audit-calendar-nav next"
-              aria-label="下个月"
-              disabled={
-                new Date(month.getFullYear(), month.getMonth() + 1, 1) >=
-                new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-              }
-              onClick={() =>
-                setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))
-              }
-            >
-              <ChevronRight size={18} />
-            </button>
-            {[0, 1].map((offset) => {
-              const current = new Date(
-                month.getFullYear(),
-                month.getMonth() + offset,
-                1,
-              );
+            {months.map((current, index) => {
               const year = current.getFullYear();
               const monthIndex = current.getMonth();
               const padding = (current.getDay() + 6) % 7;
-              const days = new Date(year, monthIndex + 1, 0).getDate();
+              const nextMonth = monthDate(year, monthIndex + 1);
+              nextMonth.setDate(0);
+              const days = nextMonth.getDate();
               return (
-                <section
-                  className="audit-calendar-month"
-                  key={`${year}-${monthIndex}`}
-                  aria-label={`${year}年${monthIndex + 1}月`}
+                <CalendarMonth
+                  key={index}
+                  current={current}
+                  side={index === 0 ? "左侧" : "右侧"}
+                  onChange={(next) => {
+                    setHover("");
+                    setMonths((previous) =>
+                      previous.map((month, i) => (i === index ? next : month)),
+                    );
+                  }}
                 >
-                  <h3>
-                    {year}年{monthIndex + 1}月
-                  </h3>
                   <div className="audit-calendar-weekdays" aria-hidden="true">
                     {["一", "二", "三", "四", "五", "六", "日"].map((day) => (
                       <span key={day}>{day}</span>
@@ -230,7 +378,7 @@ export function AuditTimeFilter({
                       );
                     })}
                   </div>
-                </section>
+                </CalendarMonth>
               );
             })}
           </div>
@@ -244,6 +392,7 @@ export function AuditTimeFilter({
               onClick={() => {
                 onChange({ start_time: undefined, end_time: undefined });
                 setOpen(false);
+                onOpenChange?.(false);
               }}
             >
               清除

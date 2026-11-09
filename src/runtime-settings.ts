@@ -86,6 +86,9 @@ export function effectiveCommandPolicy(
 }
 export interface RuntimeSettings {
   close_to_tray: boolean;
+  mcp_auto_start: boolean;
+  mcp_host: string;
+  mcp_port: number;
   deletion_protection: boolean;
   block_dangerous_commands: boolean;
   command_policy?: CommandPolicy | null;
@@ -124,6 +127,9 @@ export const defaultTransferSettings: TransferSettings = {
 };
 export const defaultRuntimeSettings: RuntimeSettings = {
   close_to_tray: true,
+  mcp_auto_start: false,
+  mcp_host: "127.0.0.1",
+  mcp_port: 18920,
   deletion_protection: true,
   block_dangerous_commands: true,
   remote_read_only: false,

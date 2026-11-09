@@ -30,6 +30,34 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
+test("MCP auto-start is off by default, persists on toggle and rolls back a failed save", async () => {
+  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
+  render(<Settings />);
+  const control = screen.getByRole("switch", { name: "自动启动 MCP 服务" });
+  expect(control.hasAttribute("disabled")).toBe(true);
+  await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
+  expect(control.getAttribute("aria-checked")).toBe("false");
+  vi.mocked(api).mockImplementationOnce(
+    async (_command, args) => args?.settings as never,
+  );
+  fireEvent.click(control);
+  await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
+  expect(control.getAttribute("aria-checked")).toBe("true");
+  expect(api).toHaveBeenCalledWith("save_runtime_settings", {
+    settings: expect.objectContaining({
+      mcp_auto_start: true,
+      mcp_host: "127.0.0.1",
+      mcp_port: 18920,
+    }),
+  });
+  vi.mocked(api).mockRejectedValueOnce(new Error("save failed"));
+  fireEvent.click(control);
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toContain("save failed"),
+  );
+  expect(control.getAttribute("aria-checked")).toBe("true");
+});
+
 test("settings immediately show changes and roll back a failed save without remounting", async () => {
   vi.mocked(api).mockResolvedValueOnce({
     ...defaultRuntimeSettings,

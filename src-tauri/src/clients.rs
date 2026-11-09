@@ -245,6 +245,55 @@ pub fn list(targets: &[ClientTarget], status: &McpStatus) -> Vec<ClientConnectio
         })
         .collect()
 }
+
+/// Refresh existing remote-ssh entries without opting new clients into the service.
+/// Process every target so one broken configuration does not block the others.
+pub fn refresh_configured(targets: &[ClientTarget], status: &McpStatus) -> Result<()> {
+    let mut errors = Vec::new();
+    for target in targets {
+        let result = (|| -> Result<()> {
+            let Some(source) = read(&target.path)? else {
+                return Ok(());
+            };
+            if source.trim().is_empty() {
+                return Ok(());
+            }
+            let configured = if target.id == "codex" {
+                let doc: toml_edit::DocumentMut = source.parse().context("TOML 配置格式无效")?;
+                doc.get("mcp_servers")
+                    .and_then(|servers| servers.get(KEY))
+                    .is_some()
+            } else {
+                let root = CstRootNode::parse(&source, &Default::default())
+                    .context("JSON 配置格式无效")?;
+                let value = root.to_serde_value().context("配置根节点必须是对象")?;
+                let map_key = if target.id == "opencode" {
+                    "mcp"
+                } else {
+                    "mcpServers"
+                };
+                value
+                    .get(map_key)
+                    .and_then(|servers| servers.get(KEY))
+                    .is_some()
+            };
+            if configured {
+                install(target, status)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(format!("{}：{error}", target.name));
+        }
+    }
+    anyhow::ensure!(
+        errors.is_empty(),
+        "客户端配置更新失败：{}",
+        errors.join("；")
+    );
+    Ok(())
+}
+
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {

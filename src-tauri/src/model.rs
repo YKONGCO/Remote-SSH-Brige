@@ -10,6 +10,9 @@ pub const MAX_COMMAND_RULES: usize = 4096;
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
     pub close_to_tray: bool,
+    pub mcp_auto_start: bool,
+    pub mcp_host: String,
+    pub mcp_port: u16,
     pub deletion_protection: bool,
     pub block_dangerous_commands: bool,
     pub command_policy: Option<CommandPolicy>,
@@ -32,6 +35,9 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             close_to_tray: true,
+            mcp_auto_start: false,
+            mcp_host: "127.0.0.1".into(),
+            mcp_port: 18920,
             deletion_protection: true,
             block_dangerous_commands: true,
             command_policy: None,
@@ -83,6 +89,11 @@ impl RuntimeSettings {
         policy
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.mcp_port > 0, "MCP port must be 1-65535");
+        anyhow::ensure!(
+            self.mcp_host.parse::<std::net::IpAddr>().is_ok(),
+            "MCP listen address must be a valid IPv4 or IPv6 address"
+        );
         self.transfers.validate()?;
         if let Some(policy) = &self.command_policy {
             policy.validate()?;

@@ -5,7 +5,7 @@ use crate::{
     state::AppState,
 };
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -21,7 +21,7 @@ use std::{
 const MAX_TUNNELS: usize = 32;
 const MAX_CONNECTIONS: usize = 16;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TunnelInfo {
     pub tunnel_id: String,
     pub server_id: String,
@@ -69,6 +69,40 @@ impl Drop for TunnelManager {
     }
 }
 impl TunnelManager {
+    pub fn history(&self, state: &AppState) -> Result<Vec<TunnelInfo>> {
+        // Use the same lock order as deletion and listener finalization.
+        let entries = self.entries.lock().unwrap();
+        let mut items: HashMap<_, _> = state
+            .database
+            .lock()
+            .unwrap()
+            .tunnel_history()?
+            .into_iter()
+            .map(|info| (info.tunnel_id.clone(), info))
+            .collect();
+        for (id, tunnel) in entries.iter() {
+            items.insert(id.clone(), tunnel.info.lock().unwrap().clone());
+        }
+        let mut items: Vec<_> = items.into_values().collect();
+        items.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.tunnel_id.cmp(&a.tunnel_id))
+        });
+        Ok(items)
+    }
+    pub fn delete(&self, state: &AppState, id: &str) -> Result<()> {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(tunnel) = entries.get(id) {
+            anyhow::ensure!(
+                tunnel.info.lock().unwrap().status == "closed",
+                "请先关闭端口转发，再删除记录"
+            );
+        }
+        state.database.lock().unwrap().delete_tunnel(id)?;
+        entries.remove(id);
+        Ok(())
+    }
     pub fn list(&self, server_id: Option<&str>) -> Vec<TunnelInfo> {
         let mut items: Vec<_> = self
             .entries
@@ -221,11 +255,20 @@ pub fn operate(
         });
     }
     let worker = tunnel.clone();
-    std::thread::Builder::new()
+    state
+        .database
+        .lock()
+        .unwrap()
+        .save_tunnel(&tunnel.info.lock().unwrap())?;
+    let spawned = std::thread::Builder::new()
         .name("ssh-forward".into())
         .spawn(move || {
             run_listener(listener, &worker, weak, original);
-        })?;
+        });
+    if let Err(error) = spawned {
+        state.database.lock().unwrap().delete_tunnel(&id)?;
+        return Err(error.into());
+    }
     entries.insert(id, tunnel.clone());
     let info = tunnel.info.lock().unwrap().clone();
     Ok(json!(info))
@@ -307,16 +350,26 @@ fn run_listener(listener: TcpListener, tunnel: &Arc<Tunnel>, weak: Weak<AppState
     for w in workers {
         let _ = w.join();
     }
-    tunnel.info.lock().unwrap().status = "closed".into();
     if let Some(state) = weak.upgrade() {
-        let info = tunnel.info.lock().unwrap().clone();
+        // Serialize final persistence with history deletion so deleted records stay deleted.
+        let entries = state.tunnels.entries.lock().unwrap();
+        let mut info = tunnel.info.lock().unwrap();
+        info.status = "closed".into();
+        if let Err(error) = state.database.lock().unwrap().save_tunnel(&info) {
+            info.error = Some(format!("转发已关闭，但历史保存失败：{error:#}"));
+        }
+        let final_info = info.clone();
+        drop(info);
+        drop(entries);
         let op = Operation {
             kind: "port_forward_close".into(),
             server_id: server.id.clone(),
-            tunnel_id: info.tunnel_id.clone(),
+            tunnel_id: final_info.tunnel_id.clone(),
             ..Default::default()
         };
-        let _ = state.log(&server, &source, &op, &Ok(json!(info)), 0);
+        let _ = state.log(&server, &source, &op, &Ok(json!(final_info)), 0);
+    } else {
+        tunnel.info.lock().unwrap().status = "closed".into();
     }
 }
 
@@ -434,6 +487,44 @@ fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_survives_restart_and_deletion_without_restoring_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(dir.path().into()).unwrap();
+        let info: TunnelInfo = serde_json::from_value(json!({
+            "tunnel_id":"retained", "server_id":"removed-server", "server_name":"test",
+            "source":"mcp", "local_host":"127.0.0.1", "local_port":18080,
+            "remote_host":"127.0.0.1", "remote_port":8080, "status":"running",
+            "created_at":"2026-11-01T00:00:00Z", "connections":2,
+            "bytes_sent":123, "bytes_received":456, "error":null
+        }))
+        .unwrap();
+        state.database.lock().unwrap().save_tunnel(&info).unwrap();
+        state.tunnels.entries.lock().unwrap().insert(
+            info.tunnel_id.clone(),
+            Arc::new(Tunnel {
+                info: Mutex::new(info),
+                cancel: AtomicBool::new(false),
+                sockets: Mutex::new(HashMap::new()),
+            }),
+        );
+        assert!(state.tunnels.delete(&state, "retained").is_err());
+        assert_eq!(state.tunnels.history(&state).unwrap().len(), 1);
+        drop(state);
+        let state = AppState::open(dir.path().into()).unwrap();
+        assert!(state.tunnels.list(None).is_empty());
+        let retained = state.tunnels.history(&state).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].status, "closed");
+        assert_eq!(retained[0].connections, 0);
+        assert_eq!(retained[0].bytes_received, 456);
+        state.tunnels.delete(&state, "retained").unwrap();
+        assert!(state.tunnels.history(&state).unwrap().is_empty());
+        drop(state);
+        let state = AppState::open(dir.path().into()).unwrap();
+        assert!(state.tunnels.history(&state).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn permissions_read_only_and_approval_are_enforced_before_network() {
         let dir = tempfile::tempdir().unwrap();
@@ -560,6 +651,11 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(tunnel.info.lock().unwrap().status, "closed", "{mode}");
             assert!(TcpListener::bind(("127.0.0.1", port)).is_ok(), "{mode}");
+            let history = state.database.lock().unwrap().tunnel_history().unwrap();
+            assert_eq!(history.len(), 1, "{mode}");
+            assert_eq!(history[0].status, "closed", "{mode}");
+            state.tunnels.delete(&state, "test").unwrap();
+            assert!(state.tunnels.history(&state).unwrap().is_empty(), "{mode}");
         }
     }
     #[test]

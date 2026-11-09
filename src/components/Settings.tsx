@@ -265,9 +265,12 @@ export function Settings() {
       </button>
     );
   }
-  function securityToggle(
+  function runtimeToggle(
     name:
-      "deletion_protection" | "block_dangerous_commands" | "remote_read_only",
+      | "deletion_protection"
+      | "block_dangerous_commands"
+      | "remote_read_only"
+      | "mcp_auto_start",
     label: string,
   ) {
     return (
@@ -357,6 +360,12 @@ export function Settings() {
             </SelectField>
           </Row>
           <Row
+            title="自动启动 MCP 服务"
+            description="下次打开应用时按上次成功启动的地址和端口启动服务，并更新已接入客户端的配置（自动备份）。"
+          >
+            {runtimeToggle("mcp_auto_start", "自动启动 MCP 服务")}
+          </Row>
+          <Row
             title="状态刷新频率"
             description="列表自动刷新间隔，不影响终端输出。"
           >
@@ -398,19 +407,19 @@ export function Settings() {
             title="只读保护"
             description="禁止文件修改、命令和终端交互，允许查看与下载。"
           >
-            {securityToggle("remote_read_only", "只读保护")}
+            {runtimeToggle("remote_read_only", "只读保护")}
           </Row>
           <Row
             title="删除保护"
             description="禁止桌面和 MCP 文件删除，不限制 Shell 和终端。"
           >
-            {securityToggle("deletion_protection", "删除保护")}
+            {runtimeToggle("deletion_protection", "删除保护")}
           </Row>
           <Row
             title="危险命令拦截"
             description="拦截 rm、磁盘破坏、关机等高危命令。"
           >
-            {securityToggle("block_dangerous_commands", "危险命令拦截")}
+            {runtimeToggle("block_dangerous_commands", "危险命令拦截")}
           </Row>
           <Row
             title="审批模式"

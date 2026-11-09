@@ -39,6 +39,110 @@ beforeAll(() => {
 });
 afterEach(cleanup);
 
+test("audit date deletion includes unloaded rows and supports cancellation and retry without selection checkboxes", async () => {
+  localStorage.clear();
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-11-09T12:00:00"));
+  const realApi = remoteApi.api;
+  let fail = true;
+  let entries = Array.from({ length: 56 }, (_, index) => ({
+    id: `batch-${index}`,
+    time: new Date(
+      index < 55 ? "2026-11-01T12:00:00" : "2026-11-03T00:00:00",
+    ).toISOString(),
+    server_id: "demo-1",
+    server_name: "批量服务器",
+    source: "desktop",
+    kind: "exec",
+    detail: `batch command ${index}`,
+    success: true,
+    duration_ms: 1,
+    summary: "ok",
+  }));
+  const requests = vi
+    .spyOn(remoteApi, "api")
+    .mockImplementation(async (command, args) => {
+      if (command === "audit_page") {
+        const query = args!.query as {
+          offset: number;
+          limit: number;
+          start_time?: string;
+          end_time?: string;
+        };
+        const matching = entries.filter(
+          (entry) =>
+            (!query.start_time || entry.time >= query.start_time) &&
+            (!query.end_time || entry.time < query.end_time),
+        );
+        return {
+          entries: matching.slice(query.offset, query.offset + query.limit),
+          total: matching.length,
+          upper: 56,
+        } as never;
+      }
+      if (command === "delete_audits") {
+        if (fail) throw new Error("batch database locked");
+        const range = args!.range as { start_time: string; end_time: string };
+        const before = entries.length;
+        entries = entries.filter(
+          (entry) =>
+            entry.time < range.start_time || entry.time >= range.end_time,
+        );
+        return (before - entries.length) as never;
+      }
+      return realApi(command, args);
+    });
+  try {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "操作记录" }));
+    await screen.findByText("batch command 0");
+    expect(
+      within(screen.getByLabelText("操作记录列表")).queryByRole("checkbox"),
+    ).toBeNull();
+    await user.click(screen.getByRole("button", { name: "批量删除" }));
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "删除",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(
+      requests.mock.calls.some(([command]) => command === "delete_audits"),
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "批量删除" }));
+    await user.click(
+      screen.getByRole("button", { name: "时间范围：选择日期范围" }),
+    );
+    await user.click(screen.getByRole("button", { name: "2026-11-01" }));
+    await user.click(screen.getByRole("button", { name: "2026-11-02" }));
+    await screen.findByText("55 条记录");
+    await user.click(screen.getByRole("button", { name: "删除" }));
+    await screen.findByRole("alert");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fail = false;
+    await user.click(screen.getByRole("button", { name: "删除" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await screen.findByText("batch command 55");
+    expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
+      "1 条",
+    );
+    expect(screen.queryByText("batch command 0")).toBeNull();
+    expect(requests).toHaveBeenCalledWith("delete_audits", {
+      range: {
+        start_time: new Date("2026-11-01T00:00:00").toISOString(),
+        end_time: new Date("2026-11-03T00:00:00").toISOString(),
+        upper: 56,
+      },
+    });
+  } finally {
+    requests.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
 test("disables the native context menu while the app is mounted", () => {
   const view = render(<App />);
   const blocked = new MouseEvent("contextmenu", {

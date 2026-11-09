@@ -31,6 +31,26 @@ pub struct AuditPage {
     pub upper: i64,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDeleteRange {
+    pub start_time: String,
+    pub end_time: String,
+    pub upper: i64,
+}
+
+impl AuditDeleteRange {
+    pub fn validate(&self) -> Result<()> {
+        let start =
+            chrono::DateTime::parse_from_rfc3339(&self.start_time).context("删除开始日期无效")?;
+        let end =
+            chrono::DateTime::parse_from_rfc3339(&self.end_time).context("删除结束日期无效")?;
+        anyhow::ensure!(start < end, "结束日期不能早于开始日期");
+        anyhow::ensure!(self.upper >= 0, "记录范围无效");
+        Ok(())
+    }
+}
+
 const AUDIT_FILTER: &str = "sequence <= ?1 AND
     (?2 IN ('', 'all') OR (?2='mcp' AND source='mcp')
     OR (?2='error' AND (success=0 OR kind='security_reject'))
@@ -156,10 +176,10 @@ impl Database {
         let mut connection = Connection::open(database_path).context("无法打开 SQLite 数据库")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 4 {
+        if version > 5 {
             bail!("数据库版本较新，请使用新版应用打开")
         }
-        if version != 0 && version != 2 && version != 3 && version != 4 {
+        if !matches!(version, 0 | 2 | 3 | 4 | 5) {
             bail!("不再支持此数据库版本，请先使用旧版应用升级至 SQLite 版本 2")
         }
         if version == 0 {
@@ -183,7 +203,7 @@ impl Database {
             transaction.execute_batch("ALTER TABLE servers ADD COLUMN login_path TEXT; ALTER TABLE servers ADD COLUMN login_path_synced_at TEXT;")?;
         }
         transaction.execute_batch(include_str!("schema.sql"))?;
-        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit().context("SQLite 初始化提交失败")?;
         Ok(Self { connection })
     }
@@ -209,6 +229,46 @@ impl Database {
         self.connection
             .execute("DELETE FROM transfer_tasks WHERE id=?1", [id])?;
         Ok(())
+    }
+    pub fn save_tunnel(&self, info: &crate::tunnels::TunnelInfo) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO port_forwards(id,created_at,record_json) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json",
+            params![info.tunnel_id, info.created_at, serde_json::to_string(info)?],
+        )?;
+        Ok(())
+    }
+    pub fn tunnel_history(&self) -> Result<Vec<crate::tunnels::TunnelInfo>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record_json FROM port_forwards ORDER BY created_at DESC, id DESC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+    pub fn delete_tunnel(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM port_forwards WHERE id=?1", [id])?;
+        Ok(())
+    }
+    pub fn delete_audits(&mut self, range: &AuditDeleteRange) -> Result<(usize, Vec<Audit>)> {
+        range.validate()?;
+        let transaction = self.connection.transaction()?;
+        let deleted = transaction.execute(
+            "DELETE FROM audit_entries WHERE sequence <= ?3 AND julianday(time) >= julianday(?1) AND julianday(time) < julianday(?2)",
+            params![range.start_time, range.end_time, range.upper],
+        )?;
+        // Read the replacement cache before committing, so any failure rolls back deletion.
+        let recent = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {AUDIT_COLUMNS} FROM audit_entries ORDER BY sequence DESC LIMIT 500"
+            ))?;
+            let mut recent = statement
+                .query_map([], audit_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            recent.reverse();
+            recent
+        };
+        transaction.commit()?;
+        Ok((deleted, recent))
     }
     pub fn save_server(&mut self, server: &Server) -> Result<()> {
         let transaction = self.connection.transaction()?;

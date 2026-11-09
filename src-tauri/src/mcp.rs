@@ -402,6 +402,11 @@ pub async fn start_on(state: Arc<AppState>, port: u16, host: &str) -> Result<Mcp
         .parse()
         .map_err(|_| anyhow::anyhow!("Listen address must be a valid IPv4 or IPv6 address"))?;
     let listener = tokio::net::TcpListener::bind((address, port)).await?;
+    // Remember only successfully bound endpoints for the next desktop launch.
+    let mut settings = state.settings.lock().unwrap().clone();
+    settings.mcp_host = address.to_string();
+    settings.mcp_port = port;
+    state.save_settings(settings)?;
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),

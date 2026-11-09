@@ -20,8 +20,12 @@ test("two-month calendar selects across dates, previews range and clears", () =>
   );
   expect(screen.queryByRole("dialog")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: /时间范围/ }));
-  expect(screen.getByRole("region", { name: "2026年10月" })).toBeTruthy();
-  expect(screen.getByRole("region", { name: "2026年11月" })).toBeTruthy();
+  expect(
+    screen.getByRole("region", { name: "左侧日历：2026年10月" }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("region", { name: "右侧日历：2026年11月" }),
+  ).toBeTruthy();
   expect(
     (screen.getByRole("button", { name: "2026-11-03" }) as HTMLButtonElement)
       .disabled,
@@ -77,11 +81,73 @@ test("supports reverse selection, same-day selection, month navigation and Escap
     end_time: new Date("2026-11-01T00:00:00").toISOString(),
   });
   fireEvent.click(screen.getByRole("button", { name: /时间范围/ }));
-  fireEvent.click(screen.getByRole("button", { name: "上个月" }));
-  expect(screen.getByRole("region", { name: "2026年9月" })).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "下个月" }));
+  fireEvent.click(screen.getByRole("button", { name: "左侧上个月" }));
+  expect(
+    screen.getByRole("region", { name: "左侧日历：2026年9月" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "左侧下个月" }));
   fireEvent.click(screen.getByRole("button", { name: "2026-10-01" }));
   fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(onChange).toHaveBeenCalledTimes(2);
+});
+
+test("each calendar jumps to its own year and month while retaining a cross-year range start", () => {
+  const onChange = vi.fn();
+  render(<AuditTimeFilter query={query} onChange={onChange} />);
+  fireEvent.click(screen.getByRole("button", { name: /时间范围/ }));
+  fireEvent.click(screen.getByRole("button", { name: "左侧月份" }));
+  fireEvent.click(screen.getByRole("button", { name: "左侧1月" }));
+  expect(
+    screen.getByRole("region", { name: "左侧日历：2026年1月" }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("region", { name: "右侧日历：2026年11月" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "左侧年份" }));
+  expect(
+    (screen.getByRole("button", { name: "左侧2027年" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "左侧前12年" }));
+  fireEvent.click(screen.getByRole("button", { name: "左侧2012年" }));
+  fireEvent.click(screen.getByRole("button", { name: "左侧2月" }));
+  fireEvent.click(screen.getByRole("button", { name: "2012-02-29" }));
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "右侧年份" }));
+  fireEvent.click(screen.getByRole("button", { name: "右侧2024年" }));
+  fireEvent.click(screen.getByRole("button", { name: "右侧12月" }));
+  expect(
+    screen.getByRole("region", { name: "左侧日历：2012年2月" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "2024-12-31" }));
+  expect(onChange).toHaveBeenCalledExactlyOnceWith({
+    start_time: new Date("2012-02-29T00:00:00").toISOString(),
+    end_time: new Date("2025-01-01T00:00:00").toISOString(),
+  });
+});
+
+test("reopening a range shows both endpoint months instead of forcing consecutive months", () => {
+  render(
+    <AuditTimeFilter
+      query={{
+        ...query,
+        start_time: new Date("2020-05-03T00:00:00").toISOString(),
+        end_time: new Date("2024-08-25T00:00:00").toISOString(),
+      }}
+      onChange={vi.fn()}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: /时间范围/ }));
+  expect(
+    screen.getByRole("region", { name: "左侧日历：2020年5月" }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("region", { name: "右侧日历：2024年8月" }),
+  ).toBeTruthy();
+  expect(
+    screen
+      .getByRole("button", { name: "2024-08-24" })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
 });

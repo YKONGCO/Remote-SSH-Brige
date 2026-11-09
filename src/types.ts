@@ -60,6 +60,11 @@ export interface AuditPage {
   total: number;
   upper: number;
 }
+export interface AuditDeleteRange {
+  start_time: string;
+  end_time: string;
+  upper: number;
+}
 export interface McpStatus {
   running: boolean;
   host?: string;

@@ -129,6 +129,51 @@ fn installs_backup_and_detects_token_rotation_for_all_clients() {
         .all(|c| c.status == "configured"));
     cleanup(dir);
 }
+
+#[test]
+fn automatic_refresh_only_updates_existing_entries_and_continues_after_errors() {
+    let dir = workspace();
+    let targets = clients::targets_at(&dir);
+    fs::write(&targets[0].path, "{invalid").unwrap();
+    // A mention in an unrelated field must not opt a client into MCP.
+    fs::create_dir_all(targets[1].path.parent().unwrap()).unwrap();
+    fs::write(&targets[1].path, "# remote-ssh\nmodel = 'keep'\n").unwrap();
+    fs::create_dir_all(targets[2].path.parent().unwrap()).unwrap();
+    fs::write(
+        &targets[2].path,
+        r#"{"note":"remote-ssh","mcpServers":{"other":{}}}"#,
+    )
+    .unwrap();
+    for target in &targets[3..5] {
+        clients::install(target, &status("old-token")).unwrap();
+    }
+    let error = clients::refresh_configured(&targets, &status("new-token")).unwrap_err();
+    assert!(error.to_string().contains("Claude Code"));
+    assert_eq!(fs::read_to_string(&targets[0].path).unwrap(), "{invalid");
+    assert_eq!(
+        fs::read_to_string(&targets[1].path).unwrap(),
+        "# remote-ssh\nmodel = 'keep'\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&targets[2].path).unwrap(),
+        r#"{"note":"remote-ssh","mcpServers":{"other":{}}}"#
+    );
+    assert!(!targets[5].path.exists());
+    assert!(!targets[5].path.parent().unwrap().exists());
+    assert!(clients::list(&targets[3..5], &status("new-token"))
+        .iter()
+        .all(|c| c.status == "configured"));
+    for target in &targets[3..5] {
+        assert!(fs::read_dir(target.path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bak"))
+            .any(|entry| fs::read_to_string(entry.path())
+                .unwrap()
+                .contains("old-token")));
+    }
+    cleanup(dir);
+}
 #[test]
 fn malformed_files_and_invalid_maps_are_never_overwritten() {
     let dir = workspace();

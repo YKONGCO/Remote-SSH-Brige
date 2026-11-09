@@ -33,6 +33,15 @@ impl AppState {
         };
         let audit = database.recent_audits(500)?;
         let settings = database.settings()?;
+        // Listeners are process-local. Retain their metadata after a restart.
+        for mut info in database.tunnel_history()? {
+            if info.status != "closed" {
+                info.status = "closed".into();
+                info.connections = 0;
+                info.error = Some("应用已重启，端口转发已关闭".into());
+                database.save_tunnel(&info)?;
+            }
+        }
         let state = Arc::new(Self {
             dir,
             database: Mutex::new(database),
@@ -116,6 +125,13 @@ impl AppState {
     }
     pub fn audit_details(&self, id: &str) -> Result<Audit> {
         self.database.lock().unwrap().audit(id)
+    }
+    pub fn delete_audits(&self, range: &crate::database::AuditDeleteRange) -> Result<usize> {
+        // Match log()'s lock order and replace the cache only after a successful commit.
+        let mut audits = self.audit.lock().unwrap();
+        let (deleted, recent) = self.database.lock().unwrap().delete_audits(range)?;
+        *audits = recent;
+        Ok(deleted)
     }
     pub fn audit_page(
         &self,
@@ -376,10 +392,12 @@ impl AppState {
                 .ok()
                 .is_some_and(|v| op.kind == "exec" && v.get("job_id").is_some())
                 || (!result.as_ref().ok().is_some_and(|v| {
-                    matches!(
-                        v["status"].as_str(),
-                        Some("disconnected" | "closed" | "failed" | "cancelled")
-                    )
+                    match v["status"].as_str() {
+                        // A closed tunnel is the expected outcome of a successful close.
+                        Some("closed") => op.kind != "port_forward_close",
+                        Some("disconnected" | "failed" | "cancelled") => true,
+                        _ => false,
+                    }
                 }) && op.kind != "security_reject"
                     && result.is_ok()
                     && result

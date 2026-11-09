@@ -9,6 +9,9 @@
     --bg-sidebar: #f5f5f7;
     --bg-subtle: #efeff2;
     --bg-selected: #e4e4ea;
+    --code-selection: #b8d5fa;
+    --code-selection-inactive: #dce5f1;
+    --code-active-line: #3b70b612;
     --bg-card: #ffffff;
     --border-strong: #cfcfd6;
     --text-1: #18181b;
@@ -57,6 +60,9 @@
     --bg-sidebar: #161618;
     --bg-subtle: #26262a;
     --bg-selected: #313136;
+    --code-selection: #355477;
+    --code-selection-inactive: #3b4350;
+    --code-active-line: #4278b61a;
     --bg-card: #2e2e33;
     --border-strong: #4a4a52;
     --text-1: #e4e4e7;

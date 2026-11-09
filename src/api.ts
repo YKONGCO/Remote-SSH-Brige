@@ -12,6 +12,7 @@ import type {
   Operation,
   FileEntry,
   AuditQuery,
+  AuditDeleteRange,
   LoginPathUpdate,
 } from "./types";
 import { chooseBrowserSave } from "./save-file";
@@ -163,6 +164,37 @@ export async function api<T = unknown>(
   if (desktop) return invoke<T>(command, args);
   if (command === "list_port_forwards")
     return { tunnels: demoTunnels.map((t) => ({ ...t })) } as T;
+  if (command === "delete_port_forward") {
+    const index = demoTunnels.findIndex((t) => t.tunnel_id === args.id);
+    if (index >= 0) {
+      if (demoTunnels[index].status !== "closed")
+        throw new Error("请先关闭端口转发，再删除记录");
+      demoTunnels.splice(index, 1);
+    }
+    return undefined as T;
+  }
+  if (command === "delete_audits") {
+    const range = args.range as AuditDeleteRange | undefined;
+    const start = Date.parse(range?.start_time ?? "");
+    const end = Date.parse(range?.end_time ?? "");
+    if (
+      !range ||
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start >= end ||
+      !Number.isSafeInteger(range.upper) ||
+      range.upper < 0
+    )
+      throw new Error("请选择有效的删除日期范围");
+    const previous = demo.audits.length;
+    demo.audits = demo.audits.filter(
+      (entry, index) =>
+        index >= range.upper ||
+        Date.parse(entry.time) < start ||
+        Date.parse(entry.time) >= end,
+    );
+    return (previous - demo.audits.length) as T;
+  }
   if (command === "port_forward") {
     const request = args.args as {
       action: string;
@@ -291,6 +323,7 @@ export async function api<T = unknown>(
   if (command === "save_runtime_settings") {
     const next = args.settings as RuntimeSettings;
     const ranges = {
+      mcp_port: [1, 65535],
       approval_timeout_secs: [1, 120],
       upload_limit_mib: [0, MAX_TRANSFER_MIB],
       download_limit_mib: [0, MAX_TRANSFER_MIB],
@@ -300,6 +333,8 @@ export async function api<T = unknown>(
       command_timeout_secs: [1, 300],
       max_terminals: [1, 64],
     };
+    if (typeof next.mcp_auto_start !== "boolean")
+      throw new Error("MCP 自动启动设置无效");
     if (typeof next.close_to_tray !== "boolean")
       throw new Error("关闭窗口设置无效");
     if (

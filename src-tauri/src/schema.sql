@@ -26,3 +26,6 @@ CREATE INDEX IF NOT EXISTS audit_kind_sequence ON audit_entries(kind,sequence DE
 CREATE TABLE IF NOT EXISTS transfer_tasks (
     id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, record_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS port_forwards (
+    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, record_json TEXT NOT NULL
+);

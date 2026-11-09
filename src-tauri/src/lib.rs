@@ -12,6 +12,7 @@ pub mod operation_error;
 pub mod safe_remove;
 pub mod security;
 pub mod ssh;
+pub mod startup;
 pub mod state;
 pub mod terminal;
 pub mod transfer_batch;
@@ -388,8 +389,32 @@ mod desktop {
         serde_json::json!({"jobs":state.jobs.list()})
     }
     #[tauri::command]
-    fn list_port_forwards(state: Shared<'_>) -> serde_json::Value {
-        serde_json::json!({"tunnels":state.tunnels.list(None)})
+    async fn list_port_forwards(state: Shared<'_>) -> Result<serde_json::Value, String> {
+        let state = state.inner().clone();
+        tokio::task::spawn_blocking(move || state.tunnels.history(&state))
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|items| serde_json::json!({"tunnels":items}))
+            .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn delete_port_forward(state: Shared<'_>, id: String) -> Result<(), String> {
+        let state = state.inner().clone();
+        tokio::task::spawn_blocking(move || state.tunnels.delete(&state, &id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn delete_audits(
+        state: Shared<'_>,
+        range: database::AuditDeleteRange,
+    ) -> Result<usize, String> {
+        let state = state.inner().clone();
+        tokio::task::spawn_blocking(move || state.delete_audits(&range))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
     async fn port_forward(
@@ -538,6 +563,7 @@ mod desktop {
             }))
             .setup(|app| {
                 let shared = state::AppState::open(app.path().app_data_dir()?)?;
+                tauri::async_runtime::block_on(startup::run(shared.clone()));
                 let approval_app = app.handle().clone();
                 *shared.approvals.notify.lock().unwrap() =
                     Some(Arc::new(move || show_main(&approval_app)));
@@ -603,6 +629,8 @@ mod desktop {
                 runtime_settings,
                 list_jobs,
                 list_port_forwards,
+                delete_port_forward,
+                delete_audits,
                 port_forward,
                 job,
                 pending_approvals,
