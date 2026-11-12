@@ -696,6 +696,9 @@ fn protections_and_approval_scope_are_independent_and_default_to_no_approval() {
     settings.approval_mode = "mcp".into();
     assert!(security::needs_approval(&settings, &remove, "mcp"));
     assert!(!security::needs_approval(&settings, &remove, "desktop"));
+    settings.approval_mode = "all".into();
+    assert!(security::needs_approval(&settings, &remove, "mcp"));
+    assert!(!security::needs_approval(&settings, &remove, "desktop"));
     let terminal = Operation {
         kind: "terminal_write".into(),
         content: "r".into(),

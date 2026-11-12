@@ -35,7 +35,7 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             close_to_tray: true,
-            mcp_auto_start: false,
+            mcp_auto_start: true,
             mcp_host: "127.0.0.1".into(),
             mcp_port: 18920,
             deletion_protection: true,
@@ -44,8 +44,8 @@ impl Default for RuntimeSettings {
             remote_read_only: false,
             approval_mode: "off".into(),
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
-            upload_limit_mib: 128,
-            download_limit_mib: 128,
+            upload_limit_mib: 0,
+            download_limit_mib: 0,
             local_upload_roots: vec![],
             local_download_roots: vec![],
             connect_timeout_secs: 8,

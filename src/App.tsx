@@ -1,7 +1,10 @@
 import { productName } from "./branding";
 import { McpPanel } from "./components/McpPanel";
 import { Settings } from "./components/Settings";
-import type { RuntimeSettings } from "./runtime-settings";
+import {
+  RUNTIME_SETTINGS_CHANGED,
+  type RuntimeSettings,
+} from "./runtime-settings";
 import { ApprovalCenter } from "./components/ApprovalCenter";
 import { readPreferences, usePreferences } from "./preferences";
 import { CompactTime } from "./components/CompactTime";
@@ -138,13 +141,13 @@ export default function App() {
             ? "dark"
             : "light"
           : preferences.theme;
-      document.documentElement.dataset.density = preferences.density;
-      document.documentElement.dataset.motion = String(preferences.motion);
+      document.documentElement.dataset.density = "comfortable";
+      document.documentElement.dataset.motion = "true";
     };
     apply();
     media?.addEventListener("change", apply);
     return () => media?.removeEventListener("change", apply);
-  }, [preferences.theme, preferences.density, preferences.motion]);
+  }, [preferences.theme]);
   useEffect(() => {
     const disableContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", disableContextMenu);
@@ -173,6 +176,10 @@ export default function App() {
     [auditDetail, setAuditDetail] = useState<Audit | null>(null),
     [port, setPort] = useState(18920),
     [mcpHost, setMcpHost] = useState("127.0.0.1"),
+    [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(
+      null,
+    ),
+    [approvalEnabled, setApprovalEnabled] = useState(false),
     [mcpBusy, setMcpBusy] = useState(false),
     [loadError, setLoadError] = useState("");
   const notify = useCallback(
@@ -192,18 +199,24 @@ export default function App() {
   }, [data.mcp.error, notify]);
   useEffect(() => {
     let active = true;
-    void api<RuntimeSettings>("runtime_settings")
-      .then((settings) => {
-        if (active) {
-          setMcpHost(settings.mcp_host);
-          setPort(settings.mcp_port);
-        }
-      })
-      .catch((error) => {
+    const load = async () => {
+      try {
+        const settings = await api<RuntimeSettings>("runtime_settings");
+        if (!active) return;
+        setRuntimeSettings(settings);
+        setMcpHost(settings.mcp_host);
+        setPort(settings.mcp_port);
+        setApprovalEnabled(settings.approval_mode !== "off");
+      } catch (error) {
         if (active) notify(String(error), true);
-      });
+      }
+    };
+    void load();
+    const reload = () => void load();
+    window.addEventListener(RUNTIME_SETTINGS_CHANGED, reload);
     return () => {
       active = false;
+      window.removeEventListener(RUNTIME_SETTINGS_CHANGED, reload);
     };
   }, [notify]);
   useEffect(() => {
@@ -522,7 +535,6 @@ export default function App() {
               aria-current={page === id ? "page" : undefined}
               className={page === id ? "nav-item active" : "nav-item"}
               onClick={() => {
-                if (id === "files" && page !== "files") setFileServerId("");
                 setPage(id);
               }}
             >
@@ -539,6 +551,7 @@ export default function App() {
         </nav>
         <div className="sidebar-bottom">
           <ApprovalCenter
+            enabled={approvalEnabled}
             onResolved={() => void refresh()}
             onOpenSettings={() => {
               setPage("settings");
@@ -875,7 +888,6 @@ export default function App() {
                         ["all", "全部"],
                         ["files", "文件"],
                         ["exec", "命令"],
-                        ["mcp", "MCP"],
                         ["error", "失败"],
                       ].map(([key, label]) => (
                         <TabsTrigger key={key} value={key}>
@@ -1123,7 +1135,7 @@ export default function App() {
               notify={notify}
             />
           )}
-          {page === "settings" && <Settings />}
+          {page === "settings" && <Settings initialRuntime={runtimeSettings} />}
         </main>
       </div>
       {modal && (

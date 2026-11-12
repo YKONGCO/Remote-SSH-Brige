@@ -39,51 +39,49 @@ fn audit_recognizes_successful_port_forward_close_without_hiding_failures() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::open(dir.path().into()).unwrap();
     let saved = state.save_server(server(), None).unwrap();
-    for source in ["mcp", "desktop"] {
-        for (kind, status, success) in [
-            ("port_forward_close", "closing", true),
-            ("port_forward_close", "closed", true),
-            ("port_forward_close", "failed", false),
-            ("port_forward_close", "disconnected", false),
-            ("port_forward_close", "cancelled", false),
-            ("port_forward_open", "closed", false),
-            ("job", "failed", false),
-            ("transfer", "cancelled", false),
-        ] {
-            let op = Operation {
-                kind: kind.into(),
-                tunnel_id: "closed-tunnel".into(),
-                ..Default::default()
-            };
-            state
-                .log(
-                    &saved,
-                    source,
-                    &op,
-                    &Ok(serde_json::json!({"status":status,"error":null})),
-                    0,
-                )
-                .unwrap();
-            let entry = state.audit.lock().unwrap().last().unwrap().clone();
-            assert_eq!(entry.success, success, "{source} {kind} {status}");
-            assert_eq!(state.audit_details(&entry.id).unwrap().success, success);
-        }
+    for (kind, status, success) in [
+        ("port_forward_close", "closing", true),
+        ("port_forward_close", "closed", true),
+        ("port_forward_close", "failed", false),
+        ("port_forward_close", "disconnected", false),
+        ("port_forward_close", "cancelled", false),
+        ("port_forward_open", "closed", false),
+        ("job", "failed", false),
+        ("transfer", "cancelled", false),
+    ] {
         let op = Operation {
-            kind: "port_forward_close".into(),
-            tunnel_id: "missing-tunnel".into(),
+            kind: kind.into(),
+            tunnel_id: "closed-tunnel".into(),
             ..Default::default()
         };
         state
             .log(
                 &saved,
-                source,
+                "mcp",
                 &op,
-                &Err(anyhow::anyhow!("NOT_FOUND: Tunnel does not exist")),
+                &Ok(serde_json::json!({"status":status,"error":null})),
                 0,
             )
             .unwrap();
-        assert!(!state.audit.lock().unwrap().last().unwrap().success);
+        let entry = state.audit.lock().unwrap().last().unwrap().clone();
+        assert_eq!(entry.success, success, "{kind} {status}");
+        assert_eq!(state.audit_details(&entry.id).unwrap().success, success);
     }
+    let op = Operation {
+        kind: "port_forward_close".into(),
+        tunnel_id: "missing-tunnel".into(),
+        ..Default::default()
+    };
+    state
+        .log(
+            &saved,
+            "mcp",
+            &op,
+            &Err(anyhow::anyhow!("NOT_FOUND: Tunnel does not exist")),
+            0,
+        )
+        .unwrap();
+    assert!(!state.audit.lock().unwrap().last().unwrap().success);
 }
 
 #[test]
@@ -96,7 +94,7 @@ fn audit_batch_delete_is_atomic_and_updates_pages_details_cache_and_restart() {
         state
             .log(
                 &saved,
-                "desktop",
+                "mcp",
                 &Operation {
                     kind: "exec".into(),
                     command: format!("echo {index}"),
@@ -1023,7 +1021,7 @@ fn sqlite_retains_audit_history_beyond_recent_list_and_after_server_removal() {
     state
         .log(
             &saved,
-            "desktop",
+            "mcp",
             &op,
             &Ok(serde_json::json!({"connected":true})),
             0,
@@ -1034,7 +1032,7 @@ fn sqlite_retains_audit_history_beyond_recent_list_and_after_server_removal() {
         state
             .log(
                 &saved,
-                "desktop",
+                "mcp",
                 &op,
                 &Ok(serde_json::json!({"connected":true})),
                 0,
@@ -1089,7 +1087,7 @@ fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
         state
             .log(
                 &saved,
-                if index % 2 == 0 { "mcp" } else { "desktop" },
+                "mcp",
                 &Operation {
                     kind: if index % 3 == 0 { "exec" } else { "download" }.into(),
                     command: format!("echo Needle_{index}"),
@@ -1111,7 +1109,7 @@ fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
     state
         .log(
             &saved,
-            "desktop",
+            "mcp",
             &Operation {
                 kind: "security_reject".into(),
                 ..Default::default()
@@ -1137,7 +1135,7 @@ fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
     query.category = "files".into();
     assert_eq!(state.audit_page(&query).unwrap().total, 80);
     query.category = "mcp".into();
-    assert_eq!(state.audit_page(&query).unwrap().total, 60);
+    assert_eq!(state.audit_page(&query).unwrap().total, 121);
     query.category = "all".into();
     query.search = "needle_119".into();
     assert_eq!(state.audit_page(&query).unwrap().total, 1);
@@ -1162,7 +1160,7 @@ fn database_failure_does_not_update_visible_configuration_or_audit_cache() {
     assert!(state
         .log(
             &saved,
-            "desktop",
+            "mcp",
             &Operation {
                 kind: "test".into(),
                 ..Default::default()
@@ -1177,6 +1175,35 @@ fn database_failure_does_not_update_visible_configuration_or_audit_cache() {
     let state = AppState::open(dir.clone()).unwrap();
     assert_eq!(state.server(&saved.id).unwrap().name, saved.name);
     assert!(state.audit.lock().unwrap().is_empty());
+    drop(state);
+    cleanup(dir);
+}
+
+#[test]
+fn manual_operations_are_not_recorded_in_the_mcp_audit_trail() {
+    let dir = workspace();
+    let state = AppState::open(dir.clone()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    state
+        .log(
+            &saved,
+            "desktop",
+            &Operation {
+                kind: "exec".into(),
+                command: "echo manual".into(),
+                ..Default::default()
+            },
+            &Ok(serde_json::json!({"exit_code": 0})),
+            1,
+        )
+        .unwrap();
+    let query = remote_ssh_brige_lib::database::AuditQuery::default();
+    assert_eq!(state.audit_page(&query).unwrap().total, 0);
+    assert!(persisted_audits(&dir).is_empty());
+    assert!(state.snapshot_with_audits(true)["audits"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     drop(state);
     cleanup(dir);
 }

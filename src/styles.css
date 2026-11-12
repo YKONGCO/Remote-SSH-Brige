@@ -5193,3 +5193,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.settings-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.settings-footer-actions .version-pill {
+  margin-left: 0;
+}
+.sidebar-bottom .nav-item.active {
+  font-weight: var(--weight-body);
+}

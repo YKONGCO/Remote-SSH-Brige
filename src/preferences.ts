@@ -2,8 +2,6 @@
 
 export const defaults = {
   theme: "system",
-  density: "comfortable",
-  motion: true,
   startPage: "servers",
   refreshSeconds: "3",
   showHidden: true,
@@ -20,7 +18,6 @@ export function readPreferences(): Preferences {
     const result = { ...defaults };
     const choices: Record<string, string[]> = {
       theme: ["system", "light", "dark"],
-      density: ["comfortable", "compact"],
       startPage: [
         "servers",
         "files",

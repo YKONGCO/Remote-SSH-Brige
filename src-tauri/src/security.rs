@@ -28,8 +28,9 @@ pub fn sensitive(op: &Operation, source: &str) -> bool {
 }
 
 pub fn needs_approval(settings: &RuntimeSettings, op: &Operation, source: &str) -> bool {
-    sensitive(op, source)
-        && (settings.approval_mode == "all" || (settings.approval_mode == "mcp" && source == "mcp"))
+    // Approval is an MCP-only control. Operations started from the desktop UI
+    // never wait for a second confirmation from the same user.
+    source == "mcp" && settings.approval_mode != "off" && sensitive(op, source)
 }
 
 pub fn check_command(command: &str) -> Result<()> {

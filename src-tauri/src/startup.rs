@@ -41,9 +41,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_default_to_manual_start_and_validate_endpoints() {
+    fn settings_default_to_auto_start_and_validate_endpoints() {
         let settings: RuntimeSettings = serde_json::from_str("{}").unwrap();
-        assert!(!settings.mcp_auto_start);
+        assert!(settings.mcp_auto_start);
         assert_eq!(settings.mcp_host, "127.0.0.1");
         assert_eq!(settings.mcp_port, 18920);
         for invalid in [
@@ -63,6 +63,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_startup_does_not_start_or_read_client_files() {
         let (_dir, state) = workspace();
+        state.settings.lock().unwrap().mcp_auto_start = false;
         run_with_targets(state.clone(), || panic!("must not inspect clients")).await;
         assert!(!state.mcp.lock().unwrap().running);
         assert!(state.mcp.lock().unwrap().error.is_none());
@@ -122,6 +123,12 @@ mod tests {
     #[tokio::test]
     async fn manual_start_only_remembers_successfully_bound_endpoints() {
         let (dir, state) = workspace();
+        state
+            .save_settings(RuntimeSettings {
+                mcp_auto_start: false,
+                ..Default::default()
+            })
+            .unwrap();
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         drop(reservation);

@@ -51,7 +51,7 @@ impl AuditDeleteRange {
     }
 }
 
-const AUDIT_FILTER: &str = "sequence <= ?1 AND
+const AUDIT_FILTER: &str = "source='mcp' AND sequence <= ?1 AND
     (?2 IN ('', 'all') OR (?2='mcp' AND source='mcp')
     OR (?2='error' AND (success=0 OR kind='security_reject'))
     OR (?2='exec' AND kind IN ('exec','job'))
@@ -253,13 +253,13 @@ impl Database {
         range.validate()?;
         let transaction = self.connection.transaction()?;
         let deleted = transaction.execute(
-            "DELETE FROM audit_entries WHERE sequence <= ?3 AND julianday(time) >= julianday(?1) AND julianday(time) < julianday(?2)",
+            "DELETE FROM audit_entries WHERE source='mcp' AND sequence <= ?3 AND julianday(time) >= julianday(?1) AND julianday(time) < julianday(?2)",
             params![range.start_time, range.end_time, range.upper],
         )?;
         // Read the replacement cache before committing, so any failure rolls back deletion.
         let recent = {
             let mut statement = transaction.prepare(&format!(
-                "SELECT {AUDIT_COLUMNS} FROM audit_entries ORDER BY sequence DESC LIMIT 500"
+                "SELECT {AUDIT_COLUMNS} FROM audit_entries WHERE source='mcp' ORDER BY sequence DESC LIMIT 500"
             ))?;
             let mut recent = statement
                 .query_map([], audit_row)?
@@ -287,7 +287,7 @@ impl Database {
     }
     pub fn recent_audits(&self, limit: u32) -> Result<Vec<Audit>> {
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {AUDIT_COLUMNS} FROM audit_entries ORDER BY sequence DESC LIMIT ?1"
+            "SELECT {AUDIT_COLUMNS} FROM audit_entries WHERE source='mcp' ORDER BY sequence DESC LIMIT ?1"
         ))?;
         let mut audits = statement
             .query_map([limit], audit_row)?

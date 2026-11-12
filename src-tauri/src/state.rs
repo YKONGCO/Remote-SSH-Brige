@@ -338,6 +338,11 @@ impl AppState {
         result: &Result<Value>,
         elapsed: u64,
     ) -> Result<()> {
+        // The activity log is an MCP audit trail; manual desktop actions are
+        // intentionally not recorded.
+        if source != "mcp" {
+            return Ok(());
+        }
         let detail = if op.kind.starts_with("port_forward_") {
             if op.kind == "port_forward_open" {
                 format!(

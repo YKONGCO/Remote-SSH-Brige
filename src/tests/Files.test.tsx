@@ -93,6 +93,46 @@ function setupFilePreview(
   );
 }
 
+test("restores and remembers the last opened directory per server", async () => {
+  const user = userEvent.setup();
+  localStorage.setItem(
+    "remote-desk.files.paths.v1",
+    JSON.stringify({ server: "/workspace/logs" }),
+  );
+  vi.mocked(api).mockImplementation(async (command) =>
+    command === "runtime_settings"
+      ? ({ ...defaultRuntimeSettings } as never)
+      : (null as never),
+  );
+  vi.mocked(operate).mockImplementation(async (op) =>
+    op.kind === "list_files"
+      ? ({ path: op.path, entries: [] } as never)
+      : ({} as never),
+  );
+  render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/workspace" }}
+      refresh={vi.fn()}
+      notify={vi.fn()}
+    />,
+  );
+  await waitFor(() =>
+    expect(operate).toHaveBeenCalledWith({
+      kind: "list_files",
+      server_id: "server",
+      path: "/workspace/logs",
+    }),
+  );
+  const input = screen.getByRole("textbox", { name: "远程目录" });
+  await user.clear(input);
+  await user.type(input, "/workspace/new{Enter}");
+  await waitFor(() =>
+    expect(
+      JSON.parse(localStorage.getItem("remote-desk.files.paths.v1")!),
+    ).toEqual({ server: "/workspace/new" }),
+  );
+});
+
 async function changeCode(value: string) {
   const element = await screen.findByRole("textbox", { name: "文件内容" });
   const view = EditorView.findFromDOM(element)!;

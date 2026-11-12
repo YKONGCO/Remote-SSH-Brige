@@ -1,6 +1,6 @@
 {
   "name": "remote-ssh-brige",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Permission-controlled remote server access for AI agents over MCP and SSH",
   "license": "MIT",
   "private": true,
@@ -20,7 +20,8 @@
     "test:e2e": "node --test scripts/ssh-fixture-keys.test.mjs scripts/transfer-read-gate.test.mjs && node scripts/integration.mjs",
     "test:ui": "vitest run",
     "test:dev": "node --test scripts/dev-server.test.mjs",
-    "format": "prettier --write src scripts/integration.mjs vite.config.ts README.md docs"
+    "format": "prettier --write src scripts/integration.mjs vite.config.ts README.md docs",
+    "version:set": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

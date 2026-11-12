@@ -1,6 +1,7 @@
 import commandPresets from "./command-presets.json";
 
 export const MAX_TRANSFER_MIB = 8_589_934_591;
+export const RUNTIME_SETTINGS_CHANGED = "runtime-settings-changed";
 export interface CommandPolicy {
   execution_mode?: "disabled" | "whitelist" | "unrestricted";
   allowed_commands?: string[];
@@ -116,6 +117,7 @@ export interface TransferSettings {
   idle_timeout_secs: number;
   bandwidth_kib: number;
 }
+
 export const defaultTransferSettings: TransferSettings = {
   max_concurrent: 4,
   per_server_concurrent: 2,
@@ -127,7 +129,7 @@ export const defaultTransferSettings: TransferSettings = {
 };
 export const defaultRuntimeSettings: RuntimeSettings = {
   close_to_tray: true,
-  mcp_auto_start: false,
+  mcp_auto_start: true,
   mcp_host: "127.0.0.1",
   mcp_port: 18920,
   deletion_protection: true,
@@ -135,8 +137,8 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   remote_read_only: false,
   approval_mode: "off",
   approval_timeout_secs: 120,
-  upload_limit_mib: 128,
-  download_limit_mib: 128,
+  upload_limit_mib: 0,
+  download_limit_mib: 0,
   local_upload_roots: [],
   local_download_roots: [],
   connect_timeout_secs: 8,

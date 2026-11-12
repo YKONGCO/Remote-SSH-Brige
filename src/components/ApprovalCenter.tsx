@@ -6,9 +6,11 @@ import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
 
 export function ApprovalCenter({
+  enabled,
   onResolved,
   onOpenSettings,
 }: {
+  enabled: boolean;
   onResolved: () => void;
   onOpenSettings?: () => void;
 }) {
@@ -19,7 +21,7 @@ export function ApprovalCenter({
   const [now, setNow] = useState(Date.now);
   const known = useRef(new Set<string>());
   useEffect(() => {
-    if (!desktop) return;
+    if (!desktop || !enabled) return;
     let disposed = false;
     let loading = false;
     const load = async () => {
@@ -48,7 +50,8 @@ export function ApprovalCenter({
       clearInterval(timer);
       window.removeEventListener("focus", load);
     };
-  }, []);
+  }, [enabled]);
+  if (!enabled) return null;
   const request = requests[0];
   const remainingSeconds = request
     ? Math.max(0, Math.ceil((Date.parse(request.expires_at) - now) / 1000))
@@ -122,9 +125,7 @@ export function ApprovalCenter({
                     {request.server_name} · {request.username}@{request.host}
                   </dd>
                   <dt>来源</dt>
-                  <dd>
-                    {request.source === "mcp" ? "MCP 客户端" : "桌面操作"}
-                  </dd>
+                  <dd>MCP 客户端</dd>
                   <dt>操作</dt>
                   <dd>{labels[request.kind] || request.kind}</dd>
                   {request.kind === "write_file" && (
@@ -202,11 +203,7 @@ export function ApprovalCenter({
               <div className="approval-empty">
                 <ShieldCheck size={26} />
                 <h3>暂无待审批操作</h3>
-                <p>
-                  {desktop
-                    ? "开启审批模式后，敏感操作会在这里等待处理。"
-                    : "审批请求需要在桌面应用中处理。"}
-                </p>
+                <p>开启审批后，MCP 敏感操作会在这里等待处理。</p>
                 {onOpenSettings && (
                   <Button
                     variant="outline"

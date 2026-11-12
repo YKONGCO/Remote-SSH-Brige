@@ -54,7 +54,7 @@ test("approval requires an explicit decision and renders remote commands as iner
   setup([pending()]);
   const user = userEvent.setup();
   const onResolved = vi.fn();
-  render(<ApprovalCenter onResolved={onResolved} />);
+  render(<ApprovalCenter enabled onResolved={onResolved} />);
   await screen.findByRole("dialog", { name: "审批操作" });
   expect(screen.getByText(mock.pending[0].command)).toBeTruthy();
   expect(document.querySelector("img")).toBeNull();
@@ -71,7 +71,7 @@ test("approval requires an explicit decision and renders remote commands as iner
 });
 test("expired approvals cannot be accepted", async () => {
   setup([pending(new Date(Date.now() - 1000).toISOString())]);
-  render(<ApprovalCenter onResolved={vi.fn()} />);
+  render(<ApprovalCenter enabled onResolved={vi.fn()} />);
   const approve = await screen.findByRole("button", { name: "批准本次" });
   expect((approve as HTMLButtonElement).disabled).toBe(true);
   expect(
@@ -90,7 +90,7 @@ test("recursive deletion scope is explicit before approval", async () => {
       missing_ok: true,
     },
   ]);
-  render(<ApprovalCenter onResolved={vi.fn()} />);
+  render(<ApprovalCenter enabled onResolved={vi.fn()} />);
   await screen.findByRole("dialog", { name: "审批操作" });
   expect(screen.getByText("安全删除文件 / 目录")).toBeTruthy();
   expect(screen.getByText("整个目录及其内容（不跟随符号链接）")).toBeTruthy();
@@ -99,11 +99,19 @@ test("recursive deletion scope is explicit before approval", async () => {
     mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
   ).toBe(false);
 });
-test("approval entry stays visible with no requests and links to approval settings", async () => {
+test("approval entry is hidden while approval is disabled", () => {
+  setup([]);
+  render(<ApprovalCenter enabled={false} onResolved={vi.fn()} />);
+  expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull();
+});
+
+test("approval entry with no requests links to approval settings", async () => {
   setup([]);
   const user = userEvent.setup();
   const settings = vi.fn();
-  render(<ApprovalCenter onResolved={vi.fn()} onOpenSettings={settings} />);
+  render(
+    <ApprovalCenter enabled onResolved={vi.fn()} onOpenSettings={settings} />,
+  );
   await user.click(screen.getByRole("button", { name: "操作审批" }));
   await screen.findByText("暂无待审批操作");
   expect(screen.queryByRole("button", { name: "批准本次" })).toBeNull();

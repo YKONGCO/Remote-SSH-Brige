@@ -54,6 +54,32 @@ async function base64Content(file: File) {
   return btoa(binary);
 }
 
+const filePathsKey = "remote-desk.files.paths.v1";
+
+function savedFilePath(serverId: string) {
+  try {
+    const paths = JSON.parse(
+      localStorage.getItem(filePathsKey) || "{}",
+    ) as Record<string, unknown>;
+    const path = paths[serverId];
+    return typeof path === "string" && path.startsWith("/") ? path : "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberFilePath(serverId: string, path: string) {
+  try {
+    const paths = JSON.parse(
+      localStorage.getItem(filePathsKey) || "{}",
+    ) as Record<string, string>;
+    paths[serverId] = path;
+    localStorage.setItem(filePathsKey, JSON.stringify(paths));
+  } catch {
+    // Ignore storage failures; the file browser still works for this session.
+  }
+}
+
 export function Files({
   server,
   notify,
@@ -71,7 +97,9 @@ export function Files({
     error: string;
   } | null>(null);
   const [security, setSecurity] = useState<RuntimeSettings>();
-  const [path, setPath] = useState(server?.root || "/"),
+  const [path, setPath] = useState(() =>
+      server ? savedFilePath(server.id) || server.root || "/" : "/",
+    ),
     [input, setInput] = useState(path),
     [entries, setEntries] = useState<FileEntry[]>([]),
     [busy, setBusy] = useState(false),
@@ -114,6 +142,7 @@ export function Files({
       if (!quiet) {
         setPath(r.path);
         setInput(r.path);
+        rememberFilePath(server.id, r.path);
         refresh();
       }
     } catch (e) {
@@ -140,9 +169,9 @@ export function Files({
         if (serverRequest.current === securityRequest) setSecurity(settings);
       })
       .catch(() => {});
-    setPath(server?.root || "/");
-    setInput(server?.root || "/");
-    if (server) void load(server.root);
+    setPath(server ? savedFilePath(server.id) || server.root || "/" : "/");
+    setInput(server ? savedFilePath(server.id) || server.root || "/" : "/");
+    if (server) void load(savedFilePath(server.id) || server.root || "/");
   }, [server?.id]);
   useEffect(() => {
     if (!server?.enabled || preferences.refreshSeconds === "0") return;

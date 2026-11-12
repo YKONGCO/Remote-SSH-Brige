@@ -1,4 +1,4 @@
-﻿// @vitest-environment jsdom
+// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
   act,
@@ -13,6 +13,10 @@ import userEvent from "@testing-library/user-event";
 import App from "../App";
 import { EditorView } from "@codemirror/view";
 import * as remoteApi from "../api";
+import {
+  defaultRuntimeSettings,
+  RUNTIME_SETTINGS_CHANGED,
+} from "../runtime-settings";
 beforeAll(() => {
   Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
   Range.prototype.getBoundingClientRect = () => new DOMRect();
@@ -269,6 +273,8 @@ test("audit loads on scroll, virtualizes rows and exports the full active filter
     ).toBe(false);
     await user.click(screen.getByRole("button", { name: "操作记录" }));
     await screen.findByText("paged command 0");
+    expect(screen.getByRole("tab", { name: "文件" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "MCP" })).toBeNull();
     expect(
       document.querySelectorAll(".audit-table tbody tr[data-index]").length,
     ).toBeLessThan(50);
@@ -498,7 +504,7 @@ test("file downloads wait for a save destination and cancellation skips the tran
   }
 });
 
-test("remote files wait for server selection on each visit", async () => {
+test("remote files remember the selected server and directory between visits", async () => {
   localStorage.clear();
   const user = userEvent.setup();
   const operations = vi.spyOn(remoteApi, "operate");
@@ -520,12 +526,23 @@ test("remote files wait for server selection on each visit", async () => {
     expect(operations).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "list_files", server_id: "demo-2" }),
     );
+    await user.click(screen.getByRole("button", { name: "home" }));
+    await screen.findByRole("button", { name: "developer" });
+    await user.click(screen.getByRole("button", { name: "developer" }));
+    await screen.findByRole("button", { name: "app" });
 
     await user.click(screen.getByRole("button", { name: "服务器" }));
     operations.mockClear();
     await user.click(screen.getByRole("button", { name: "远程文件" }));
-    expect(screen.getByText("选择一台服务器")).toBeTruthy();
-    expect(operations).not.toHaveBeenCalled();
+    await screen.findByRole("button", { name: "app" });
+    expect(screen.queryByText("选择一台服务器")).toBeNull();
+    expect(operations).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "list_files",
+        server_id: "demo-2",
+        path: "/home/developer",
+      }),
+    );
 
     await user.click(screen.getByRole("button", { name: "服务器" }));
     await user.click(
@@ -626,8 +643,9 @@ test("dialogs restore focus, authentication tabs support keyboard, and menus exp
   ).toBe("active");
   expect(within(dialog).getByLabelText("登录密码")).toBeTruthy();
   const permission = within(dialog).getByRole("checkbox", { name: "文件写入" });
-  await user.click(permission);
   expect(permission.getAttribute("aria-checked")).toBe("true");
+  await user.click(permission);
+  expect(permission.getAttribute("aria-checked")).toBe("false");
   await user.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   await waitFor(() => expect(document.activeElement).toBe(add));
@@ -687,7 +705,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(24);
+  expect(screen.getAllByRole("combobox")).toHaveLength(23);
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");
@@ -735,8 +753,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
   );
   await choose("主题外观", "深色");
   expect(document.documentElement.dataset.theme).toBe("dark");
-  await choose("界面密度", "紧凑");
-  expect(document.documentElement.dataset.density).toBe("compact");
+  expect(document.documentElement.dataset.density).toBe("comfortable");
   await user.click(screen.getByRole("switch", { name: "显示隐藏文件" }));
   await choose("启动页面", "设置");
   await choose("终端字号", "16 px");
@@ -824,4 +841,36 @@ test("server creation uses its toolbar while terminal actions use the titlebar",
       .closest(".server-toolbar"),
   ).toBeTruthy();
   expect(screen.queryByRole("button", { name: "新建终端" })).toBeNull();
+});
+
+test("approval entry follows the runtime approval setting", async () => {
+  localStorage.clear();
+  const realApi = remoteApi.api;
+  let mode: "off" | "mcp" = "off";
+  const requests = vi
+    .spyOn(remoteApi, "api")
+    .mockImplementation(async (command, args) => {
+      if (command === "runtime_settings")
+        return { ...defaultRuntimeSettings, approval_mode: mode } as never;
+      return realApi(command, args);
+    });
+  try {
+    render(<App />);
+    await screen.findByRole("button", { name: "服务器" });
+    expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull();
+    mode = "mcp";
+    await act(async () => {
+      window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
+    });
+    await screen.findByRole("button", { name: "操作审批" });
+    mode = "off";
+    await act(async () => {
+      window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull(),
+    );
+  } finally {
+    requests.mockRestore();
+  }
 });

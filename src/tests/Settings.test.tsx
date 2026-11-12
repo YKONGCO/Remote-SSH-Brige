@@ -20,6 +20,7 @@ import {
   MAX_COMMAND_RULES,
   validCommandLists,
 } from "../runtime-settings";
+import appPackage from "../../package.json";
 
 vi.mock("../api", () => ({ desktop: true, api: vi.fn() }));
 beforeAll(() => {
@@ -30,22 +31,22 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-test("MCP auto-start is off by default, persists on toggle and rolls back a failed save", async () => {
+test("MCP auto-start is on by default, persists on toggle and rolls back a failed save", async () => {
   vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
   render(<Settings />);
   const control = screen.getByRole("switch", { name: "自动启动 MCP 服务" });
   expect(control.hasAttribute("disabled")).toBe(true);
   await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
-  expect(control.getAttribute("aria-checked")).toBe("false");
+  expect(control.getAttribute("aria-checked")).toBe("true");
   vi.mocked(api).mockImplementationOnce(
     async (_command, args) => args?.settings as never,
   );
   fireEvent.click(control);
   await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
-  expect(control.getAttribute("aria-checked")).toBe("true");
+  expect(control.getAttribute("aria-checked")).toBe("false");
   expect(api).toHaveBeenCalledWith("save_runtime_settings", {
     settings: expect.objectContaining({
-      mcp_auto_start: true,
+      mcp_auto_start: false,
       mcp_host: "127.0.0.1",
       mcp_port: 18920,
     }),
@@ -55,7 +56,31 @@ test("MCP auto-start is off by default, persists on toggle and rolls back a fail
   await waitFor(() =>
     expect(screen.getByRole("alert").textContent).toContain("save failed"),
   );
-  expect(control.getAttribute("aria-checked")).toBe("true");
+  expect(control.getAttribute("aria-checked")).toBe("false");
+});
+
+test("settings footer shows the application version", async () => {
+  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
+  render(<Settings />);
+  const version = await screen.findByLabelText(
+    `应用版本 ${appPackage.version}`,
+  );
+  expect(version.textContent).toBe(`v${appPackage.version}`);
+});
+
+test("settings render with the cached runtime instead of a loading pass", () => {
+  vi.mocked(api).mockResolvedValue({ ...defaultRuntimeSettings });
+  render(
+    <Settings
+      initialRuntime={{
+        ...defaultRuntimeSettings,
+        deletion_protection: false,
+      }}
+    />,
+  );
+  const control = screen.getByRole("switch", { name: "删除保护" });
+  expect(control.hasAttribute("disabled")).toBe(false);
+  expect(control.getAttribute("aria-checked")).toBe("false");
 });
 
 test("settings immediately show changes and roll back a failed save without remounting", async () => {

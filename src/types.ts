@@ -1,3 +1,5 @@
+import { allMcpPermissions } from "./mcp-permissions";
+
 export interface Server {
   id: string;
   name: string;
@@ -147,7 +149,7 @@ export const newServer = (): Server => ({
   allow_write: false,
   allow_terminal: false,
   mcp_enabled: true,
-  mcp_permissions: ["read_file", "list_files", "stat_file"],
+  mcp_permissions: [...allMcpPermissions],
   root: "/",
 });
 export const labels: Record<string, string> = {

@@ -13,6 +13,7 @@ import {
   validCommandLists,
   parseCommandList,
   MAX_COMMAND_RULES,
+  RUNTIME_SETTINGS_CHANGED,
 } from "../runtime-settings";
 import { CommandPresets } from "./CommandPresets";
 import { X, RotateCcw, Check, ShieldBan, FolderOpen } from "lucide-react";
@@ -22,6 +23,7 @@ import { Textarea } from "./ui/textarea";
 import { SelectField } from "./SelectField";
 import { TransferLimitField } from "./TransferLimitField";
 import { useEffect, useState, type ReactNode } from "react";
+import appPackage from "../../package.json";
 import {
   defaults,
   savePreferences,
@@ -48,10 +50,16 @@ function Row({
     </div>
   );
 }
-export function Settings() {
+export function Settings({
+  initialRuntime,
+}: {
+  initialRuntime?: RuntimeSettings | null;
+} = {}) {
   const preferences = usePreferences();
   const [error, setError] = useState("");
-  const [runtime, setRuntime] = useState<RuntimeSettings | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeSettings | null>(
+    initialRuntime ?? null,
+  );
   const [saving, setSaving] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [listsOpen, setListsOpen] = useState(false);
@@ -121,7 +129,12 @@ export function Settings() {
   }
   async function loadRuntime() {
     try {
-      setRuntime(await api<RuntimeSettings>("runtime_settings"));
+      const settings = await api<RuntimeSettings>("runtime_settings");
+      setRuntime((current) =>
+        current && JSON.stringify(current) === JSON.stringify(settings)
+          ? current
+          : settings,
+      );
       setLoadFailed(false);
       setError("");
     } catch (e) {
@@ -146,11 +159,11 @@ export function Settings() {
     setRuntime(next);
     setSaving(true);
     try {
-      setRuntime(
-        await api<RuntimeSettings>("save_runtime_settings", {
-          settings: next,
-        }),
-      );
+      const saved = await api<RuntimeSettings>("save_runtime_settings", {
+        settings: next,
+      });
+      setRuntime(saved);
+      window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
       setError("");
       return true;
     } catch (e) {
@@ -248,10 +261,7 @@ export function Settings() {
       </SelectField>
     );
   }
-  function toggle(
-    name: "motion" | "showHidden" | "cursorBlink",
-    label: string,
-  ) {
+  function toggle(name: "showHidden" | "cursorBlink", label: string) {
     return (
       <button
         type="button"
@@ -377,26 +387,12 @@ export function Settings() {
               ["0", "仅手动刷新"],
             ])}
           </Row>
-        </div>
-      </section>
-      <section className="settings-section">
-        <h2 className="settings-group-title">外观与体验</h2>
-        <div className="settings-card">
           <Row title="主题外观" description="浅色、深色或跟随系统。">
             {select("theme", "主题外观", [
               ["light", "浅色"],
               ["dark", "深色"],
               ["system", "跟随系统"],
             ])}
-          </Row>
-          <Row title="界面密度" description="调整列表行距。">
-            {select("density", "界面密度", [
-              ["comfortable", "舒适"],
-              ["compact", "紧凑"],
-            ])}
-          </Row>
-          <Row title="界面动效" description="按钮与面板的过渡效果。">
-            {toggle("motion", "界面动效")}
           </Row>
         </div>
       </section>
@@ -423,13 +419,13 @@ export function Settings() {
           </Row>
           <Row
             title="审批模式"
-            description="敏感操作需确认，超过等待时间则自动拒绝。"
+            description="仅对 MCP 发起的敏感操作生效，桌面操作不弹审批；超时自动拒绝。"
           >
             <SelectField
               className="setting-select"
               aria-label="审批模式"
               disabled={!runtime || saving}
-              value={runtime?.approval_mode || "off"}
+              value={runtime?.approval_mode === "off" ? "off" : "mcp"}
               onValueChange={(value) =>
                 void updateRuntime(
                   "approval_mode",
@@ -438,8 +434,7 @@ export function Settings() {
               }
             >
               <option value="off">关闭审批</option>
-              <option value="mcp">仅 MCP 敏感操作</option>
-              <option value="all">所有来源的敏感操作</option>
+              <option value="mcp">开启审批（仅 MCP）</option>
             </SelectField>
           </Row>
           <Row
@@ -1065,9 +1060,17 @@ export function Settings() {
                 ? "设置自动保存"
                 : "演示模式 · 业务设置仅保存在页面内存"}
         </span>
-        <button className="text-btn" onClick={() => update(defaults)}>
-          恢复界面默认设置
-        </button>
+        <div className="settings-footer-actions">
+          <span
+            className="version-pill"
+            aria-label={`应用版本 ${appPackage.version}`}
+          >
+            v{appPackage.version}
+          </span>
+          <button className="text-btn" onClick={() => update(defaults)}>
+            恢复界面默认设置
+          </button>
+        </div>
       </footer>
     </div>
   );

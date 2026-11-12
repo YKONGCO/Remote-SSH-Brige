@@ -120,7 +120,7 @@ let demo: Snapshot = {
     time: new Date(now - (i + 1) * 180000).toISOString(),
     server_id: i === 2 ? "demo-2" : "demo-1",
     server_name: i === 2 ? "开发服务器" : "生产服务器",
-    source: i === 1 ? "desktop" : "mcp",
+    source: "mcp",
     kind: String(r[0]),
     detail: String(r[1]),
     success: Boolean(r[2]),
@@ -518,8 +518,6 @@ export async function operate<T = Record<string, unknown>>(
     ["remove", "remove_path"].includes(op.kind)
   )
     throw new Error("删除保护已开启，请在设置中关闭后再删除");
-  if (demoSettings.approval_mode === "all" && sensitive)
-    throw new Error("操作审批需要在桌面应用中使用。");
   // Browser preview never executes Shell; the desktop backend applies the AST policy.
   let result: unknown = {};
   switch (op.kind) {

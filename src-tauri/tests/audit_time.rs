@@ -23,7 +23,7 @@ fn time_range_filters_count_pages_export_and_delete_across_dates_and_timezones()
                 time: (*time).into(),
                 server_id: "server".into(),
                 server_name: "host".into(),
-                source: "desktop".into(),
+                source: "mcp".into(),
                 kind: "exec".into(),
                 detail: "echo hello".into(),
                 success: true,
