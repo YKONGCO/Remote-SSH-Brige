@@ -10,7 +10,7 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { FilePreview } from "./FilePreview";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, type DragEvent } from "react";
 import {
   Folder,
   FileText,
@@ -28,12 +28,32 @@ import {
   Search,
 } from "lucide-react";
 import { api, desktop, operate } from "../api";
+import { listenForNativeDrops, nativeDragDropAvailable } from "../native-drop";
 import { TransferPanel } from "./TransferPanel";
 import { chooseBrowserSave } from "../save-file";
 import type { FileTransfer } from "../transfers";
 import { formatBytes } from "../transfers";
 import type { RuntimeSettings } from "../runtime-settings";
 import type { Server, FileEntry, FilePreview as Preview } from "../types";
+
+type BatchResult = {
+  tasks: unknown[];
+  queued?: number;
+  rejected?: number;
+};
+
+function batchSubmitted(batch: BatchResult, noun: string) {
+  return `已提交 ${batch.queued ?? batch.tasks.length} 个${noun}任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`;
+}
+
+async function base64Content(file: File) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192)
+    binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(binary);
+}
+
 export function Files({
   server,
   notify,
@@ -58,8 +78,12 @@ export function Files({
     [error, setError] = useState(""),
     [filter, setFilter] = useState("");
   const [saving, setSaving] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const previewRequest = useRef(0);
   const serverRequest = useRef(0);
+  const dropTarget = useRef({ serverId: "", path: "/", readOnly: false });
+  const dragDepth = useRef(0);
+  const dropping = useRef(false);
   const [dialog, setDialog] = useState<{
     kind: string;
     name: string;
@@ -142,6 +166,140 @@ export function Files({
     await operate({ kind, server_id: server.id, ...extra });
     refresh();
   };
+  const uploadBrowserFiles = async (files: File[]) => {
+    if (!files.length) return;
+    setBusy(true);
+    try {
+      const limits = await api<RuntimeSettings>("runtime_settings");
+      const limitMib = Math.min(limits.upload_limit_mib || 256, 256);
+      const limit = limitMib * 1024 * 1024;
+      const names = new Set(entries.map((entry) => entry.name));
+      const skipped: string[] = [];
+      const oversized: string[] = [];
+      let uploaded = 0;
+      for (const file of files) {
+        if (file.size > limit) {
+          oversized.push(file.name);
+          continue;
+        }
+        if (names.has(file.name)) {
+          skipped.push(file.name);
+          continue;
+        }
+        await act("upload", {
+          path: join(file.name),
+          content: await base64Content(file),
+        });
+        names.add(file.name);
+        uploaded += 1;
+      }
+      await load();
+      const messages: string[] = [];
+      if (uploaded) messages.push(`已上传 ${uploaded} 个文件`);
+      if (skipped.length) messages.push(`已跳过 ${skipped.length} 个同名文件`);
+      if (oversized.length)
+        messages.push(
+          `${oversized.length} 个文件超过 ${limitMib} MiB 上传限制`,
+        );
+      if (messages.length)
+        notify(messages.join("；"), skipped.length + oversized.length > 0);
+    } catch (e) {
+      notify(String(e), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const uploadPaths = async (paths: string[]) => {
+    if (dropping.current) return;
+    const { serverId, path: target, readOnly } = dropTarget.current;
+    if (readOnly) {
+      notify("只读模式下不能上传文件", true);
+      return;
+    }
+    if (!serverId || !paths.length) return;
+    if (paths.length > 100) {
+      notify("一次最多拖拽 100 个文件或文件夹", true);
+      return;
+    }
+    dropping.current = true;
+    setBusy(true);
+    setDragActive(false);
+    try {
+      const batch = await api<BatchResult>("upload_paths", {
+        serverId,
+        remoteDir: target,
+        paths,
+      });
+      notify(batchSubmitted(batch, "传输"), !!batch.rejected);
+    } catch (e) {
+      notify(String(e), true);
+    } finally {
+      dropping.current = false;
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    dropTarget.current = {
+      serverId: server?.id ?? "",
+      path,
+      readOnly: security?.remote_read_only ?? false,
+    };
+  }, [server?.id, path, security?.remote_read_only]);
+  useEffect(() => {
+    if (!desktop || !nativeDragDropAvailable() || !server) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenForNativeDrops({
+      onEnter: (paths) => {
+        if (paths.length && !dropTarget.current.readOnly) setDragActive(true);
+      },
+      onLeave: () => setDragActive(false),
+      onDrop: (paths) => {
+        setDragActive(false);
+        if (paths.length) void uploadPaths(paths);
+      },
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [server?.id]);
+  const draggingFiles = (event: DragEvent<HTMLDivElement>) =>
+    Array.from(event.dataTransfer.types).includes("Files");
+  const dragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (desktop || !draggingFiles(event)) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    if (!security?.remote_read_only) setDragActive(true);
+  };
+  const dragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (desktop || !draggingFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = security?.remote_read_only
+      ? "none"
+      : "copy";
+  };
+  const dragLeave = () => {
+    if (desktop) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (!dragDepth.current) setDragActive(false);
+  };
+  const dropFiles = (event: DragEvent<HTMLDivElement>) => {
+    if (desktop || !draggingFiles(event)) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDragActive(false);
+    if (security?.remote_read_only) {
+      notify("只读模式下不能上传文件", true);
+      return;
+    }
+    void uploadBrowserFiles(Array.from(event.dataTransfer.files));
+  };
   const open = async (entry: FileEntry) => {
     if (entry.is_dir) {
       void load(entry.path);
@@ -213,7 +371,13 @@ export function Files({
       </div>
     );
   return (
-    <div className="files-workspace">
+    <div
+      className="files-workspace"
+      onDragEnter={dragEnter}
+      onDragOver={dragOver}
+      onDragLeave={dragLeave}
+      onDrop={dropFiles}
+    >
       <div className="toolbar file-toolbar">
         <div className="button-group">
           <Button
@@ -330,11 +494,7 @@ export function Files({
                   key={String(directory)}
                   disabled={security?.remote_read_only}
                   onSelect={() =>
-                    void api<{
-                      tasks: unknown[];
-                      queued?: number;
-                      rejected?: number;
-                    } | null>("pick_transfer_batch", {
+                    void api<BatchResult | null>("pick_transfer_batch", {
                       serverId: server.id,
                       remotePath: path,
                       direction: "upload",
@@ -343,7 +503,7 @@ export function Files({
                       .then((batch) => {
                         if (batch)
                           notify(
-                            `已提交 ${batch.queued ?? batch.tasks.length} 个传输任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
+                            batchSubmitted(batch, "传输"),
                             !!batch.rejected,
                           );
                       })
@@ -378,14 +538,9 @@ export function Files({
               if (!f) return;
               try {
                 const limits = await api<RuntimeSettings>("runtime_settings");
-                if (
-                  f.size >
-                  Math.min(limits.upload_limit_mib || 256, 256) * 1024 * 1024
-                ) {
-                  notify(
-                    `文件超过 ${limits.upload_limit_mib} MiB 上传限制`,
-                    true,
-                  );
+                const limitMib = Math.min(limits.upload_limit_mib || 256, 256);
+                if (f.size > limitMib * 1024 * 1024) {
+                  notify(`文件超过 ${limitMib} MiB 上传限制`, true);
                   return;
                 }
                 if (entries.some((x) => x.name === f.name)) {
@@ -393,13 +548,9 @@ export function Files({
                   return;
                 }
                 setBusy(true);
-                const bytes = new Uint8Array(await f.arrayBuffer());
-                let binary = "";
-                for (let i = 0; i < bytes.length; i += 8192)
-                  binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
                 await act("upload", {
                   path: join(f.name),
-                  content: btoa(binary),
+                  content: await base64Content(f),
                 });
                 notify("文件已上传");
                 await load();
@@ -426,7 +577,7 @@ export function Files({
           </Button>
         </div>
       )}
-      <div className="file-surface">
+      <div className={`file-surface${dragActive ? " is-drop-target" : ""}`}>
         <div className="file-list-scroll">
           <table className="data-table file-table">
             <colgroup>
@@ -493,20 +644,19 @@ export function Files({
                           className="icon-btn"
                           title="下载文件夹"
                           onClick={() =>
-                            void api<{
-                              tasks: unknown[];
-                              queued?: number;
-                              rejected?: number;
-                            } | null>("pick_transfer_batch", {
-                              serverId: server.id,
-                              remotePath: e.path,
-                              direction: "download",
-                              directory: true,
-                            })
+                            void api<BatchResult | null>(
+                              "pick_transfer_batch",
+                              {
+                                serverId: server.id,
+                                remotePath: e.path,
+                                direction: "download",
+                                directory: true,
+                              },
+                            )
                               .then((batch) => {
                                 if (batch)
                                   notify(
-                                    `已提交 ${batch.queued ?? batch.tasks.length} 个下载任务${batch.rejected ? `，${batch.rejected} 项未能提交` : ""}`,
+                                    batchSubmitted(batch, "下载"),
                                     !!batch.rejected,
                                   );
                               })
@@ -554,9 +704,20 @@ export function Files({
             </tbody>
           </table>
           {!visibleEntries.length && !busy && !error && (
-            <div className="empty-small">这个目录还是空的</div>
+            <div className="empty-small">
+              {security?.remote_read_only
+                ? "这个目录还是空的"
+                : "这个目录还是空的，可将文件拖拽到此处上传"}
+            </div>
           )}
         </div>
+        {dragActive && (
+          <div className="file-drop-overlay" role="status" aria-live="polite">
+            <Upload size={30} />
+            <strong>松开鼠标上传</strong>
+            <span>上传到 {path}</span>
+          </div>
+        )}
       </div>
       {preview && (
         <FilePreview

@@ -20,6 +20,24 @@ import type { FileTransfer } from "../transfers";
 
 vi.mock("../api", () => ({ desktop: true, api: vi.fn(), operate: vi.fn() }));
 
+type DropHandlers = {
+  onEnter: (paths: string[]) => void;
+  onLeave: () => void;
+  onDrop: (paths: string[]) => void;
+};
+const nativeDrop = vi.hoisted(() => ({
+  available: false,
+  handlers: null as DropHandlers | null,
+  unlisten: vi.fn(),
+}));
+vi.mock("../native-drop", () => ({
+  nativeDragDropAvailable: () => nativeDrop.available,
+  listenForNativeDrops: async (handlers: DropHandlers) => {
+    nativeDrop.handlers = handlers;
+    return nativeDrop.unlisten;
+  },
+}));
+
 beforeAll(() => {
   Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
   Range.prototype.getBoundingClientRect = () => new DOMRect();
@@ -325,6 +343,8 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.resetAllMocks();
+  nativeDrop.available = false;
+  nativeDrop.handlers = null;
   localStorage.clear();
 });
 
@@ -705,4 +725,76 @@ test("expanding the last loaded batch reveals children and active progress stays
   await user.click(last);
   expect(screen.getByText("file-029.txt")).toBeTruthy();
   expect(screen.getByRole("button", { name: /^批次 batch-30，/ })).toBeTruthy();
+});
+
+test("native drops submit the dropped paths for the current directory", async () => {
+  nativeDrop.available = true;
+  const notify = vi.fn();
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "runtime_settings")
+      return { ...defaultRuntimeSettings } as never;
+    if (command === "upload_paths")
+      return {
+        tasks: [{ transfer_id: "a" }, { transfer_id: "b" }],
+        queued: 2,
+        rejected: 0,
+      } as never;
+    if (command === "transfer") return { transfers: [] } as never;
+    return null as never;
+  });
+  vi.mocked(operate).mockResolvedValue({ path: "/workspace", entries: [] });
+  render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/workspace" }}
+      refresh={vi.fn()}
+      notify={notify}
+    />,
+  );
+  await waitFor(() => expect(nativeDrop.handlers).not.toBeNull());
+  act(() => nativeDrop.handlers!.onEnter(["/tmp/a.txt", "/tmp/b.txt"]));
+  expect(screen.getByText("松开鼠标上传")).toBeTruthy();
+  expect(screen.getByText("上传到 /workspace")).toBeTruthy();
+  act(() => nativeDrop.handlers!.onDrop(["/tmp/a.txt", "/tmp/b.txt"]));
+  await waitFor(() =>
+    expect(api).toHaveBeenCalledWith("upload_paths", {
+      serverId: "server",
+      remoteDir: "/workspace",
+      paths: ["/tmp/a.txt", "/tmp/b.txt"],
+    }),
+  );
+  expect(notify).toHaveBeenCalledWith("已提交 2 个传输任务", false);
+  expect(screen.queryByText("松开鼠标上传")).toBeNull();
+});
+
+test("native drops are ignored while the server is read-only", async () => {
+  nativeDrop.available = true;
+  const notify = vi.fn();
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "runtime_settings")
+      return { ...defaultRuntimeSettings, remote_read_only: true } as never;
+    if (command === "transfer") return { transfers: [] } as never;
+    return null as never;
+  });
+  vi.mocked(operate).mockResolvedValue({ path: "/workspace", entries: [] });
+  render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/workspace" }}
+      refresh={vi.fn()}
+      notify={notify}
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: "新建文件" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true),
+  );
+  await waitFor(() => expect(nativeDrop.handlers).not.toBeNull());
+  act(() => nativeDrop.handlers!.onEnter(["/tmp/a.txt"]));
+  expect(screen.queryByText("松开鼠标上传")).toBeNull();
+  act(() => nativeDrop.handlers!.onDrop(["/tmp/a.txt"]));
+  await waitFor(() =>
+    expect(notify).toHaveBeenCalledWith("只读模式下不能上传文件", true),
+  );
+  expect(api).not.toHaveBeenCalledWith("upload_paths", expect.anything());
 });

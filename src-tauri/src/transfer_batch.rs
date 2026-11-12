@@ -51,6 +51,39 @@ fn filename(name: &str) -> Result<()> {
     );
     Ok(())
 }
+/// Turn paths from a native file drop into upload items under `remote_dir`.
+pub fn upload_items(remote_dir: &str, paths: Vec<String>) -> Result<Vec<BatchItem>> {
+    anyhow::ensure!(
+        remote_dir.starts_with('/')
+            && !remote_dir.contains(['\\', '\0'])
+            && !remote_dir.split('/').any(|part| part == ".."),
+        "INVALID_ARGUMENT: Invalid remote directory"
+    );
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "INVALID_ARGUMENT: No local files were dropped"
+    );
+    let base = remote_dir.trim_end_matches('/');
+    paths
+        .into_iter()
+        .map(|local_path| {
+            let name = Path::new(&local_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .context("INVALID_ARGUMENT: Invalid local file name")?;
+            anyhow::ensure!(
+                !name.contains(['/', '\\', '\0']),
+                "INVALID_ARGUMENT: Invalid local file name"
+            );
+            let remote_path = format!("{base}/{name}");
+            Ok(BatchItem {
+                local_path,
+                remote_path,
+            })
+        })
+        .collect()
+}
 pub async fn start(state: Arc<AppState>, args: BatchArgs, source: &'static str) -> Result<Value> {
     anyhow::ensure!(
         !args.items.is_empty() && args.items.len() <= 100,
@@ -240,4 +273,42 @@ pub async fn start(state: Arc<AppState>, args: BatchArgs, source: &'static str) 
     Ok(
         json!({"group_id":group,"queued":results.len()-rejected,"rejected":rejected,"tasks":results}),
     )
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_uploads_join_the_current_remote_directory() {
+        let items = upload_items(
+            "/workspace/docs/",
+            vec!["/tmp/report.txt".into(), "/tmp/archive".into()],
+        )
+        .unwrap();
+        assert_eq!(items[0].local_path, "/tmp/report.txt");
+        assert_eq!(items[0].remote_path, "/workspace/docs/report.txt");
+        assert_eq!(items[1].remote_path, "/workspace/docs/archive");
+    }
+    #[test]
+    fn dropped_uploads_accept_the_remote_root() {
+        let items = upload_items("/", vec!["/tmp/report.txt".into()]).unwrap();
+        assert_eq!(items[0].remote_path, "/report.txt");
+    }
+    #[test]
+    fn dropped_uploads_reject_unsafe_inputs() {
+        for remote in [
+            "",
+            "workspace",
+            "/workspace/../etc",
+            "/work\\space",
+            "/work\0space",
+        ] {
+            assert!(
+                upload_items(remote, vec!["/tmp/report.txt".into()]).is_err(),
+                "{remote:?}"
+            );
+        }
+        assert!(upload_items("/workspace", Vec::new()).is_err());
+        assert!(upload_items("/workspace", vec!["/".into()]).is_err());
+    }
 }

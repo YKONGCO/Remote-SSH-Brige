@@ -5157,3 +5157,39 @@
 .transfer-task-options input {
   width: 110px;
 }
+.file-surface.is-drop-target {
+  position: relative;
+  border-color: var(--action-bg);
+}
+.file-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  border: 2px dashed var(--action-bg);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--bg-card) 86%, transparent);
+  color: var(--text-1);
+  text-align: center;
+  pointer-events: none;
+}
+.file-drop-overlay svg {
+  color: var(--action-text);
+}
+.file-drop-overlay strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+.file-drop-overlay span {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -233,6 +233,63 @@ mod desktop {
         .map(Some)
         .map_err(|e| format!("{e:#}"))
     }
+    fn single_regular_file(path: &str) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    }
+    #[tauri::command]
+    async fn upload_paths(
+        state: Shared<'_>,
+        server_id: String,
+        remote_dir: String,
+        paths: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        let items =
+            transfer_batch::upload_items(&remote_dir, paths).map_err(|e| format!("{e:#}"))?;
+        if items.len() == 1 && single_regular_file(&items[0].local_path) {
+            let item = &items[0];
+            let spec = transfers::TransferSpec {
+                local_path: item.local_path.clone(),
+                remote_path: item.remote_path.clone(),
+                overwrite: false,
+                size: None,
+                sha256: None,
+                create_parents: false,
+                skip_existing: true,
+                directory: false,
+            };
+            let task = transfers::start(
+                state.inner().clone(),
+                model::Operation {
+                    kind: "upload_file".into(),
+                    server_id,
+                    transfer_request: Some(spec),
+                    ..Default::default()
+                },
+                "desktop",
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+            return Ok(serde_json::json!({
+                "tasks": [task],
+                "queued": 1,
+                "rejected": 0
+            }));
+        }
+        let args = transfer_batch::BatchArgs {
+            server_id,
+            direction: transfer_batch::Direction::Upload,
+            items,
+            recursive: true,
+            overwrite: false,
+            skip_existing: true,
+            request_id: None,
+        };
+        transfer_batch::start(state.inner().clone(), args, "desktop")
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
     #[tauri::command]
     async fn transfer(
         state: Shared<'_>,
@@ -620,6 +677,7 @@ mod desktop {
                 export_audits,
                 download_file,
                 upload_file,
+                upload_paths,
                 pick_local_directories,
                 transfer,
                 pick_transfer_batch,
