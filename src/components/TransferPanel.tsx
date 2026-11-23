@@ -217,7 +217,6 @@ export function TransferPanel({
       const tasks = groups.get(item.group_id)!;
       const matching = tasks.filter(matches);
       if (!matching.length) continue;
-      // Search also reaches files in unopened batches and outside loaded rows.
       const expanded = expandedGroups.get(item.group_id) ?? !!query;
       result.push({ kind: "batch", id: item.group_id, tasks, expanded });
       if (expanded)
@@ -402,7 +401,6 @@ export function TransferPanel({
                   setExpandedGroups((current) =>
                     new Map(current).set(row.id, !row.expanded),
                   );
-                  // Expanding the last loaded header should reveal its files immediately.
                   if (!row.expanded && index + 1 === renderCount)
                     setRenderCount((count) => count + PAGE_SIZE);
                 }}

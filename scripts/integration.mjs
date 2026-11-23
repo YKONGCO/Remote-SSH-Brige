@@ -1,6 +1,4 @@
 import { DatabaseSync } from "node:sqlite";
-// Protocol integration test: a disposable, in-memory SSH/SFTP fixture on loopback.
-// No user servers or SSH configuration are contacted.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
@@ -131,7 +129,6 @@ const ssh = new Server(
             stream.exit(7);
             stream.end();
           } else if (info.command === "fixture:timeout") {
-            /* Intentionally hold the command open. */
           } else {
             stream.write("SSH command: " + info.command + "\n");
             stream.exit(0);
@@ -502,8 +499,8 @@ settingsDB
         allow_compound: true,
         allow_scripts: true,
         allow_substitution: true,
-        allow_mcp_terminal: true,
       },
+      advanced_mcp_tools: { terminal: true, port_forward: true },
       remote_read_only: false,
       approval_mode: "off",
       upload_limit_mib: 4,
@@ -634,8 +631,8 @@ try {
         [
           "list_servers",
           "server_info",
-          "transfer_batch",
           "exec",
+          "exec_approved",
           "job",
           "port_forward",
           "upload_file",
@@ -707,11 +704,16 @@ try {
   const blockedFindCommand =
     "find /tmp -maxdepth 1 -name 'wlx*' -exec rm -rf {} ';'";
   const blockedFind = await call("exec", { command: blockedFindCommand });
+  const blockedFindError = blockedFind.error
+    ? JSON.parse(blockedFind.value)
+    : {};
   check(
-    "Exec policy denial is compact JSON without policy configuration",
+    "Protected exec returns compact approval guidance without connecting",
     blockedFind.error &&
-      JSON.parse(blockedFind.value).message ===
-        "find delete and execute actions are blocked",
+      blockedFindError.code === "APPROVAL_REQUIRED" &&
+      blockedFindError.next_tool === "exec_approved" &&
+      blockedFindError.matched_rules.length > 0 &&
+      (executionCounts.get(blockedFindCommand) || 0) === 0,
   );
   check(
     "Unknown tool error identifies the requested tool",
@@ -743,19 +745,20 @@ try {
     write_file: ["server_id", "path", "content", "mode", "create_parents"],
     edit_file: ["server_id", "path", "edits"],
     exec: ["server_id", "command", "timeout_secs"],
+    exec_approved: ["server_id", "command", "timeout_secs"],
     upload_file: [
       "server_id",
-      "local_path",
-      "remote_path",
+      "items",
+      "recursive",
       "overwrite",
-      "request_id",
+      "skip_existing",
     ],
     download_file: [
       "server_id",
-      "local_path",
-      "remote_path",
+      "items",
+      "recursive",
       "overwrite",
-      "request_id",
+      "skip_existing",
     ],
     remove_path: ["server_id", "path", "recursive", "missing_ok"],
   })) {
@@ -781,6 +784,7 @@ try {
     ["terminal", { action: "read", session_id: "s", content: "irrelevant" }],
     ["terminal", { action: "resize", session_id: "s", cols: 100 }],
     ["exec", { command: "pwd", timeout_secs: 301 }],
+    ["exec_approved", { command: "pwd", timeout_secs: 301 }],
     ["edit_file", { path: "/workspace/hello.txt", edits: [] }],
     ["remove_path", {}],
     ["remove_path", { path: "/workspace/file", recursive: "true" }],
@@ -796,7 +800,7 @@ try {
   check(
     "Terminal schema is discriminated by action",
     terminalSchema.type === "object" &&
-      terminalSchema.oneOf.length === 6 &&
+      terminalSchema.oneOf.length === 5 &&
       terminalSchema.oneOf.every(
         (variant) =>
           variant.additionalProperties === false &&
@@ -822,11 +826,7 @@ try {
     );
   }
   const hosts = await value("list_servers", {});
-  const commandInfo = await value("server_info", { topic: "commands" });
   const compactBytes = Buffer.byteLength(JSON.stringify(hosts));
-  const expandedLowerBound =
-    compactBytes +
-    hosts.length * Buffer.byteLength(JSON.stringify(commandInfo));
   check(
     "Default server discovery contains only identity and root fields",
     hosts.every(
@@ -835,22 +835,7 @@ try {
         JSON.stringify(["host", "id", "name", "root"]),
     ),
   );
-  check(
-    "Discovery payload is over 80 percent smaller than repeated command policies",
-    compactBytes < expandedLowerBound * 0.2,
-  );
-  await writeFile(
-    resolve(work, "mcp-size.json"),
-    JSON.stringify(
-      {
-        compactBytes,
-        expandedLowerBound,
-        reduction: 1 - compactBytes / expandedLowerBound,
-      },
-      null,
-      2,
-    ),
-  );
+  check("Discovery payload stays compact", compactBytes < 1024);
   const listing = await value("list_files", { path: "/workspace", limit: 1 });
   check(
     "Directory listing is paginated and contains metadata",
@@ -914,13 +899,15 @@ try {
     invalidPath.error &&
       invalidPath.value.includes("path must be an absolute POSIX path"),
   );
+  const shellInfo = await value("server_info", { topic: "commands" });
   check(
-    "Discovery exposes independently configured Shell policy",
-    (await value("server_info", { topic: "commands" })).command_policy
-      .allow_pipes &&
-      (await value("server_info", { topic: "commands" })).command_policy
-        .allow_scripts &&
-      (await value("server_info", { topic: "commands" })).command_protection,
+    "Discovery exposes command availability without internal policy rules",
+    shellInfo.exec.available &&
+      shellInfo.exec_approved.available &&
+      shellInfo.exec_approved.timeout_secs >= 1 &&
+      shellInfo.approval_required &&
+      !Object.hasOwn(shellInfo, "command_policy") &&
+      !Object.hasOwn(shellInfo, "protected_commands"),
   );
   for (const command of [
     "ls | head",
@@ -942,8 +929,8 @@ try {
   ]) {
     const result = await call("exec", { command });
     check(
-      `High-risk command stays blocked with Shell enabled: ${command}`,
-      result.error && result.value.includes("Dangerous"),
+      `High-risk command requires approval with Shell enabled: ${command}`,
+      result.error && JSON.parse(result.value).code === "APPROVAL_REQUIRED",
     );
   }
   check(
@@ -970,11 +957,14 @@ try {
   });
   check(
     "Discovery exposes precise tool permissions",
-    limitedHost.mcp_permissions.includes("read_file") &&
-      !limitedHost.mcp_permissions.includes("upload") &&
-      !limitedHost.mcp_permissions.includes("exec") &&
-      JSON.stringify(limitedHost.terminal_actions) ===
-        JSON.stringify(["open", "read", "close"]),
+    limitedHost.capabilities.includes("read_file") &&
+      !limitedHost.capabilities.includes("exec") &&
+      !limitedHost.capabilities.includes("upload_file") &&
+      limitedHost.advanced_tools.terminal === true &&
+      limitedHost.advanced_tools.port_forward === true &&
+      limitedHost.capabilities.includes("terminal_open") &&
+      limitedHost.capabilities.includes("terminal_read") &&
+      limitedHost.capabilities.includes("terminal_close"),
   );
   entries.set("/workspace/limited.txt", Buffer.from("limited read"));
   const limitedText = await value("read_file", {
@@ -984,7 +974,7 @@ try {
   check(
     "Limited file grants do not imply shell permission",
     limitedText.content === "limited read" &&
-      !limitedHost.mcp_permissions.includes("exec"),
+      !limitedHost.capabilities.includes("exec"),
   );
   for (const [kind, args] of [
     ["write_file", { path: "/workspace/limited.txt", content: "denied" }],
@@ -1029,6 +1019,10 @@ try {
       result.stdout.includes(command),
     );
   }
+  check(
+    "Repeated execs reuse a healthy SSH session",
+    (await value("exec", { command: "pwd" })).stdout.length > 0,
+  );
   const text = await value("read_file", { path: "/workspace/hello.txt" });
   check("Read remote UTF-8 file", text.content === "hello SSH\n");
   await value("write_file", {
@@ -1225,8 +1219,9 @@ try {
       cleanup.removed_entries === 1 &&
       !entries.has("/workspace/mcp_test_remote_ssh.txt") &&
       !(await value("server_info", { topic: "permissions" }))
-        .deletion_protection &&
-      (await value("server_info", { topic: "commands" })).command_protection,
+        .deletion_protected &&
+      (await value("server_info", { topic: "commands" })).exec_approved
+        .available,
   );
   const repeated = await value("remove_path", {
     path: "/workspace/mcp_test_remote_ssh.txt",
@@ -1362,6 +1357,7 @@ try {
       action: "read",
       session_id: terminal.session_id,
       cursor: 0,
+      wait_secs: 1,
     });
     output = r.stdout;
     if (output.includes("/workspace/kept")) break;
@@ -1377,17 +1373,11 @@ try {
     terminals.some((t) => t.id === terminal.session_id),
   );
   await value("terminal", {
-    action: "resize",
-    session_id: terminal.session_id,
-    cols: 120,
-    rows: 40,
-  });
-  await value("terminal", {
     action: "close",
     session_id: terminal.session_id,
   });
   check(
-    "Resize and close persistent terminal",
+    "Close persistent terminal",
     (await value("terminal", { action: "list" })).length === 0,
   );
   const limitedTerminal = await value("terminal", {
@@ -1583,9 +1573,6 @@ try {
     let highTimer;
     await Promise.race([
       (async () => {
-        // The ssh2 fixture server can starve a pending stderr write when two
-        // multi-megabyte writes exhaust the same SSH window. Produce realistic
-        // interleaved chunks while leaving job.read entirely idle.
         for (let offset = 0; offset < block.length; offset += 8192) {
           const chunk = block.subarray(offset, offset + 8192);
           await write(highStream, chunk);

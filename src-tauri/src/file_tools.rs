@@ -1,4 +1,3 @@
-//! Bounded, transport-independent file operations inspired by earendil-works/pi.
 use crate::model::{FileEdit, FileRequest, Operation, RuntimeSettings};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -14,7 +13,6 @@ pub const MAX_LINES: u64 = 2000;
 pub const DIRECTORY_SCAN_LIMIT: usize = 10000;
 pub const PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
 
-// Keep the existing imports available to operation implementations and callers.
 pub use crate::operation_error::{
     error, error_code, error_message, error_response, error_with_details, with_stage, ErrorStage,
     OperationError as FileError,
@@ -25,8 +23,6 @@ pub fn require_mcp_permissions(server: &crate::model::Server, required: &[&str])
         .iter()
         .copied()
         .filter(|kind| {
-            // edit_file's dependency is checked separately, so don't report a
-            // granted edit_file as missing when only read_file is absent.
             let explicitly_granted_edit = *kind == "edit_file"
                 && server.enabled
                 && server.mcp_enabled
@@ -111,7 +107,6 @@ pub fn validate(op: &Operation, settings: &RuntimeSettings) -> Result<()> {
     Ok(())
 }
 
-/// Read a bounded prefix with one-byte lookahead, preserving UTF-8 boundaries.
 pub fn read_preview(reader: impl Read, size: u64, limit: u64) -> Result<Value> {
     if limit == 0 || limit > PREVIEW_BYTES {
         return Err(error("INVALID_ARGUMENT", "Invalid text preview size"));
@@ -145,7 +140,6 @@ pub fn read_preview(reader: impl Read, size: u64, limit: u64) -> Result<Value> {
     }))
 }
 
-/// Stream without allocating the whole file or an unbounded single line.
 pub fn read_page(
     mut reader: impl BufRead,
     offset: u64,
@@ -166,7 +160,6 @@ pub fn read_page(
     let mut reason = None;
     let mut long_line = false;
     loop {
-        // One-byte lookahead is bounded by the reader buffer, not a whole line.
         if reader.fill_buf()?.is_empty() {
             eof = true;
             break;
@@ -396,7 +389,6 @@ pub fn edit_text(original: &str, edits: &[FileEdit], output_limit: u64) -> Resul
                 "Text not found; read again and provide matching context",
             )
         })?;
-        // Count in fuzzy space even when exact matching succeeded, like Pi.
         if fuzzy_base.match_indices(&fuzzy_old).take(2).count() > 1 {
             return Err(error(
                 "EDIT_AMBIGUOUS",
@@ -430,7 +422,6 @@ pub fn edit_text(original: &str, edits: &[FileEdit], output_limit: u64) -> Resul
         changed.replace_range(*start..*end, new);
     }
     if use_fuzzy {
-        // Overlay changed line blocks onto the original so equal lines keep original punctuation/spacing.
         let original_lines: Vec<_> = normalized.split_inclusive('\n').collect();
         let diff = similar::TextDiff::configure()
             .timeout(Duration::from_millis(200))

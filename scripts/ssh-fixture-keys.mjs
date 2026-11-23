@@ -1,8 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import ssh2 from "ssh2";
 
-// ssh2's Ed25519 generator strips leading zero bytes from random public keys,
-// intermittently producing an invalid OpenSSH key. Generate PEM with Node instead.
 export function createSshFixtureKey() {
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,

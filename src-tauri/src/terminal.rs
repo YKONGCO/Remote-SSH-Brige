@@ -2,13 +2,17 @@ use crate::{model::*, state::AppState};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     time::{Duration, Instant},
 };
 const CAPACITY: usize = 1024 * 1024;
 const READ_LIMIT: usize = 64 * 1024;
+const RETENTION: Duration = Duration::from_secs(300);
 enum Input {
     Data(Vec<u8>),
     Resize(u32, u32),
@@ -18,6 +22,8 @@ struct Buffer {
     bytes: VecDeque<u8>,
     total: u64,
     alive: bool,
+    state: String,
+    finished: Option<Instant>,
 }
 impl Buffer {
     fn read(&self, requested: u64) -> Result<Value> {
@@ -34,8 +40,6 @@ impl Buffer {
             .take(READ_LIMIT)
             .copied()
             .collect();
-        // Do not consume an incomplete UTF-8 suffix until more bytes arrive.
-        // On EOF the final incomplete suffix is emitted as replacement text.
         if self.alive || cursor + (bytes.len() as u64) < self.total {
             let mut checked = 0;
             while let Err(error) = std::str::from_utf8(&bytes[checked..]) {
@@ -51,7 +55,8 @@ impl Buffer {
         let next = cursor + bytes.len() as u64;
         Ok(
             json!({"stdout":String::from_utf8_lossy(&bytes),"cursor":next,
-            "alive":self.alive,"truncated":requested < start,"has_more":next < self.total}),
+            "alive":self.alive,"state":self.state,"truncated":requested < start,
+            "has_more":next < self.total}),
         )
     }
 }
@@ -59,26 +64,77 @@ pub struct TerminalHandle {
     metadata: TerminalInfo,
     input: mpsc::SyncSender<Input>,
     buffer: Arc<Mutex<Buffer>>,
+    wake: Arc<Condvar>,
+    closed: Arc<AtomicBool>,
+    mcp: bool,
 }
 impl TerminalHandle {
     pub fn info(&self) -> TerminalInfo {
-        let mut i = self.metadata.clone();
-        i.alive = self.buffer.lock().unwrap().alive;
-        i
+        let buffer = self.buffer.lock().unwrap();
+        let mut info = self.metadata.clone();
+        info.alive = buffer.alive;
+        info.state = buffer.state.clone();
+        info
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.buffer.lock().unwrap().state = "closing".into();
+        self.wake.notify_all();
+        let _ = self.input.try_send(Input::Close);
+    }
+    fn read(&self, cursor: u64, wait: Duration) -> Result<Value> {
+        let deadline = Instant::now() + wait;
+        let mut buffer = self.buffer.lock().unwrap();
+        loop {
+            let value = buffer.read(cursor)?;
+            let empty = value["stdout"].as_str().is_some_and(|text| text.is_empty());
+            let now = Instant::now();
+            if !empty
+                || !buffer.alive
+                || buffer.state != "running"
+                || wait.is_zero()
+                || now >= deadline
+            {
+                return Ok(value);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            buffer = self
+                .wake
+                .wait_timeout(buffer, remaining)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|error| error.into_inner().0);
+        }
     }
 }
-fn append(buffer: &Arc<Mutex<Buffer>>, bytes: &[u8]) {
+fn append(buffer: &Arc<Mutex<Buffer>>, wake: &Arc<Condvar>, bytes: &[u8]) {
     let mut b = buffer.lock().unwrap();
     b.bytes.extend(bytes);
     b.total += bytes.len() as u64;
     let excess = b.bytes.len().saturating_sub(CAPACITY);
     b.bytes.drain(..excess);
+    drop(b);
+    wake.notify_all();
 }
-pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Value> {
+fn finish(buffer: &Arc<Mutex<Buffer>>, wake: &Arc<Condvar>, state: &str) {
+    let mut b = buffer.lock().unwrap();
+    b.alive = false;
+    b.state = state.into();
+    b.finished = Some(Instant::now());
+    drop(b);
+    wake.notify_all();
+}
+pub fn operate(state: &AppState, server: &Server, op: &Operation, source: &str) -> Result<Value> {
     if op.kind == "terminal_open" {
         let _opening = state.terminal_open_lock.lock().unwrap();
         let settings = state.settings.lock().unwrap().clone();
-        if state.terminals.lock().unwrap().len() >= settings.max_terminals {
+        let active = state
+            .terminals
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| handle.info().alive)
+            .count();
+        if active >= settings.max_terminals {
             bail!(
                 "Terminal session limit of {} reached; close an unused session",
                 settings.max_terminals
@@ -99,7 +155,11 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
             bytes: VecDeque::new(),
             total: 0,
             alive: true,
+            state: "running".into(),
+            finished: None,
         }));
+        let wake = Arc::new(Condvar::new());
+        let closed = Arc::new(AtomicBool::new(false));
         let handle = Arc::new(TerminalHandle {
             metadata: TerminalInfo {
                 id: id.clone(),
@@ -107,11 +167,17 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
                 name: format!("{} · 终端", server.name),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 alive: true,
+                state: "running".into(),
             },
             input: tx,
             buffer: buffer.clone(),
+            wake: wake.clone(),
+            closed: closed.clone(),
+            mcp: source == "mcp",
         });
         state.terminals.lock().unwrap().insert(id.clone(), handle);
+        let worker_buffer = buffer.clone();
+        let worker_wake = wake.clone();
         std::thread::spawn(move || {
             let mut pending = VecDeque::new();
             let mut data = [0; 16384];
@@ -119,7 +185,10 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
             let mut pending_since = Instant::now();
             let result = (|| -> Result<()> {
                 loop {
-                    // Bound unsent input when a remote process stops reading.
+                    if closed.load(Ordering::Acquire) {
+                        let _ = channel.close();
+                        return Ok(());
+                    }
                     while pending.len() < CAPACITY {
                         match rx.try_recv() {
                             Ok(Input::Close) => {
@@ -159,7 +228,7 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
                     loop {
                         match channel.read(&mut data) {
                             Ok(0) => break,
-                            Ok(n) => append(&buffer, &data[..n]),
+                            Ok(n) => append(&worker_buffer, &worker_wake, &data[..n]),
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => return Err(e.into()),
                         }
@@ -173,11 +242,14 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
             })();
             if let Err(e) = result {
                 append(
-                    &buffer,
+                    &worker_buffer,
+                    &worker_wake,
                     format!("\r\n[Connection closed: {e}]\r\n").as_bytes(),
                 );
+                finish(&worker_buffer, &worker_wake, "disconnected");
+            } else {
+                finish(&worker_buffer, &worker_wake, "closed");
             }
-            buffer.lock().unwrap().alive = false;
         });
         return Ok(json!({"session_id":id}));
     }
@@ -193,8 +265,11 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
     }
     match op.kind.as_str() {
         "terminal_read" => {
-            let b = handle.buffer.lock().unwrap();
-            b.read(op.cursor)
+            anyhow::ensure!(
+                op.wait_secs <= 30,
+                "INVALID_ARGUMENT: wait_secs must be 0-30"
+            );
+            handle.read(op.cursor, Duration::from_secs(op.wait_secs))
         }
         "terminal_write" => {
             if op.content.len() > 65536 {
@@ -213,11 +288,43 @@ pub fn operate(state: &AppState, server: &Server, op: &Operation) -> Result<Valu
             Ok(json!({"resized":true}))
         }
         "terminal_close" => {
-            let _ = handle.input.try_send(Input::Close);
+            handle.close();
             state.terminals.lock().unwrap().remove(&op.session_id);
             Ok(json!({"closed":true}))
         }
         _ => bail!("Unsupported terminal action"),
+    }
+}
+pub fn stop_mcp(terminals: &Mutex<HashMap<String, Arc<TerminalHandle>>>) {
+    let sessions: Vec<_> = terminals
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, handle)| handle.mcp)
+        .map(|(id, handle)| (id.clone(), handle.clone()))
+        .collect();
+    for (id, handle) in sessions {
+        handle.close();
+        terminals.lock().unwrap().remove(&id);
+    }
+}
+pub fn prune(terminals: &Mutex<HashMap<String, Arc<TerminalHandle>>>) {
+    let expired: Vec<_> = terminals
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, handle)| {
+            let buffer = handle.buffer.lock().unwrap();
+            !buffer.alive
+                && buffer
+                    .finished
+                    .is_some_and(|finished| finished.elapsed() > RETENTION)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut terminals = terminals.lock().unwrap();
+    for id in expired {
+        terminals.remove(&id);
     }
 }
 
@@ -230,6 +337,8 @@ mod tests {
             bytes: bytes.iter().copied().collect(),
             total: bytes.len() as u64,
             alive,
+            state: if alive { "running" } else { "closed" }.into(),
+            finished: None,
         }
     }
 
@@ -247,6 +356,7 @@ mod tests {
         assert_eq!(invalid["stdout"], "��");
         assert_eq!(invalid["cursor"], 2);
         assert_eq!(invalid["has_more"], false);
+        assert_eq!(invalid["state"], "closed");
     }
 
     #[test]

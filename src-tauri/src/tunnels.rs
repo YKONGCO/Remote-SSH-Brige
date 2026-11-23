@@ -1,5 +1,3 @@
-//! Local TCP forwarding. Each client owns its SSH session so slow clients cannot
-//! hold libssh2's shared session lock and stall other clients.
 use crate::{
     model::{Operation, Server},
     state::AppState,
@@ -70,7 +68,6 @@ impl Drop for TunnelManager {
 }
 impl TunnelManager {
     pub fn history(&self, state: &AppState) -> Result<Vec<TunnelInfo>> {
-        // Use the same lock order as deletion and listener finalization.
         let entries = self.entries.lock().unwrap();
         let mut items: HashMap<_, _> = state
             .database
@@ -146,7 +143,7 @@ pub fn validate(op: &Operation) -> Result<()> {
                 op.remote_port != 0,
                 "INVALID_ARGUMENT: remote_port must be 1-65535"
             );
-            // First version intentionally limits targets to the SSH server itself.
+
             anyhow::ensure!(
                 matches!(op.remote_host.as_str(), "127.0.0.1" | "::1"),
                 "INVALID_ARGUMENT: remote_host must be 127.0.0.1 or ::1"
@@ -190,7 +187,7 @@ pub fn operate(
     }
     let settings = state.settings.lock().unwrap().clone();
     let generation = state.tunnels.mcp_generation.load(Ordering::SeqCst);
-    // Verify host key and credentials before publishing a listener.
+
     let session = crate::ssh::connect_with_settings(server, &settings)?;
     drop(session);
     let listener = TcpListener::bind(("127.0.0.1", op.local_port))
@@ -245,7 +242,7 @@ pub fn operate(
         active < MAX_TUNNELS,
         "Maximum of {MAX_TUNNELS} active tunnels reached"
     );
-    // Bound retained history without discarding running tasks.
+
     if entries.len() >= 128 {
         entries.retain(|_, t| {
             matches!(
@@ -345,13 +342,12 @@ fn run_listener(listener: TcpListener, tunnel: &Arc<Tunnel>, weak: Weak<AppState
             }
         }
     }
-    drop(listener); // Free the listening port before waiting for in-flight SSH handshakes.
+    drop(listener);
     tunnel.stop();
     for w in workers {
         let _ = w.join();
     }
     if let Some(state) = weak.upgrade() {
-        // Serialize final persistence with history deletion so deleted records stay deleted.
         let entries = state.tunnels.entries.lock().unwrap();
         let mut info = tunnel.info.lock().unwrap();
         info.status = "closed".into();
@@ -379,7 +375,7 @@ fn retry(e: &std::io::Error) -> bool {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
     )
 }
-// One bounded buffer per direction; never accumulate arbitrary stream contents.
+
 #[derive(Default)]
 struct Pending {
     bytes: Vec<u8>,
@@ -526,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permissions_read_only_and_approval_are_enforced_before_network() {
+    async fn permissions_and_read_only_are_enforced_before_network() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::open(dir.path().into()).unwrap();
         let mut server = state
@@ -562,17 +558,7 @@ mod tests {
             .is_err());
         assert!(crate::security::sensitive(&op, "desktop"));
         settings.remote_read_only = false;
-        settings.approval_mode = "mcp".into();
         state.save_settings(settings).unwrap();
-        let pending = tokio::spawn(crate::state::execute(state.clone(), op, "mcp"));
-        let view = loop {
-            if let Some(view) = state.approvals.list().first() {
-                break view.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        state.resolve_approval(&view.id, false).unwrap();
-        assert!(pending.await.unwrap().is_err());
         assert!(state.tunnels.list(None).is_empty());
     }
 

@@ -2,9 +2,9 @@ import {
   defaultRuntimeSettings,
   defaultCommandPolicy,
   MAX_TRANSFER_MIB,
+  validCommandRules,
   type RuntimeSettings,
 } from "./runtime-settings";
-import { defaultAllowedCommands, validCommandLists } from "./runtime-settings";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type {
   Snapshot,
@@ -317,6 +317,19 @@ export async function api<T = unknown>(
   if (command === "pick_local_directories")
     throw new Error("请选择桌面应用中的文件夹，浏览器预览支持手动填写目录。");
   if (command === "runtime_settings") return structuredClone(demoSettings) as T;
+  if (command === "protected_rules")
+    return {
+      builtin: [
+        { command: "rm", reason: "Deletes files or directories" },
+        { command: "dd", reason: "Can overwrite disks or devices" },
+        { command: "shutdown", reason: "Powers off or restarts the machine" },
+        {
+          command: "find",
+          arguments: ["-delete", "-exec", "-execdir", "-ok", "-okdir"],
+          reason: "find may delete files or execute commands",
+        },
+      ],
+    } as T;
   if (command === "pending_approvals") return [] as T;
   if (command === "resolve_approval")
     throw new Error("操作审批需要在桌面应用中使用。");
@@ -340,44 +353,39 @@ export async function api<T = unknown>(
     if (
       ![
         next.deletion_protection,
-        next.block_dangerous_commands,
         next.remote_read_only,
-      ].every((value) => typeof value === "boolean") ||
-      !["off", "mcp", "all"].includes(next.approval_mode)
+        next.approval_mode,
+      ].every((value) => typeof value === "boolean")
     )
       throw new Error("安全设置无效");
     if (
       next.command_policy != null &&
       (Object.keys(next.command_policy).some(
-        (key) =>
-          !(key in defaultCommandPolicy) &&
-          ![
-            "execution_mode",
-            "allowed_commands",
-            "blocked_commands",
-            "allow_advanced_shell",
-          ].includes(key),
+        (key) => !(key in defaultCommandPolicy),
       ) ||
-        Object.keys(defaultCommandPolicy).some(
-          (key) =>
-            typeof next.command_policy![
-              key as keyof typeof defaultCommandPolicy
-            ] !== "boolean",
-        ))
+        (
+          [
+            "allow_pipes",
+            "allow_redirection",
+            "allow_compound",
+            "allow_scripts",
+            "allow_substitution",
+            "exec_disabled",
+          ] as const
+        ).some((key) => typeof next.command_policy![key] !== "boolean"))
     )
       throw new Error("命令权限设置无效");
     if (
+      !next.advanced_mcp_tools ||
+      typeof next.advanced_mcp_tools.terminal !== "boolean" ||
+      typeof next.advanced_mcp_tools.port_forward !== "boolean"
+    )
+      throw new Error("高级 MCP 工具设置无效");
+    if (
       next.command_policy &&
-      ((next.command_policy.execution_mode !== undefined &&
-        !["disabled", "whitelist", "unrestricted"].includes(
-          next.command_policy.execution_mode,
-        )) ||
-        (next.command_policy.allow_advanced_shell !== undefined &&
-          typeof next.command_policy.allow_advanced_shell !== "boolean") ||
-        !validCommandLists(
-          next.command_policy.allowed_commands ?? defaultAllowedCommands,
-          next.command_policy.blocked_commands ?? [],
-        ))
+      (!validCommandRules(next.command_policy.protected_commands ?? []) ||
+        (next.command_policy.legacy_whitelist != null &&
+          !validCommandRules(next.command_policy.legacy_whitelist)))
     )
       throw new Error("命令名单或执行范围无效");
     for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
@@ -518,7 +526,7 @@ export async function operate<T = Record<string, unknown>>(
     ["remove", "remove_path"].includes(op.kind)
   )
     throw new Error("删除保护已开启，请在设置中关闭后再删除");
-  // Browser preview never executes Shell; the desktop backend applies the AST policy.
+
   let result: unknown = {};
   switch (op.kind) {
     case "test":
@@ -555,7 +563,7 @@ export async function operate<T = Record<string, unknown>>(
           Math.min(20, demoSettings.download_limit_mib || 256) * 1024 * 1024;
         const prefix = bytes.subarray(0, limit);
         let end = prefix.length;
-        // Exclude an incomplete UTF-8 character at the preview boundary.
+
         if (bytes.length > limit) {
           while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
         }

@@ -1,4 +1,3 @@
-/** Hold one file's prefetched reads until the test observes a client checkpoint. */
 export function createTransferReadGate(path, offset) {
   let state = "armed";
   const pending = [];

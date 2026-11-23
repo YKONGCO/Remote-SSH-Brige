@@ -1,11 +1,12 @@
-/// <reference types="vitest/config" />
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 export default defineConfig({
-  // Node protocol fixtures run separately through test:e2e.
-  test: { include: ["src/tests/**/*.test.{ts,tsx}"] },
+  test: {
+    include: ["src/tests/**/*.test.{ts,tsx}"],
+    environment: "jsdom",
+  },
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -17,8 +18,7 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 1420,
     strictPort: true,
-    // Tauri watches Rust itself. Watching toolchains and build output can stall
-    // startup before the webview receives its first HTML/JS response.
+
     watch: {
       ignored: [
         "**/src-tauri/**",

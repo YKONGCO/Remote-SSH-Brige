@@ -1,4 +1,4 @@
-﻿import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useCallback, type ReactNode } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";

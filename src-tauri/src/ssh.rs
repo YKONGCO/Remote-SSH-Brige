@@ -8,13 +8,89 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use ssh2::{Session, Sftp};
 use std::{
+    collections::HashMap,
     io::{BufReader, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Condvar, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
-/// Applied only at the SSH boundary; policy, approvals and audit keep the original command.
+pub(crate) fn connection_signature(server: &Server) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        server.host, server.port, server.username, server.auth, server.key_path, server.fingerprint
+    )
+}
+
+struct ConnectThrottle {
+    state: Mutex<HashMap<String, usize>>,
+    changed: Condvar,
+}
+
+impl ConnectThrottle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+static CONNECT_THROTTLE: OnceLock<ConnectThrottle> = OnceLock::new();
+
+pub(crate) struct ConnectSlot {
+    key: String,
+}
+
+impl Drop for ConnectSlot {
+    fn drop(&mut self) {
+        let throttle = CONNECT_THROTTLE
+            .get()
+            .expect("connect throttle initialized");
+        let mut state = throttle.state.lock().unwrap();
+        if let Some(count) = state.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.remove(&self.key);
+            }
+        }
+        throttle.changed.notify_all();
+    }
+}
+
+pub(crate) fn connect_slot(server: &Server) -> Result<ConnectSlot> {
+    let throttle = CONNECT_THROTTLE.get_or_init(ConnectThrottle::new);
+    let key = format!("{}:{}:{}", server.host, server.port, server.username);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut state = throttle.state.lock().unwrap();
+    loop {
+        let count = state.get(&key).copied().unwrap_or(0);
+        if count < 2 {
+            state.insert(key.clone(), count + 1);
+            return Ok(ConnectSlot { key });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(crate::operation_error::error(
+                "SSH_SESSION_BUSY",
+                "Too many concurrent SSH handshakes for this server",
+            ));
+        }
+        let (next, timeout) = throttle
+            .changed
+            .wait_timeout(state, remaining.min(Duration::from_millis(500)))
+            .unwrap();
+        state = next;
+        if timeout.timed_out() && Instant::now() >= deadline {
+            return Err(crate::operation_error::error(
+                "SSH_SESSION_BUSY",
+                "Too many concurrent SSH handshakes for this server",
+            ));
+        }
+    }
+}
+
 pub fn command_with_login_path(server: &Server, command: &str) -> String {
     match &server.login_path {
         Some(path) => format!("export PATH='{}'\n{command}", path.replace('\'', "'\\''")),
@@ -25,7 +101,7 @@ pub fn command_with_login_path(server: &Server, command: &str) -> String {
 pub fn sync_login_path(server: &Server, settings: &RuntimeSettings) -> Result<String> {
     let session = connect_with_settings(server, settings)?;
     let mut channel = session.channel_session()?;
-    // Merge startup diagnostics to avoid blocking on a full stderr buffer.
+
     channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
     let marker = format!("remote_path_{}", uuid::Uuid::new_v4().simple());
     let script = format!("printf '\\000{marker}\\000%s\\000' \"$PATH\"");
@@ -210,13 +286,13 @@ pub(crate) fn remote_path(
         ));
     }
     let root = sftp.realpath(Path::new(&server.root))?;
-    // Resolve existing targets, including symlinks. New targets resolve their parent.
+
     let path = Path::new(value);
     let resolved = match sftp.realpath(path) {
         Ok(p) => p,
         Err(e) if create => {
             match sftp.lstat(path) {
-                Ok(_) => return Err(e.into()), // Reject dangling symlinks rather than following them.
+                Ok(_) => return Err(e.into()),
                 Err(missing) if missing.code() == ssh2::ErrorCode::SFTP(2) => {}
                 Err(other) => return Err(other.into()),
             }
@@ -245,8 +321,6 @@ pub(crate) fn remote_path(
     Ok(resolved)
 }
 pub(crate) fn create_parent_directories(sftp: &Sftp, server: &Server, value: &str) -> Result<()> {
-    // Validate the entire request before creating anything. Resolve the nearest
-    // existing ancestor first, so symlinks outside the root cannot cause writes.
     if !value.starts_with('/')
         || value.contains('\0')
         || value.contains('\\')
@@ -292,8 +366,6 @@ pub(crate) fn create_parent_directories(sftp: &Sftp, server: &Server, value: &st
         match sftp.mkdir(&checked, 0o755) {
             Ok(()) => {}
             Err(e) => {
-                // A concurrent creator is acceptable only after rechecking scope
-                // and type. Other errors retain the original SFTP diagnostic.
                 let existing = remote_path(sftp, server, &directory.to_string_lossy(), false);
                 if !existing.is_ok_and(|p| sftp.stat(&p).is_ok_and(|st| st.is_dir())) {
                     return Err(anyhow::Error::from(e).context(format!(
@@ -311,7 +383,7 @@ fn destructive_path(sftp: &Sftp, server: &Server, value: &str) -> Result<PathBuf
     if p == sftp.realpath(Path::new(&server.root))? {
         bail!("Cannot delete or rename the allowed file root")
     }
-    // Preserve the original basename for unlink/rename so a symlink itself is affected.
+
     let original = Path::new(value);
     Ok(sftp
         .realpath(original.parent().context("Invalid path")?)?
@@ -332,7 +404,7 @@ pub fn operate_with_settings(
     settings.validate()?;
     validate_payload(op, settings)?;
     let limit = settings.transfer_limit(&op.kind);
-    // Reject oversized payloads before allocating decoded bytes or connecting.
+
     if op.kind == "upload" && op.content.len() as u64 > ((limit + 2) / 3) * 4 {
         bail!(
             "File exceeds the {} MiB upload limit",
@@ -612,7 +684,7 @@ pub fn operate_with_settings(
                     "Rename target already exists",
                 ));
             }
-            // None in ssh2 enables OVERWRITE by default. Empty flags request SFTP no-replace.
+
             mutation_result(sftp.rename(&p, &target, Some(ssh2::RenameFlags::empty())))?;
             Ok(json!({"path":op.path,"target":op.target,"renamed":true}))
         }
@@ -699,8 +771,6 @@ fn mutation_result(result: std::result::Result<(), ssh2::Error>) -> Result<()> {
     })
 }
 
-/// Use an explicit OpenSSH extension: libssh2's generic rename flags are only
-/// preferences and do not guarantee an atomic overwrite on an SFTP v3 server.
 pub(crate) fn commit_extension(
     session: &Session,
     extension: &str,
@@ -727,15 +797,14 @@ pub(crate) fn commit_extension(
     }
     let mut channel = session.channel_session()?;
     channel.subsystem("sftp")?;
-    packet(&mut channel, &[1, 0, 0, 0, 3])?; // SSH_FXP_INIT v3
+    packet(&mut channel, &[1, 0, 0, 0, 3])?;
     let version = receive(&mut channel)?;
     anyhow::ensure!(
         version[0] == 2 && version[1..5] == [0, 0, 0, 3],
         "Unsupported SFTP protocol version"
     );
-    // A server's successful extension response confirms support; OP_UNSUPPORTED
-    // fails safely. Do not fall back to a generic rename or shell command.
-    let mut payload = vec![200, 0, 0, 0, 1]; // SSH_FXP_EXTENDED, request id 1
+
+    let mut payload = vec![200, 0, 0, 0, 1];
     string(&mut payload, extension);
     string(
         &mut payload,
@@ -877,8 +946,7 @@ fn atomic_write_using(
             path,
         )
     })();
-    // After hardlink success, removing the temp name does not affect the committed inode.
-    // Cleanup is best-effort and never turns a completed commit into a retryable failure.
+
     let _ = sftp.unlink(&temp);
     if let Err(error) = result {
         if mode == WriteMode::Create

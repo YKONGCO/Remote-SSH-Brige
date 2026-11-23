@@ -1,4 +1,4 @@
-//! Transfer content only through fixed-size file streams. No content enters IPC or audit.
+use crate::transfer_scheduler::{RunPermit, TransferScheduler};
 use crate::{
     model::{Operation, RuntimeSettings, Server},
     operation_error::error,
@@ -21,7 +21,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-// A fixed 1 MiB window lets libssh2 pipeline SFTP requests on higher-latency links.
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 const RETENTION: Duration = Duration::from_secs(7 * 86400);
 #[cfg(test)]
@@ -127,13 +126,35 @@ pub struct Snapshot {
     pub sha256: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+    #[serde(default)]
+    pub verified_bytes: u64,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub retry_stage: Option<String>,
+    #[serde(default)]
+    pub failure_category: Option<String>,
+    #[serde(default)]
+    pub session_reuse_count: u64,
+    #[serde(default)]
+    pub effective_throughput: u64,
+    #[serde(default)]
+    pub queued_ms: u64,
+    #[serde(default)]
+    pub transfer_ms: u64,
+    #[serde(default)]
+    pub verify_ms: u64,
+    #[serde(default)]
+    pub retry_wait_ms: u64,
+    #[serde(default)]
+    pub batch_policy: Option<String>,
 }
 
 pub struct Handle {
     snapshot: Mutex<Snapshot>,
     notify: tokio::sync::Notify,
     cancel: CancellationToken,
-    // 0 transfers, 1 cancellation accepted, 2 committing, 3 terminal.
+
     control: AtomicU8,
     confirmed_bytes: AtomicU64,
     destination_key: String,
@@ -142,11 +163,15 @@ pub struct Handle {
     state: Mutex<Weak<AppState>>,
     pub(crate) operation: Mutex<Operation>,
     origin: Mutex<String>,
-    pub(crate) checkpoint: Mutex<crate::transfer_io::Checkpoint>,
+    pub(crate) checkpoint: Mutex<crate::transfer_engine::Checkpoint>,
     worker_active: std::sync::atomic::AtomicBool,
     server_identity: Mutex<Option<Server>>,
     journal_lock: Mutex<()>,
     lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) window: Mutex<crate::transfer_engine::AdaptiveWindow>,
+    pub(crate) last_progress: Mutex<Instant>,
+    phase_started: Mutex<Option<(String, Instant)>>,
+    queued_recorded: std::sync::atomic::AtomicBool,
 }
 impl Handle {
     fn snapshot(&self) -> Snapshot {
@@ -164,6 +189,46 @@ impl Handle {
         drop(view);
         self.notify.notify_waiters();
     }
+    pub(crate) fn mark_running(&self) {
+        if !self.queued_recorded.swap(true, Ordering::AcqRel) {
+            let queued = self.created.elapsed().as_millis() as u64;
+            self.update(|s| s.queued_ms = queued);
+        }
+    }
+    pub(crate) fn retry_wait(&self, delay: Duration) {
+        self.update(|s| {
+            s.retry_wait_ms = s.retry_wait_ms.saturating_add(delay.as_millis() as u64);
+        });
+    }
+    pub(crate) fn verified(&self, bytes: u64) {
+        self.update(|s| s.verified_bytes = bytes);
+    }
+    pub(crate) fn reset_checkpoint(&self) {
+        {
+            let mut checkpoint = self.checkpoint.lock().unwrap();
+            checkpoint.hashes.clear();
+            checkpoint.verified_bytes = 0;
+            checkpoint.temp_size = None;
+        }
+        let _ = self.persist();
+    }
+    pub(crate) fn session_reused(&self, reused: bool) {
+        if reused {
+            self.update(|s| s.session_reuse_count = s.session_reuse_count.saturating_add(1));
+        }
+    }
+    pub(crate) fn failure(&self, error: &anyhow::Error) {
+        let code = crate::operation_error::error_code(error);
+        let category = failure_category(code);
+        let stage = crate::operation_error::error_response(error, &Operation::default())["stage"]
+            .as_str()
+            .unwrap_or("execution")
+            .to_string();
+        self.update(|s| {
+            s.failure_category = Some(category.to_string());
+            s.retry_stage = Some(stage);
+        });
+    }
     pub fn check_cancelled(&self) -> Result<()> {
         if self.control.load(Ordering::Acquire) == 4 {
             return Err(error("TRANSFER_PAUSED", "Transfer paused"));
@@ -177,9 +242,7 @@ impl Handle {
         self.control
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| error("TRANSFER_CANCELLED", "Transfer cancelled"))?;
-        self.update(|s| {
-            s.phase = "committing".into();
-        });
+        self.phase("committing");
         Ok(())
     }
     fn request_cancel(&self) -> bool {
@@ -189,7 +252,7 @@ impl Handle {
         {
             Ok(_) => {
                 self.cancel.cancel();
-                self.update(|s| s.phase = "cancelling".into());
+                self.phase("cancelling");
                 true
             }
             Err(1) => true,
@@ -198,10 +261,18 @@ impl Handle {
     }
     fn progress(&self, count: u64, total: u64, elapsed: Duration) {
         self.confirmed_bytes.store(count, Ordering::Release);
+        let throughput = (count as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+        let now = chrono::Utc::now().to_rfc3339();
+        *self.last_progress.lock().unwrap() = Instant::now();
         self.update(|s| {
             s.transferred_bytes = count;
             s.total_bytes = Some(total);
-            s.bytes_per_second = (count as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+            s.bytes_per_second = throughput;
+            s.effective_throughput = throughput;
+            s.last_progress_at = Some(now);
+            if s.phase == "stalled" {
+                s.phase = "transferring".into();
+            }
         });
     }
     fn complete(&self, result: &Result<Value>) {
@@ -217,7 +288,7 @@ impl Handle {
                 Err(_) => "failed",
             }
             .into();
-            // Preserve the measured streaming average after completion.
+
             s.phase = s.status.clone();
             s.next_retry_at = None;
             if result.is_ok() {
@@ -231,21 +302,24 @@ impl Handle {
             s.finished_at = Some(chrono::Utc::now().to_rfc3339());
             if let Err(e) = result {
                 let cancellation = error("TRANSFER_CANCELLED", "Transfer cancelled");
-                s.error = Some(crate::operation_error::error_response(
-                    if cancelled { &cancellation } else { e },
-                    &Operation {
-                        kind: if s.direction == "upload" {
-                            "upload_file"
-                        } else {
-                            "download_file"
-                        }
-                        .into(),
-                        server_id: s.server_id.clone(),
-                        transfer_id: s.transfer_id.clone(),
-                        path: s.remote_path.clone(),
-                        ..Default::default()
-                    },
-                ));
+                let operation = Operation {
+                    kind: if s.direction == "upload" {
+                        "upload_file"
+                    } else {
+                        "download_file"
+                    }
+                    .into(),
+                    server_id: s.server_id.clone(),
+                    transfer_id: s.transfer_id.clone(),
+                    path: s.remote_path.clone(),
+                    ..Default::default()
+                };
+                let response =
+                    transfer_error_response(if cancelled { &cancellation } else { e }, &operation);
+                s.failure_category =
+                    Some(failure_category(response["code"].as_str().unwrap_or("")).to_string());
+                s.retry_stage = response["stage"].as_str().map(str::to_string);
+                s.error = Some(response);
             }
             if paused {
                 s.error = None;
@@ -272,18 +346,72 @@ fn terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
 
+pub(crate) fn transfer_error_response(error: &anyhow::Error, op: &Operation) -> Value {
+    let mut response = crate::operation_error::error_response(error, op);
+    let code = response["code"].as_str().unwrap_or("").to_string();
+    response["retryable"] = json!(crate::operation_error::retryable(error));
+    response["reconnect_required"] =
+        json!(matches!(failure_category(&code), "connection" | "network"));
+    response["recovery"] = json!(match failure_category(&code) {
+        "connection" => "retry after the SSH connection is available",
+        "network" => "retry with backoff; keep the checkpoint",
+        "remote_storage" => "free remote space or fix permissions before retrying",
+        "permission" => "ask the server owner for the required permission",
+        "file" => "inspect the source and destination, then create a new transfer",
+        "control" => "resume or create a new transfer",
+        _ => "inspect the transfer status before retrying",
+    });
+    response
+}
+
+fn batch_policy_name(policy: crate::transfer_planner::BatchErrorPolicy) -> &'static str {
+    match policy {
+        crate::transfer_planner::BatchErrorPolicy::Continue => "continue_on_error",
+        crate::transfer_planner::BatchErrorPolicy::FailFast => "fail_fast",
+    }
+}
+
+fn failure_category(code: &str) -> &'static str {
+    match code {
+        "SSH_CONNECT_FAILED"
+        | "SSH_AUTHENTICATION_FAILED"
+        | "SSH_HOST_UNTRUSTED"
+        | "SSH_HOST_KEY_MISMATCH"
+        | "SSH_SESSION_BUSY" => "connection",
+        "SSH_TIMEOUT" | "IO_TIMEOUT" | "CONNECTION_LOST" | "CONNECTION_REFUSED" | "SSH_ERROR" => {
+            "network"
+        }
+        "NO_SPACE" | "QUOTA_EXCEEDED" | "SFTP_FAILURE" | "REMOTE_IO" => "remote_storage",
+        "PERMISSION_DENIED" | "WRITE_PROTECTED" | "LOCAL_PATH_DENIED" | "PATH_OUTSIDE_ROOT" => {
+            "permission"
+        }
+        "SOURCE_CHANGED" | "NOT_FOUND" | "ALREADY_EXISTS" | "CHECKSUM_MISMATCH" => "file",
+        "TRANSFER_CANCELLED" | "TRANSFER_PAUSED" => "control",
+        _ => "unknown",
+    }
+}
+
 include!("transfer_tasks.rs");
 
-#[derive(Default)]
 pub struct TransferManager {
     items: Mutex<HashMap<String, Arc<Handle>>>,
-    running: Mutex<HashSet<String>>,
+    scheduler: Arc<TransferScheduler>,
+    group_policies: Mutex<HashMap<String, crate::transfer_planner::BatchErrorPolicy>>,
     state: Mutex<Weak<AppState>>,
+}
+
+impl Default for TransferManager {
+    fn default() -> Self {
+        Self {
+            items: Mutex::new(HashMap::new()),
+            scheduler: TransferScheduler::new(),
+            group_policies: Mutex::new(HashMap::new()),
+            state: Mutex::new(Weak::new()),
+        }
+    }
 }
 impl TransferManager {
     pub fn prune(&self) {
-        // Failed/paused tasks keep their checkpoints until explicit cleanup.
-        // Only successful records without retained partial data expire.
         let mut items = self.items.lock().unwrap();
         let expired: Vec<_> = items
             .iter()
@@ -308,6 +436,15 @@ impl TransferManager {
             }
             items.remove(&id);
         }
+        let live: HashSet<String> = items
+            .values()
+            .filter_map(|handle| handle.snapshot().group_id)
+            .collect();
+        drop(items);
+        self.group_policies
+            .lock()
+            .unwrap()
+            .retain(|group, _| live.contains(group));
     }
     pub fn completed_local_file(&self, server_id: &str, transfer_id: &str) -> Result<PathBuf> {
         let item = self
@@ -350,7 +487,204 @@ impl TransferManager {
         );
         Ok(path)
     }
+    pub(crate) fn register_group(
+        &self,
+        group: &str,
+        policy: crate::transfer_planner::BatchErrorPolicy,
+    ) {
+        let name = batch_policy_name(policy);
+        {
+            let mut policies = self.group_policies.lock().unwrap();
+            policies.insert(group.to_string(), policy);
+        }
+        for handle in self.items.lock().unwrap().values() {
+            if handle.snapshot().group_id.as_deref() == Some(group) {
+                handle.update(|snapshot| snapshot.batch_policy = Some(name.to_string()));
+            }
+        }
+    }
+
+    pub(crate) fn group_terminal(&self, group: &str, status: &str) {
+        if !matches!(status, "failed" | "cancelled") {
+            return;
+        }
+        let policy = self.group_policies.lock().unwrap().get(group).copied();
+        if policy != Some(crate::transfer_planner::BatchErrorPolicy::FailFast) {
+            return;
+        }
+        let handles: Vec<_> = self
+            .items
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| handle.snapshot().group_id.as_deref() == Some(group))
+            .cloned()
+            .collect();
+        for handle in handles {
+            if !terminal(&handle.snapshot().status) {
+                handle.request_cancel();
+                self.scheduler.cancel(&handle.snapshot().transfer_id);
+            }
+        }
+    }
+
+    pub(crate) fn group_exists(&self, server_id: &str, group: &str) -> bool {
+        self.items.lock().unwrap().values().any(|handle| {
+            let view = handle.snapshot();
+            view.server_id == server_id && view.group_id.as_deref() == Some(group)
+        })
+    }
+
+    pub(crate) fn cancel_group(&self, server_id: &str, group: &str) -> usize {
+        let handles: Vec<_> = self
+            .items
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| {
+                let view = handle.snapshot();
+                view.server_id == server_id && view.group_id.as_deref() == Some(group)
+            })
+            .cloned()
+            .collect();
+        let mut count = 0;
+        for handle in handles {
+            if !terminal(&handle.snapshot().status) {
+                handle.request_cancel();
+                self.scheduler.cancel(&handle.snapshot().transfer_id);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn group_summary(&self, server_id: &str, group: &str) -> Value {
+        self.group_summaries(server_id)
+            .into_iter()
+            .find(|summary| summary["group_id"] == group)
+            .unwrap_or_else(|| {
+                json!({
+                    "group_id":group,
+                    "total":0,
+                    "completed":0,
+                    "failed":0,
+                    "cancelled":0,
+                    "paused":0,
+                    "queued":0,
+                    "running":0,
+                    "retrying":0,
+                    "transferred_bytes":0,
+                    "verified_bytes":0,
+                    "status":"empty",
+                })
+            })
+    }
+
+    pub fn group_summaries(&self, server_id: &str) -> Vec<Value> {
+        let policies = self.group_policies.lock().unwrap().clone();
+        let items = self.items.lock().unwrap();
+        let mut groups: HashMap<String, Vec<Snapshot>> = HashMap::new();
+        for handle in items.values() {
+            let view = handle.snapshot();
+            if view.server_id == server_id {
+                if let Some(group) = &view.group_id {
+                    groups.entry(group.clone()).or_default().push(view);
+                }
+            }
+        }
+        let mut summaries: Vec<_> = groups
+            .into_iter()
+            .map(|(group, views)| {
+                let mut summary = json!({
+                    "group_id": group,
+                    "total": views.len(),
+                    "completed": 0,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "paused": 0,
+                    "queued": 0,
+                    "running": 0,
+                    "retrying": 0,
+                    "transferred_bytes": 0,
+                    "verified_bytes": 0,
+                    "status": "completed",
+                    "batch_policy": policies
+                        .get(&group)
+                        .copied()
+                        .map(batch_policy_name),
+                });
+                let mut active = false;
+                let mut failed = false;
+                let mut cancelled = false;
+                let mut paused = false;
+                for view in &views {
+                    summary["transferred_bytes"] = json!(
+                        summary["transferred_bytes"].as_u64().unwrap_or(0) + view.transferred_bytes
+                    );
+                    summary["verified_bytes"] = json!(
+                        summary["verified_bytes"].as_u64().unwrap_or(0) + view.verified_bytes
+                    );
+                    match view.status.as_str() {
+                        "completed" => {
+                            summary["completed"] =
+                                json!(summary["completed"].as_u64().unwrap_or(0) + 1)
+                        }
+                        "failed" => {
+                            failed = true;
+                            summary["failed"] = json!(summary["failed"].as_u64().unwrap_or(0) + 1)
+                        }
+                        "cancelled" => {
+                            cancelled = true;
+                            summary["cancelled"] =
+                                json!(summary["cancelled"].as_u64().unwrap_or(0) + 1)
+                        }
+                        "paused" => {
+                            paused = true;
+                            summary["paused"] = json!(summary["paused"].as_u64().unwrap_or(0) + 1)
+                        }
+                        "running" => {
+                            active = true;
+                            summary["running"] = json!(summary["running"].as_u64().unwrap_or(0) + 1)
+                        }
+                        "retrying" => {
+                            active = true;
+                            summary["retrying"] =
+                                json!(summary["retrying"].as_u64().unwrap_or(0) + 1)
+                        }
+                        _ => {
+                            active = true;
+                            summary["queued"] = json!(summary["queued"].as_u64().unwrap_or(0) + 1)
+                        }
+                    }
+                }
+                summary["status"] = json!(if active {
+                    "running"
+                } else if paused {
+                    "paused"
+                } else if failed {
+                    "failed"
+                } else if cancelled {
+                    "cancelled"
+                } else {
+                    "completed"
+                });
+                summary
+            })
+            .collect();
+        summaries.sort_by(|a, b| b["group_id"].as_str().cmp(&a["group_id"].as_str()));
+        summaries
+    }
+
     fn insert(&self, server: &Server, op: &Operation) -> Result<Arc<Handle>> {
+        let batch_policy = op.transfer_group.as_ref().and_then(|group| {
+            self.group_policies
+                .lock()
+                .unwrap()
+                .get(group)
+                .copied()
+                .map(batch_policy_name)
+                .map(str::to_string)
+        });
         self.prune();
         let mut items = self.items.lock().unwrap();
         anyhow::ensure!(
@@ -421,6 +755,17 @@ impl TransferManager {
                 bandwidth_kib: 0,
                 sha256: None,
                 group_id: op.transfer_group.clone(),
+                verified_bytes: 0,
+                last_progress_at: None,
+                retry_stage: None,
+                failure_category: None,
+                session_reuse_count: 0,
+                effective_throughput: 0,
+                queued_ms: 0,
+                transfer_ms: 0,
+                verify_ms: 0,
+                retry_wait_ms: 0,
+                batch_policy,
             }),
             notify: tokio::sync::Notify::new(),
             cancel: CancellationToken::new(),
@@ -437,6 +782,10 @@ impl TransferManager {
             server_identity: Mutex::new(Some(server.clone())),
             journal_lock: Mutex::new(()),
             lifecycle: tokio::sync::Mutex::new(()),
+            window: Mutex::new(Default::default()),
+            last_progress: Mutex::new(Instant::now()),
+            phase_started: Mutex::new(None),
+            queued_recorded: std::sync::atomic::AtomicBool::new(false),
         });
         items.insert(id, h.clone());
         Ok(h)
@@ -445,6 +794,7 @@ impl TransferManager {
         for h in self.items.lock().unwrap().values() {
             h.request_cancel();
         }
+        self.scheduler.cancel_all();
     }
     pub async fn operate(
         &self,
@@ -454,11 +804,19 @@ impl TransferManager {
     ) -> Result<Value> {
         let server = state.server(&op.server_id)?;
         authorize(&server, op, source)?;
-        anyhow::ensure!(
+        let allowed = if source == "desktop" {
             matches!(
                 op.transfer_action.as_str(),
-                "list" | "read" | "cancel" | "pause" | "resume" | "retry" | "cleanup" | "configure"
-            ) && op.wait_secs <= 30,
+                "list" | "read" | "cancel" | "pause" | "resume" | "cleanup" | "configure"
+            )
+        } else {
+            matches!(
+                op.transfer_action.as_str(),
+                "list" | "read" | "cancel" | "pause" | "resume"
+            )
+        };
+        anyhow::ensure!(
+            allowed && op.wait_secs <= 30,
             "INVALID_ARGUMENT: invalid transfer action or wait_secs"
         );
         self.prune();
@@ -472,12 +830,29 @@ impl TransferManager {
                 .filter(|s| s.server_id == server.id)
                 .collect();
             items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            return Ok(json!({"transfers":items}));
+            return Ok(json!({"transfers":items,"groups":self.group_summaries(&server.id)}));
         }
+        let group = op
+            .transfer_group
+            .as_deref()
+            .filter(|group| !group.is_empty());
         anyhow::ensure!(
-            !op.transfer_id.is_empty() && op.transfer_id.len() <= 128,
-            "INVALID_ARGUMENT: transfer_id is required"
+            !(op.transfer_id.is_empty() && group.is_none()),
+            "INVALID_ARGUMENT: transfer_id or group_id is required"
         );
+        anyhow::ensure!(
+            op.transfer_id.is_empty() || group.is_none(),
+            "INVALID_ARGUMENT: provide either transfer_id or group_id"
+        );
+        anyhow::ensure!(
+            op.transfer_id.len() <= 128 && group.is_none_or(|group| group.len() <= 128),
+            "INVALID_ARGUMENT: invalid transfer_id or group_id"
+        );
+        if let Some(group) = group {
+            return self
+                .operate_group(state, op, source, &server.id, group)
+                .await;
+        }
         let h = self
             .items
             .lock()
@@ -500,6 +875,7 @@ impl TransferManager {
                 return Ok(value);
             }
             let accepted = h.request_cancel();
+            self.scheduler.cancel(&op.transfer_id);
             let mut value = serde_json::to_value(h.snapshot())?;
             value["cancel_requested"] = json!(accepted);
             return Ok(value);
@@ -519,8 +895,7 @@ impl TransferManager {
                     "INVALID_ARGUMENT: version exceeds current transfer version"
                 );
             }
-            // Without a version, wait for completion (or timeout). With a
-            // version, return the next change for incremental progress polling.
+
             if op.version.is_some_and(|v| v != view.version)
                 || terminal(&view.status)
                 || view.status == "paused"
@@ -531,6 +906,103 @@ impl TransferManager {
             }
             let _ = tokio::time::timeout_at(deadline, notified).await;
         }
+    }
+
+    async fn operate_group(
+        &self,
+        state: &Arc<AppState>,
+        op: &Operation,
+        source: &str,
+        server_id: &str,
+        group: &str,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            self.group_exists(server_id, group),
+            "TRANSFER_NOT_FOUND: Transfer group does not exist or has expired"
+        );
+        match op.transfer_action.as_str() {
+            "read" => {
+                let mut tasks: Vec<_> = self
+                    .items
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|handle| handle.snapshot())
+                    .filter(|view| {
+                        view.server_id == server_id && view.group_id.as_deref() == Some(group)
+                    })
+                    .collect();
+                tasks.sort_by(|a, b| a.remote_path.cmp(&b.remote_path));
+                Ok(json!({
+                    "group_id":group,
+                    "group":self.group_summary(server_id, group),
+                    "tasks":tasks,
+                }))
+            }
+            "cancel" => {
+                let cancelled = self.cancel_group(server_id, group);
+                Ok(json!({
+                    "group_id":group,
+                    "cancel_requested":true,
+                    "cancelled":cancelled,
+                }))
+            }
+            "pause" => {
+                let handles = self.group_handles(server_id, group);
+                let mut paused = 0;
+                for handle in handles {
+                    if !terminal(&handle.snapshot().status) && self.pause_handle(&handle) {
+                        paused += 1;
+                    }
+                }
+                Ok(json!({
+                    "group_id":group,
+                    "pause_requested":paused > 0,
+                    "paused":paused,
+                    "group":self.group_summary(server_id, group),
+                }))
+            }
+            "resume" => {
+                let handles = self.group_handles(server_id, group);
+                let mut resumed = 0;
+                let mut failed = Vec::new();
+                for handle in handles {
+                    if !matches!(handle.snapshot().status.as_str(), "paused" | "failed") {
+                        continue;
+                    }
+                    match self.resume_handle(state, &handle, source).await {
+                        Ok(()) => resumed += 1,
+                        Err(error) => failed.push(json!({
+                            "transfer_id":handle.snapshot().transfer_id,
+                            "error":crate::operation_error::error_response(&error, op),
+                        })),
+                    }
+                }
+                Ok(json!({
+                    "group_id":group,
+                    "resumed":resumed,
+                    "failed":failed,
+                    "group":self.group_summary(server_id, group),
+                }))
+            }
+            _ => Err(error(
+                "INVALID_ARGUMENT",
+                "This transfer action does not support group_id",
+            )),
+        }
+    }
+
+    fn group_handles(&self, server_id: &str, group: &str) -> Vec<Arc<Handle>> {
+        self.items
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|handle| {
+                let view = handle.snapshot();
+                view.server_id == server_id && view.group_id.as_deref() == Some(group)
+            })
+            .cloned()
+            .collect()
     }
 }
 impl Drop for TransferManager {
@@ -559,8 +1031,6 @@ fn authorize(server: &Server, op: &Operation, source: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve symlinks before checking local roots; downloads authorize the parent
-/// and refuse symlink destinations. Native picker selections bypass MCP roots.
 pub fn local_path(
     spec: &TransferSpec,
     upload: bool,
@@ -783,7 +1253,6 @@ async fn start_inner(
     Ok(initial)
 }
 
-/// Stream exactly one file, with a fixed allocation and checked u64 offsets.
 pub fn copy_file(
     reader: &mut impl Read,
     writer: &mut impl Write,
@@ -855,7 +1324,6 @@ pub fn copy_file(
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// Revalidate authorization and local path immediately before publishing a file.
 pub fn validate_commit(
     state: &AppState,
     server: &Server,
@@ -1185,16 +1653,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_approval_contains_metadata_and_rejection_never_connects() {
+    async fn upload_does_not_enter_the_command_approval_queue() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.txt");
         std::fs::write(&source, "FILE_BODY_MUST_NOT_BE_IN_APPROVAL_OR_AUDIT").unwrap();
         let state = AppState::open(dir.path().join("db")).unwrap();
         state
             .save_settings(RuntimeSettings {
-                approval_mode: "mcp".into(),
-                approval_timeout_secs: 7,
                 local_upload_roots: vec![dir.path().to_string_lossy().into_owned()],
+                transfers: TransferSettings {
+                    max_retries: 0,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .unwrap();
@@ -1223,23 +1693,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(state.approvals.list().is_empty());
         let deadline = Instant::now() + Duration::from_secs(3);
-        let view = loop {
-            if let Some(view) = state.approvals.list().first().cloned() {
-                break view;
-            }
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        assert!(view.content_preview.contains("source.txt"));
-        let created = chrono::DateTime::parse_from_rfc3339(&view.created_at).unwrap();
-        let expires = chrono::DateTime::parse_from_rfc3339(&view.expires_at).unwrap();
-        assert!((7000..=7100).contains(&(expires - created).num_milliseconds()));
-        assert!(view.content_preview.contains("sha256"));
-        assert!(!view
-            .content_preview
-            .contains("FILE_BODY_MUST_NOT_BE_IN_APPROVAL_OR_AUDIT"));
-        state.resolve_approval(&view.id, false).unwrap();
         let h = state
             .transfers
             .items
@@ -1456,5 +1911,41 @@ mod tests {
             true
         );
         assert!(h.begin_commit().is_err());
+    }
+    #[test]
+    fn batch_groups_aggregate_counts_and_fail_fast_cancels_siblings() {
+        let manager = TransferManager::default();
+        let server = Server {
+            id: "s".into(),
+            ..Default::default()
+        };
+        let operation = |remote: &str| Operation {
+            kind: "upload_file".into(),
+            server_id: "s".into(),
+            transfer_group: Some("group".into()),
+            transfer_request: Some(TransferSpec {
+                remote_path: remote.into(),
+                ..spec(Path::new("source"))
+            }),
+            ..Default::default()
+        };
+        let first = manager.insert(&server, &operation("/a")).unwrap();
+        let second = manager.insert(&server, &operation("/b")).unwrap();
+        let third = manager.insert(&server, &operation("/c")).unwrap();
+        manager.register_group("group", crate::transfer_planner::BatchErrorPolicy::FailFast);
+        assert_eq!(first.snapshot().batch_policy.as_deref(), Some("fail_fast"));
+        assert_eq!(manager.group_summary("s", "group")["queued"], 3);
+        first.complete(&Err(error("IO_TIMEOUT", "network")));
+        manager.group_terminal("group", "failed");
+        assert_eq!(first.snapshot().status, "failed");
+        assert_eq!(second.control.load(Ordering::Acquire), 1);
+        assert_eq!(third.control.load(Ordering::Acquire), 1);
+        let summary = manager.group_summary("s", "group");
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["failed"], 1);
+        assert_eq!(manager.group_summaries("other").len(), 0);
+        assert_eq!(manager.cancel_group("other", "group"), 0);
+        assert!(manager.group_exists("s", "group"));
+        assert!(!manager.group_exists("other", "group"));
     }
 }

@@ -1,7 +1,6 @@
 use crate::model::{AuditInput, FileRequest, Operation};
 use serde_json::json;
 
-/// Record consumed parameters, including defaults, without file bodies or credentials.
 pub fn capture(op: &Operation) -> AuditInput {
     let mut truncated = false;
     let mut text = |value: &str| {

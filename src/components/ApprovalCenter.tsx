@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { ShieldCheck, X } from "lucide-react";
 import { api, desktop } from "../api";
-import { labels, type ApprovalRequest } from "../types";
+import type { ApprovalRequest } from "../types";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
+
+const ruleSourceLabels: Record<string, string> = {
+  builtin: "内置规则",
+  user: "自定义规则",
+  legacy_whitelist: "旧版白名单",
+  analysis: "静态分析",
+};
 
 export function ApprovalCenter({
   enabled,
@@ -77,19 +84,19 @@ export function ApprovalCenter({
     <>
       <button
         className="nav-item approval-entry"
-        aria-label="操作审批"
-        title={requests.length ? `${requests.length} 项操作待审批` : "操作审批"}
+        aria-label="命令审批"
+        title={requests.length ? `${requests.length} 条命令待审批` : "命令审批"}
         onClick={() => setOpen(true)}
       >
         <ShieldCheck size={17} />
-        <span>操作审批</span>
+        <span>命令审批</span>
         {requests.length > 0 && (
           <span className="nav-count">{requests.length}</span>
         )}
       </button>
       {open && (
         <ModalFrame
-          width={request ? 660 : 520}
+          width={request ? 700 : 520}
           className={
             request ? "approval-modal" : "approval-modal approval-empty-modal"
           }
@@ -102,7 +109,7 @@ export function ApprovalCenter({
               <ShieldCheck size={18} />
             </div>
             <DialogTitle asChild>
-              <h2>审批操作</h2>
+              <h2>审批命令执行</h2>
             </DialogTitle>
             <Button
               type="button"
@@ -126,34 +133,20 @@ export function ApprovalCenter({
                   </dd>
                   <dt>来源</dt>
                   <dd>MCP 客户端</dd>
-                  <dt>操作</dt>
-                  <dd>{labels[request.kind] || request.kind}</dd>
-                  {request.kind === "write_file" && (
-                    <>
-                      <dt>父目录</dt>
-                      <dd>
-                        {request.create_parents
-                          ? "自动创建缺失的父目录"
-                          : "必须已存在"}
-                      </dd>
-                    </>
-                  )}
-                  {request.kind === "remove_path" && (
-                    <>
-                      <dt>删除范围</dt>
-                      <dd>
-                        {request.recursive
-                          ? "整个目录及其内容（不跟随符号链接）"
-                          : "仅文件、符号链接或空目录"}
-                      </dd>
-                      <dt>目标不存在</dt>
-                      <dd>
-                        {request.missing_ok !== false
-                          ? "视为已完成"
-                          : "返回错误"}
-                      </dd>
-                    </>
-                  )}
+                  <dt>风险</dt>
+                  <dd>
+                    {request.risk === "high"
+                      ? "高（命中内置受保护规则）"
+                      : request.risk === "protected"
+                        ? "自定义受保护命令"
+                        : "无法静态确认"}
+                  </dd>
+                  <dt>执行超时</dt>
+                  <dd>
+                    {request.timeout_secs > 0
+                      ? `${request.timeout_secs} 秒`
+                      : "应用默认"}
+                  </dd>
                   <dt>有效期</dt>
                   <dd>
                     {new Date(request.expires_at).toLocaleTimeString("zh-CN", {
@@ -165,45 +158,44 @@ export function ApprovalCenter({
                       : "（已超时，自动拒绝）"}
                   </dd>
                 </dl>
-                {request.path && (
-                  <pre className="approval-code">
-                    {request.path}
-                    {request.target ? `\n→ ${request.target}` : ""}
-                  </pre>
+                {request.reason && (
+                  <p className="approval-warning">{request.reason}</p>
                 )}
-                {request.command && (
-                  <pre className="approval-code">{request.command}</pre>
-                )}
-                {request.content_bytes > 0 && (
-                  <div className="approval-payload">
-                    <p>
-                      请求内容：{request.content_bytes.toLocaleString()} 字节
-                      {request.kind === "upload" ? "（Base64）" : ""}
-                    </p>
-                    {request.content_preview && (
-                      <pre className="approval-code">
-                        {request.content_preview}
-                      </pre>
-                    )}
-                    {request.content_truncated && (
-                      <p className="approval-warning">
-                        内容较长，当前仅显示前 8,192 个字符。
-                      </p>
-                    )}
-                    <p className="approval-digest">
-                      SHA-256：{request.content_sha256}
-                    </p>
-                  </div>
-                )}
+                <pre className="approval-code">{request.command}</pre>
+                <div className="approval-rules">
+                  <p>命中的规则</p>
+                  <ul>
+                    {request.matched_rules.map((rule, index) => (
+                      <li key={`${rule.source}-${rule.command}-${index}`}>
+                        <strong>
+                          {ruleSourceLabels[rule.source] || rule.source}
+                        </strong>
+                        <code>
+                          {rule.command}
+                          {rule.argument ? ` ${rule.argument}` : ""}
+                        </code>
+                        <span>{rule.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <p className="approval-digest">
+                  命令 SHA-256：{request.command_sha256}
+                  <br />
+                  服务器配置 SHA-256：{request.server_sha256}
+                </p>
                 <p className="approval-warning">
-                  批准仅对本次请求生效；安全保护和服务器权限仍会再次校验。
+                  批准仅对上述原始命令执行一次。执行前仍会重新校验服务器配置、权限、只读模式和命令策略；无法覆盖任何拒绝。
                 </p>
               </>
             ) : (
               <div className="approval-empty">
                 <ShieldCheck size={26} />
-                <h3>暂无待审批操作</h3>
-                <p>开启审批后，MCP 敏感操作会在这里等待处理。</p>
+                <h3>暂无待审批命令</h3>
+                <p>
+                  当 Agent 通过 exec_approved
+                  提交受保护命令时，会在这里等待你的单次批准。
+                </p>
                 {onOpenSettings && (
                   <Button
                     variant="outline"
@@ -213,7 +205,7 @@ export function ApprovalCenter({
                       onOpenSettings();
                     }}
                   >
-                    审批设置
+                    查看受保护命令
                   </Button>
                 )}
               </div>
@@ -226,7 +218,7 @@ export function ApprovalCenter({
           </div>
           {request && (
             <div className="modal-foot">
-              <span>{requests.length} 项待处理</span>
+              <span>{requests.length} 条待处理</span>
               <Button
                 variant="outline"
                 className="btn"
@@ -240,7 +232,7 @@ export function ApprovalCenter({
                 disabled={busy || Date.parse(request.expires_at) <= Date.now()}
                 onClick={() => void decide(true)}
               >
-                {busy ? "处理中…" : "批准本次"}
+                {busy ? "处理中…" : "批准本次执行"}
               </Button>
             </div>
           )}

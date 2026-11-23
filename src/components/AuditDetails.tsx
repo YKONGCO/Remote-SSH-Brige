@@ -38,7 +38,7 @@ export function AuditDetails({
   }, [entry.id]);
   const response = detail.response;
   const data = response?.data;
-  // New records use message; legacy records may have a string error.
+
   const failureMessage =
     typeof data?.code === "string" && typeof data?.message === "string"
       ? data.message
@@ -82,6 +82,21 @@ export function AuditDetails({
         ["申请时间", date(approval.requested_at)],
         ["处理时间", date(approval.decided_at)],
         ["有效期至", date(approval.expires_at)],
+        ...(typeof approval.reason === "string" && approval.reason
+          ? [["命中原因", String(approval.reason)] as [string, string]]
+          : []),
+        ...(typeof approval.command_bytes === "number"
+          ? [
+              [
+                "命令大小",
+                `${Number(approval.command_bytes).toLocaleString()} 字节`,
+              ] as [string, string],
+              ["命令 SHA-256", String(approval.command_sha256 || "—")] as [
+                string,
+                string,
+              ],
+            ]
+          : []),
         ...(approval.kind === "remove_path"
           ? [
               [

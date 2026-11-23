@@ -47,6 +47,7 @@ export interface Session {
   name: string;
   created_at: string;
   alive: boolean;
+  state?: "opening" | "running" | "closing" | "closed" | "disconnected";
 }
 export interface AuditQuery {
   category: string;
@@ -112,11 +113,13 @@ export interface FilePreview {
   bytes: number;
   truncated: boolean;
 }
+export interface ApprovalRuleMatch {
+  source: "builtin" | "user" | "legacy_whitelist" | "analysis";
+  command: string;
+  reason: string;
+  argument?: string;
+}
 export interface ApprovalRequest {
-  create_parents?: boolean | null;
-  recursive?: boolean | null;
-  missing_ok?: boolean | null;
-  created_at?: string;
   id: string;
   server_id: string;
   server_name: string;
@@ -124,13 +127,15 @@ export interface ApprovalRequest {
   username: string;
   source: string;
   kind: string;
-  path: string;
-  target: string;
   command: string;
-  content_preview: string;
-  content_bytes: number;
-  content_sha256: string;
-  content_truncated: boolean;
+  reason: string;
+  risk: string;
+  matched_rules: ApprovalRuleMatch[];
+  command_bytes: number;
+  command_sha256: string;
+  server_sha256: string;
+  timeout_secs: number;
+  created_at: string;
   expires_at: string;
 }
 export const newServer = (): Server => ({

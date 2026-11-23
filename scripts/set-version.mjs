@@ -1,18 +1,5 @@
 #!/usr/bin/env node
-/**
- * Write one version into every file that records it.
- *
- * Usage:
- *   node scripts/set-version.mjs <major.minor.patch>
- *   node scripts/set-version.mjs <major.minor.patch> --dry-run
- *
- * The version is stored in package.json, package-lock.json, src-tauri/Cargo.toml,
- * src-tauri/tauri.conf.json and the local package entry in src-tauri/Cargo.lock.
- * CI builds pass --locked to Cargo, so the lock file must change together with
- * the manifest. Edits are verified before anything is written: every changed
- * line must differ only in its version string, and each file must still parse
- * with the requested version.
- */
+
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -111,7 +98,9 @@ function createTargets(packageName) {
         }
         const local = parsed.packages?.[""]?.version;
         if (local !== version) {
-          throw new Error(`package-lock.json: packages[""].version is ${local}`);
+          throw new Error(
+            `package-lock.json: packages[""].version is ${local}`,
+          );
         }
       },
     },
@@ -132,9 +121,13 @@ function createTargets(packageName) {
         throw new Error("src-tauri/Cargo.toml: [package] version not found");
       },
       check(content, version) {
-        const match = content.match(/^\[package\][\s\S]*?^version = "([^"]*)"/m);
+        const match = content.match(
+          /^\[package\][\s\S]*?^version = "([^"]*)"/m,
+        );
         if (!match || match[1] !== version) {
-          throw new Error(`src-tauri/Cargo.toml: [package] version is ${match?.[1]}`);
+          throw new Error(
+            `src-tauri/Cargo.toml: [package] version is ${match?.[1]}`,
+          );
         }
       },
     },
@@ -155,7 +148,9 @@ function createTargets(packageName) {
       check(content, version) {
         const parsed = JSON.parse(content);
         if (parsed.version !== version) {
-          throw new Error(`src-tauri/tauri.conf.json: version is ${parsed.version}`);
+          throw new Error(
+            `src-tauri/tauri.conf.json: version is ${parsed.version}`,
+          );
         }
       },
     },
@@ -205,7 +200,9 @@ function assertOnlyVersionLines(file, beforeLines, afterLines, changedIndices) {
     }
     const mask = (line) => line.replace(quotedVersion, '"*"');
     if (mask(beforeLines[index]) !== mask(afterLines[index])) {
-      throw new Error(`${file}:${index + 1}: change is not limited to the version`);
+      throw new Error(
+        `${file}:${index + 1}: change is not limited to the version`,
+      );
     }
   }
 }
@@ -220,7 +217,9 @@ function planUpdates(targets, version) {
     for (const { index, label } of target.locate(beforeLines)) {
       const token = beforeLines[index].match(quotedVersion);
       if (!token) {
-        throw new Error(`${target.file}:${index + 1}: no version string in ${label}`);
+        throw new Error(
+          `${target.file}:${index + 1}: no version string in ${label}`,
+        );
       }
       if (token[0] === `"${version}"`) continue;
       afterLines[index] = beforeLines[index].replace(token[0], `"${version}"`);
@@ -258,7 +257,9 @@ function main() {
     return;
   }
   const dryRun = args.includes("--dry-run");
-  const unexpected = args.filter((arg) => arg.startsWith("-") && arg !== "--dry-run");
+  const unexpected = args.filter(
+    (arg) => arg.startsWith("-") && arg !== "--dry-run",
+  );
   if (unexpected.length > 0) {
     throw new Error(`unknown option ${unexpected[0]}\n${usage}`);
   }

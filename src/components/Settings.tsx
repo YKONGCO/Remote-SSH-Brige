@@ -6,17 +6,23 @@ import type {
 } from "../runtime-settings";
 import {
   defaultTransferSettings,
+  defaultAdvancedMcpTools,
   effectiveCommandPolicy,
-  commandMode,
   advancedShell,
-  defaultAllowedCommands,
-  validCommandLists,
+  validCommandRules,
   parseCommandList,
   MAX_COMMAND_RULES,
   RUNTIME_SETTINGS_CHANGED,
+  type BuiltinRule,
 } from "../runtime-settings";
-import { CommandPresets } from "./CommandPresets";
-import { X, RotateCcw, Check, ShieldBan, FolderOpen } from "lucide-react";
+import {
+  X,
+  RotateCcw,
+  Check,
+  ShieldBan,
+  FolderOpen,
+  ShieldAlert,
+} from "lucide-react";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
@@ -68,8 +74,8 @@ export function Settings({
   >(null);
   const [rootsDraft, setRootsDraft] = useState("");
   const [pickingDirectories, setPickingDirectories] = useState(false);
-  const [allowedDraft, setAllowedDraft] = useState("");
-  const [blockedDraft, setBlockedDraft] = useState("");
+  const [protectedDraft, setProtectedDraft] = useState("");
+  const [builtinRules, setBuiltinRules] = useState<BuiltinRule[]>([]);
   const policy = runtime ? effectiveCommandPolicy(runtime) : undefined;
   async function pickDirectories() {
     if (pickingDirectories || saving) return;
@@ -109,23 +115,28 @@ export function Settings({
   }
   async function updateCommand(patch: Partial<CommandPolicy>) {
     if (!policy) return false;
-    const next = {
-      ...policy,
-      execution_mode: commandMode(policy),
-      allowed_commands: policy.allowed_commands ?? [...defaultAllowedCommands],
-      blocked_commands: policy.blocked_commands ?? [],
-      ...patch,
-    };
-    if (next.allow_advanced_shell !== undefined) {
-      next.allow_pipes =
-        next.allow_redirection =
-        next.allow_compound =
-        next.allow_scripts =
-        next.allow_substitution =
-          next.allow_advanced_shell;
+    return updateRuntime("command_policy", { ...policy, ...patch });
+  }
+  async function openRules() {
+    if (!policy || !runtime) return;
+    setProtectedDraft(policy.protected_commands.join("\n"));
+    setListsOpen(true);
+    setError("");
+    try {
+      const rules = await api<{ builtin: BuiltinRule[] }>("protected_rules");
+      setBuiltinRules(rules.builtin);
+    } catch (e) {
+      setError(String(e));
     }
-    next.diagnostic_only = next.execution_mode === "whitelist";
-    return updateRuntime("command_policy", next);
+  }
+  function setAdvancedShell(enabled: boolean) {
+    void updateCommand({
+      allow_pipes: enabled,
+      allow_redirection: enabled,
+      allow_compound: enabled,
+      allow_scripts: enabled,
+      allow_substitution: enabled,
+    });
   }
   async function loadRuntime() {
     try {
@@ -278,9 +289,9 @@ export function Settings({
   function runtimeToggle(
     name:
       | "deletion_protection"
-      | "block_dangerous_commands"
       | "remote_read_only"
-      | "mcp_auto_start",
+      | "mcp_auto_start"
+      | "approval_mode",
     label: string,
   ) {
     return (
@@ -298,13 +309,13 @@ export function Settings({
     );
   }
   function commandToggle(
-    name: "allow_advanced_shell" | "allow_mcp_terminal",
+    name: "allow_advanced_shell" | "exec_disabled",
     label: string,
   ) {
     const checked = policy
       ? name === "allow_advanced_shell"
         ? advancedShell(policy)
-        : policy.allow_mcp_terminal
+        : policy[name]
       : false;
     return (
       <button
@@ -314,10 +325,33 @@ export function Settings({
         aria-label={label}
         aria-checked={checked}
         disabled={!runtime || saving}
+        onClick={() => {
+          if (!policy) return;
+          if (name === "allow_advanced_shell") setAdvancedShell(!checked);
+          else void updateCommand({ [name]: !checked });
+        }}
+      >
+        <span />
+      </button>
+    );
+  }
+  function advancedToggle(name: "terminal" | "port_forward", label: string) {
+    const tools = {
+      ...defaultAdvancedMcpTools,
+      ...runtime?.advanced_mcp_tools,
+    };
+    return (
+      <button
+        type="button"
+        className="setting-switch"
+        role="switch"
+        aria-label={label}
+        aria-checked={tools[name]}
+        disabled={!runtime || saving}
         onClick={() =>
-          policy &&
-          void updateCommand({
-            [name]: !checked,
+          void updateRuntime("advanced_mcp_tools", {
+            ...tools,
+            [name]: !tools[name],
           })
         }
       >
@@ -412,115 +446,104 @@ export function Settings({
             {runtimeToggle("deletion_protection", "删除保护")}
           </Row>
           <Row
-            title="危险命令拦截"
-            description="拦截 rm、磁盘破坏、关机等高危命令。"
-          >
-            {runtimeToggle("block_dangerous_commands", "危险命令拦截")}
-          </Row>
-          <Row
             title="审批模式"
-            description="仅对 MCP 发起的敏感操作生效，桌面操作不弹审批；超时自动拒绝。"
+            description="关闭后不再注册 exec_approved，侧边栏审批入口隐藏；受保护命令将直接拒绝。"
           >
-            <SelectField
-              className="setting-select"
-              aria-label="审批模式"
-              disabled={!runtime || saving}
-              value={runtime?.approval_mode === "off" ? "off" : "mcp"}
-              onValueChange={(value) =>
-                void updateRuntime(
-                  "approval_mode",
-                  value as RuntimeSettings["approval_mode"],
-                )
-              }
-            >
-              <option value="off">关闭审批</option>
-              <option value="mcp">开启审批（仅 MCP）</option>
-            </SelectField>
+            {runtimeToggle("approval_mode", "审批模式")}
           </Row>
           <Row
-            title="审批等待时间"
-            description="超时自动拒绝。修改对新请求生效，待审批请求保留原截止时间。"
+            title="受保护命令"
+            description="内置高危规则始终启用且不可关闭。命中后普通 exec 不执行，需通过 exec_approved 由你单次批准。"
           >
-            {runtimeSelect(
-              "approval_timeout_secs",
-              "审批等待时间",
-              [1, 5, 10, 15, 30, 60, 120],
-              "秒",
-            )}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!runtime || saving}
+              onClick={() => void openRules()}
+            >
+              <ShieldAlert size={14} />
+              查看受保护命令
+            </Button>
           </Row>
+          {runtime?.approval_mode !== false && (
+            <Row
+              title="审批等待时间"
+              description="高风险命令的审批超时后自动拒绝。修改仅影响新请求。"
+            >
+              {runtimeSelect(
+                "approval_timeout_secs",
+                "审批等待时间",
+                [1, 5, 10, 15, 30, 60, 120],
+                "秒",
+              )}
+            </Row>
+          )}
         </div>
       </section>
       <section className="settings-section">
         <h2 className="settings-group-title">命令与 Shell 权限</h2>
         <div className="settings-card">
           <Row
-            title="命令执行范围"
-            description="“不限命令”仍受黑名单和高危拦截限制。"
+            title="禁止命令执行"
+            description="基础安全限制，审批不能解除；开启后 exec 和 exec_approved 都不可用。"
           >
-            <SelectField
-              className="setting-select"
-              aria-label="命令执行范围"
-              disabled={!runtime || saving}
-              value={policy ? commandMode(policy) : "whitelist"}
-              onValueChange={(execution_mode) =>
-                void updateCommand({
-                  execution_mode:
-                    execution_mode as CommandPolicy["execution_mode"],
-                })
-              }
-            >
-              <option value="disabled">禁止执行</option>
-              <option value="whitelist">仅允许白名单</option>
-              <option value="unrestricted">不限命令</option>
-            </SelectField>
+            {commandToggle("exec_disabled", "禁止命令执行")}
           </Row>
           <Row
-            title="命令名单管理"
-            description="配置白名单和黑名单，黑名单优先。"
+            title="自定义受保护命令"
+            description="在程序内置规则之外增加需要人工审批的命令；不能覆盖或取消内置规则。"
           >
             <Button
               variant="outline"
               size="sm"
               disabled={!runtime || saving}
-              onClick={() => {
-                setAllowedDraft(
-                  (policy?.allowed_commands ?? defaultAllowedCommands).join(
-                    "\n",
-                  ),
-                );
-                setBlockedDraft((policy?.blocked_commands ?? []).join("\n"));
-                setListsOpen(true);
-                setError("");
-              }}
+              onClick={() => void openRules()}
             >
-              管理名单
+              <ShieldBan size={14} />
+              管理受保护命令
             </Button>
           </Row>
+          {policy?.legacy_whitelist ? (
+            <Row
+              title="旧版白名单限制"
+              description={`检测到升级前保留的 ${policy.legacy_whitelist.length} 条白名单：名单外的命令仍需要审批，不会静默放开。`}
+            >
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={saving}
+                onClick={() =>
+                  void updateCommand({
+                    legacy_whitelist: null,
+                  })
+                }
+              >
+                改用新版受保护命令策略
+              </Button>
+            </Row>
+          ) : null}
           <Row
             title="允许 Shell 高级功能"
-            description="允许管道、重定向、组合命令与脚本；脚本内容无法完整检查。"
+            description="允许管道、重定向、组合命令与脚本；脚本和解释器内容仍按不确定处理并要求审批。"
           >
-            <div className="flex items-center gap-2">
-              {policy &&
-                policy.allow_advanced_shell === undefined &&
-                advancedShell(policy) &&
-                ![
-                  policy.allow_pipes,
-                  policy.allow_redirection,
-                  policy.allow_compound,
-                  policy.allow_scripts,
-                  policy.allow_substitution,
-                ].every(Boolean) && (
-                  <span className="muted">旧配置：部分开启</span>
-                )}
-              {commandToggle("allow_advanced_shell", "允许 Shell 高级功能")}
-            </div>
+            {commandToggle("allow_advanced_shell", "允许 Shell 高级功能")}
+          </Row>
+        </div>
+      </section>
+      <section className="settings-section">
+        <h2 className="settings-group-title">MCP 高级工具</h2>
+        <div className="settings-card">
+          <Row
+            title="端口转发"
+            description="开放 port_forward，让 Agent 创建和关闭指向服务器回环地址的本地 TCP 转发。"
+          >
+            {advancedToggle("port_forward", "端口转发")}
           </Row>
           <Row
-            title="允许 AI 交互终端"
-            description="需服务器授权；终端输入不受命令名单检查。"
+            title="交互式终端"
+            description="高风险：启用后 Agent 可直接向远程 Shell 输入，不经过受保护命令审批。仅对已单独授权的服务器生效。"
           >
-            {commandToggle("allow_mcp_terminal", "允许 AI 交互终端")}
+            {advancedToggle("terminal", "交互式终端")}
           </Row>
         </div>
       </section>
@@ -917,32 +940,33 @@ export function Settings({
               setError("");
             }
           }}
-          width={940}
+          width={720}
         >
           <form
             className="modal-layout"
             onSubmit={async (event) => {
               event.preventDefault();
-              const allowed_commands = parseCommandList(allowedDraft),
-                blocked_commands = parseCommandList(blockedDraft);
-              if (!validCommandLists(allowed_commands, blocked_commands)) {
+              const protected_commands = parseCommandList(protectedDraft);
+              if (!validCommandRules(protected_commands)) {
                 setError(
-                  `每份名单最多 ${MAX_COMMAND_RULES} 项；不要填写参数、通配符或 Shell 语法。`,
+                  `自定义规则最多 ${MAX_COMMAND_RULES} 项；只填写命令名或绝对路径，不要参数、通配符或 Shell 语法。`,
                 );
                 return;
               }
-              if (await updateCommand({ allowed_commands, blocked_commands }))
+              if (await updateCommand({ protected_commands })) {
                 setListsOpen(false);
+                setError("");
+              }
             }}
           >
             <div className="modal-head settings-editor-head">
-              <DialogTitle>命令名单管理</DialogTitle>
+              <DialogTitle>受保护命令</DialogTitle>
               <Button
                 type="button"
                 variant="ghost"
                 size="icon"
                 className="command-modal-close"
-                aria-label="关闭命令名单管理"
+                aria-label="关闭受保护命令管理"
                 disabled={saving}
                 onClick={() => {
                   setListsOpen(false);
@@ -953,56 +977,52 @@ export function Settings({
               </Button>
             </div>
             <div className="modal-body">
-              <CommandPresets
-                value={allowedDraft}
-                disabled={saving}
-                onChange={setAllowedDraft}
-                onError={setError}
-              />
+              <div className="command-builtin">
+                <span className="command-editor-label">
+                  <span>
+                    <ShieldAlert size={14} />
+                    内置规则（只读，始终启用）
+                  </span>
+                  <small>{builtinRules.length} 条</small>
+                </span>
+                <ul className="protected-rule-list">
+                  {builtinRules.map((rule) => (
+                    <li key={rule.command}>
+                      <code>
+                        {rule.command}
+                        {rule.arguments?.length
+                          ? ` ${rule.arguments.join(" / ")}`
+                          : ""}
+                      </code>
+                      <span>{rule.reason}</span>
+                    </li>
+                  ))}
+                  {!builtinRules.length && <li>正在加载内置规则…</li>}
+                </ul>
+              </div>
               <div
                 className="command-list-editors"
-                title="拖动右下角可调整名单输入区高度"
+                title="拖动右下角可调整输入区高度"
               >
                 <label>
                   <span className="command-editor-label">
                     <span>
-                      <Check size={14} />
-                      允许执行
-                    </span>
-                    <small>
-                      {parseCommandList(allowedDraft).length}
-                      <em> / {MAX_COMMAND_RULES}</em>
-                    </small>
-                  </span>
-                  <Textarea
-                    aria-label="命令白名单"
-                    className="mono"
-                    rows={10}
-                    placeholder="命令名或绝对路径，如 python3、/opt/venv/bin/python3"
-                    value={allowedDraft}
-                    disabled={saving}
-                    onChange={(event) => setAllowedDraft(event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span className="command-editor-label">
-                    <span>
                       <ShieldBan size={14} />
-                      禁止执行<span className="command-priority-tag">优先</span>
+                      自定义规则
                     </span>
                     <small>
-                      {parseCommandList(blockedDraft).length}
+                      {parseCommandList(protectedDraft).length}
                       <em> / {MAX_COMMAND_RULES}</em>
                     </small>
                   </span>
                   <Textarea
-                    aria-label="命令黑名单"
+                    aria-label="自定义受保护命令"
                     className="mono"
-                    rows={10}
-                    placeholder="添加需要始终拦截的命令"
-                    value={blockedDraft}
+                    rows={8}
+                    placeholder="每行一个命令名或绝对路径，如 curl、/opt/tools/deploy"
+                    value={protectedDraft}
                     disabled={saving}
-                    onChange={(event) => setBlockedDraft(event.target.value)}
+                    onChange={(event) => setProtectedDraft(event.target.value)}
                   />
                 </label>
               </div>
@@ -1019,13 +1039,12 @@ export function Settings({
                 className="settings-editor-reset"
                 disabled={saving}
                 onClick={() => {
-                  setAllowedDraft(defaultAllowedCommands.join("\n"));
-                  setBlockedDraft("");
+                  setProtectedDraft("");
                   setError("");
                 }}
               >
                 <RotateCcw size={13} />
-                恢复默认名单
+                清空自定义规则
               </Button>
               <Button
                 type="button"
@@ -1044,7 +1063,7 @@ export function Settings({
                 disabled={saving}
               >
                 <Check size={15} />
-                {saving ? "保存中…" : "保存名单"}
+                {saving ? "保存中…" : "保存规则"}
               </Button>
             </div>
           </form>

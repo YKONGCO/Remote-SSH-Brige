@@ -1,4 +1,3 @@
-// The desktop uses the native dialog in Rust. This also supports browser previews.
 type SaveHandle = {
   createWritable(): Promise<{
     write(data: Blob): Promise<void>;

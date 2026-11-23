@@ -18,7 +18,6 @@ const labels: Record<TerminalState, string> = {
   error: "读取失败",
 };
 
-/** Keep an xterm instance and its cursor mounted while another tab is active. */
 export function TerminalSession({
   session,
   active,
@@ -133,7 +132,6 @@ export function TerminalSession({
         remoteAlive.current = result.alive;
         if (result.truncated) term.write("\r\n[较早输出已被缓冲区清理]\r\n");
         if (result.stdout) {
-          // Wait for xterm to consume the output before reading another page.
           await new Promise<void>((resolve) =>
             term.write(result.stdout, resolve),
           );
@@ -174,7 +172,7 @@ export function TerminalSession({
       }
       writing = true;
       let count = Math.min(4096, pending.length);
-      // Do not split a surrogate pair; each chunk is at most 16 KiB of UTF-8.
+
       if (count < pending.length && /[\uD800-\uDBFF]/.test(pending[count - 1]))
         count--;
       const content = pending.slice(0, count);

@@ -1,4 +1,3 @@
-// Real MCP -> Rust -> SSH/SFTP -> disk checks. The SSH fixture is provided by integration.mjs.
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
@@ -163,8 +162,8 @@ export async function runTransferChecks({
     );
     check(
       "Deletion protection hides effective MCP deletion permission",
-      protectedServer.deletion_protection &&
-        !protectedServer.mcp_permissions.includes("remove_path"),
+      protectedServer.deletion_protected &&
+        !protectedServer.capabilities.includes("remove_path"),
     );
     const tools = await client.listTools();
     check(
@@ -186,8 +185,9 @@ export async function runTransferChecks({
     const tinySource = resolve(uploads, "tiny.bin");
     await writeFile(tinySource, Buffer.alloc(28, 65));
     const tiny = await value("upload_file", {
-      local_path: tinySource,
-      remote_path: "/workspace/tiny-upload.bin",
+      items: [
+        { local_path: tinySource, remote_path: "/workspace/tiny-upload.bin" },
+      ],
     });
     const tinyCompleted = await value("transfer", {
       action: "read",
@@ -222,8 +222,9 @@ export async function runTransferChecks({
         100,
       );
     const upload = await value("upload_file", {
-      local_path: source,
-      remote_path: "/workspace/stream-upload.bin",
+      items: [
+        { local_path: source, remote_path: "/workspace/stream-upload.bin" },
+      ],
     });
     check(
       "MCP upload starts with metadata only",
@@ -242,8 +243,12 @@ export async function runTransferChecks({
       .update(entries.get("/workspace/stream-upload.bin"))
       .digest("hex");
     const download = await value("download_file", {
-      remote_path: "/workspace/stream-upload.bin",
-      local_path: destination,
+      items: [
+        {
+          remote_path: "/workspace/stream-upload.bin",
+          local_path: destination,
+        },
+      ],
     });
     const downloaded = await wait(download.transfer_id);
     const read = await open(destination, "r");
@@ -270,17 +275,26 @@ export async function runTransferChecks({
       ),
     );
     check(
+      "SFTP sessions are reused across consecutive transfers",
+      uploaded.session_reuse_count > 0 || downloaded.session_reuse_count > 0,
+    );
+    check(
       "Existing local destination is refused by default",
       (
         await call("download_file", {
-          remote_path: "/workspace/stream-upload.bin",
-          local_path: destination,
+          items: [
+            {
+              remote_path: "/workspace/stream-upload.bin",
+              local_path: destination,
+            },
+          ],
         })
       ).isError,
     );
     const noOverwrite = await value("upload_file", {
-      local_path: source,
-      remote_path: "/workspace/stream-upload.bin",
+      items: [
+        { local_path: source, remote_path: "/workspace/stream-upload.bin" },
+      ],
     });
     check(
       "Existing remote destination is refused by default",
@@ -289,8 +303,9 @@ export async function runTransferChecks({
     const small = resolve(uploads, "small.txt");
     await writeFile(small, "replacement");
     const replace = await value("upload_file", {
-      local_path: small,
-      remote_path: "/workspace/stream-upload.bin",
+      items: [
+        { local_path: small, remote_path: "/workspace/stream-upload.bin" },
+      ],
       overwrite: true,
     });
     check(
@@ -300,8 +315,12 @@ export async function runTransferChecks({
           "replacement",
     );
     const saveAgain = await value("download_file", {
-      local_path: destination,
-      remote_path: "/workspace/stream-upload.bin",
+      items: [
+        {
+          local_path: destination,
+          remote_path: "/workspace/stream-upload.bin",
+        },
+      ],
       overwrite: true,
     });
     check(
@@ -313,8 +332,12 @@ export async function runTransferChecks({
       "Upload cannot read outside local upload roots",
       (
         await call("upload_file", {
-          local_path: server.key_path,
-          remote_path: "/workspace/denied.bin",
+          items: [
+            {
+              local_path: server.key_path,
+              remote_path: "/workspace/denied.bin",
+            },
+          ],
         })
       ).isError,
     );
@@ -322,8 +345,12 @@ export async function runTransferChecks({
       "Download cannot write outside local download roots",
       (
         await call("download_file", {
-          local_path: resolve(dir, "denied.bin"),
-          remote_path: "/workspace/stream-upload.bin",
+          items: [
+            {
+              local_path: resolve(dir, "denied.bin"),
+              remote_path: "/workspace/stream-upload.bin",
+            },
+          ],
         })
       ).isError,
     );
@@ -332,8 +359,7 @@ export async function runTransferChecks({
       (
         await call("upload_file", {
           server_id: "no-manager",
-          local_path: small,
-          remote_path: "/workspace/denied.bin",
+          items: [{ local_path: small, remote_path: "/workspace/denied.bin" }],
         })
       ).isError,
     );
@@ -361,16 +387,14 @@ export async function runTransferChecks({
       [
         "upload_file",
         {
-          local_path: small,
-          remote_path: "/workspace/bad",
+          items: [{ local_path: small, remote_path: "/workspace/bad" }],
           content: "forbidden",
         },
       ],
       [
         "download_file",
         {
-          local_path: destination,
-          remote_path: "/workspace/bad",
+          items: [{ local_path: destination, remote_path: "/workspace/bad" }],
           base64: "forbidden",
         },
       ],
@@ -392,6 +416,16 @@ export async function runTransferChecks({
         (await call(name, args)).isError,
       );
     }
+    check(
+      "Transfer rejects overwrite together with skip_existing",
+      (
+        await call("upload_file", {
+          items: [{ local_path: small, remote_path: "/workspace/both.bin" }],
+          overwrite: true,
+          skip_existing: true,
+        })
+      ).isError,
+    );
     if (process.platform !== "win32") {
       const escaped = resolve(uploads, "escaped");
       await symlink(server.key_path, escaped);
@@ -399,8 +433,9 @@ export async function runTransferChecks({
         "Local upload symlink escape is rejected",
         (
           await call("upload_file", {
-            local_path: escaped,
-            remote_path: "/workspace/denied.bin",
+            items: [
+              { local_path: escaped, remote_path: "/workspace/denied.bin" },
+            ],
           })
         ).isError,
       );
@@ -410,8 +445,12 @@ export async function runTransferChecks({
         "Local download symlink is never overwritten",
         (
           await call("download_file", {
-            local_path: escapedDownload,
-            remote_path: "/workspace/stream-upload.bin",
+            items: [
+              {
+                local_path: escapedDownload,
+                remote_path: "/workspace/stream-upload.bin",
+              },
+            ],
             overwrite: true,
           })
         ).isError,
@@ -421,15 +460,15 @@ export async function runTransferChecks({
       "/workspace/stream-slow.bin",
       Buffer.alloc(2 * 1024 * 1024, 0x5a),
     );
-    // A gated tail prevents fast CI workers from committing before cancellation.
     const cancelGate = createTransferReadGate(
       "/workspace/stream-slow.bin",
       1024 * 1024,
     );
     fixture.transferReadGate = cancelGate;
     const cancelled = await value("download_file", {
-      local_path: destination,
-      remote_path: "/workspace/stream-slow.bin",
+      items: [
+        { local_path: destination, remote_path: "/workspace/stream-slow.bin" },
+      ],
       overwrite: true,
     });
     const running = await wait(
@@ -466,8 +505,9 @@ export async function runTransferChecks({
     fixture.transferReadDelay = 0;
     fixture.dropTransferRead = true;
     const disconnected = await value("download_file", {
-      local_path: destination,
-      remote_path: "/workspace/stream-slow.bin",
+      items: [
+        { local_path: destination, remote_path: "/workspace/stream-slow.bin" },
+      ],
       overwrite: true,
     });
     check(
@@ -480,8 +520,9 @@ export async function runTransferChecks({
     fixture.rejectCommit = true;
     await writeFile(small, "THIS_REPLACEMENT_MUST_NOT_BE_COMMITTED");
     const failedUpload = await value("upload_file", {
-      local_path: small,
-      remote_path: "/workspace/stream-upload.bin",
+      items: [
+        { local_path: small, remote_path: "/workspace/stream-upload.bin" },
+      ],
       overwrite: true,
     });
     check(

@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
   cleanup,

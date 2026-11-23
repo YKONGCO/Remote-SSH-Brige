@@ -87,7 +87,6 @@ export function PortForwards({
       }
     };
     void refresh();
-    // Finish tracking an acknowledged close even when periodic refresh is disabled.
     const refreshMs = hasClosing
       ? 500
       : Number(preferences.refreshSeconds) * 1000;

@@ -127,7 +127,7 @@ fn input(value: Value) -> CstInputValue {
         }
     }
 }
-// Only this application's entry is changed. Comments and unrelated settings survive.
+
 pub fn update(id: &str, source: &str, status: &McpStatus) -> Result<String> {
     if id == "codex" {
         let mut doc: toml_edit::DocumentMut =
@@ -214,7 +214,7 @@ pub fn list(targets: &[ClientTarget], status: &McpStatus) -> Vec<ClientConnectio
                     return Ok("missing");
                 };
                 let next = update(&target.id, &source, status)?;
-                // Compare parsed documents; TOML formatting can change even for equal values.
+
                 let value = if target.id == "codex" {
                     let doc: toml_edit::DocumentMut = source.parse()?;
                     let next: toml_edit::DocumentMut = next.parse()?;
@@ -246,8 +246,6 @@ pub fn list(targets: &[ClientTarget], status: &McpStatus) -> Vec<ClientConnectio
         .collect()
 }
 
-/// Refresh existing remote-ssh entries without opting new clients into the service.
-/// Process every target so one broken configuration does not block the others.
 pub fn refresh_configured(targets: &[ClientTarget], status: &McpStatus) -> Result<()> {
     let mut errors = Vec::new();
     for target in targets {

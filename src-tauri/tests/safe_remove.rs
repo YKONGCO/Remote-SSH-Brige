@@ -401,7 +401,7 @@ fn deletion_permission_is_opt_in_and_respects_global_protection() {
     };
     assert!(server.permits_mcp("remove_path"));
     let mut settings = RuntimeSettings::default();
-    assert!(settings.deletion_protection && settings.block_dangerous_commands);
+    assert!(settings.deletion_protection);
     assert!(security::check(&settings, &op, "mcp").is_err());
     assert!(security::check(
         &settings,
@@ -423,9 +423,10 @@ fn deletion_permission_is_opt_in_and_respects_global_protection() {
         "desktop"
     )
     .is_ok());
-    assert!(security::check_command_with_settings("rm /tmp/test", &settings).is_err());
-    settings.approval_mode = "mcp".into();
-    assert!(security::needs_approval(&settings, &op, "mcp"));
+    assert_eq!(
+        remote_ssh_brige_lib::command_policy::assess("rm /tmp/test", &settings).decision,
+        remote_ssh_brige_lib::command_policy::Decision::RequireApproval
+    );
     settings.remote_read_only = true;
     assert!(security::check(&settings, &op, "mcp").is_err());
 }

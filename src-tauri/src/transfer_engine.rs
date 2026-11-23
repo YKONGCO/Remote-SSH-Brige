@@ -1,12 +1,12 @@
-//! Resumable SFTP streams. Checkpoints only refer to task-owned temporary files.
 use crate::{
     model::{Operation, RuntimeSettings, Server},
     operation_error::{error, error_code},
     state::AppState,
+    transfer_checkpoint::{block_hash, local_identity, source_identity, verify_prefix},
+    transfer_verifier::{digest_reader, hash_local},
     transfers::{Handle, CHUNK_BYTES},
 };
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,57 +16,78 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct Checkpoint {
-    source: Option<Value>,
-    pub(crate) temp: String,
-    hashes: Vec<String>,
-    pub(crate) digest: Option<String>,
-    pub(crate) commit_pending: bool,
+pub(crate) use crate::transfer_checkpoint::Checkpoint;
+
+const MIN_WINDOW: usize = 64 * 1024;
+const MAX_WINDOW: usize = 1024 * 1024;
+const WINDOW_STEP: usize = 128 * 1024;
+const WINDOW_STREAK: u32 = 8;
+
+pub(crate) struct AdaptiveWindow {
+    bytes: usize,
+    streak: u32,
 }
 
-fn digest_reader(reader: &mut impl Read, h: &Handle) -> Result<String> {
-    let mut hash = Sha256::new();
-    let mut bytes = vec![0; CHUNK_BYTES];
-    loop {
-        h.check_cancelled()?;
-        let n = reader.read(&mut bytes)?;
-        if n == 0 {
-            break;
+impl Default for AdaptiveWindow {
+    fn default() -> Self {
+        Self {
+            bytes: 256 * 1024,
+            streak: 0,
         }
-        hash.update(&bytes[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
-}
-pub(crate) fn hash_local(path: &Path, h: &Handle) -> Result<String> {
-    digest_reader(&mut File::open(path)?, h)
 }
 
-fn local_identity(file: &File) -> Result<Value> {
-    let m = file.metadata()?;
-    Ok(
-        json!({"size":m.len(),"modified":m.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string()}),
+impl AdaptiveWindow {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn success(&mut self) {
+        self.streak = self.streak.saturating_add(1);
+        if self.streak >= WINDOW_STREAK {
+            self.streak = 0;
+            self.bytes = (self.bytes + WINDOW_STEP).min(MAX_WINDOW);
+        }
+    }
+
+    pub(crate) fn failure(&mut self, transport: bool) {
+        self.streak = 0;
+        if transport {
+            self.bytes = (self.bytes / 2).max(MIN_WINDOW);
+        }
+    }
+}
+
+fn transport_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
     )
 }
-fn source_identity(h: &Handle, identity: Value) -> Result<()> {
-    {
-        let mut cp = h.checkpoint.lock().unwrap();
-        if let Some(before) = &cp.source {
-            anyhow::ensure!(
-                *before == identity,
-                "SOURCE_CHANGED: Source file changed; create a new transfer"
-            );
-        } else {
-            cp.source = Some(identity);
-        }
-    }
-    h.persist()
+
+pub(crate) fn session_unhealthy(error: &anyhow::Error) -> bool {
+    matches!(
+        error_code(error),
+        "SSH_CONNECT_FAILED"
+            | "SSH_AUTHENTICATION_FAILED"
+            | "SSH_HOST_KEY_MISMATCH"
+            | "SSH_HOST_UNTRUSTED"
+            | "SSH_SESSION_BUSY"
+            | "SSH_TIMEOUT"
+            | "CONNECTION_LOST"
+            | "CONNECTION_REFUSED"
+            | "SSH_ERROR"
+            | "COMMIT_STATUS_UNKNOWN"
+    )
 }
+
 fn local_temp(path: &Path) -> Result<File> {
-    if let Ok(m) = std::fs::symlink_metadata(path) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
         anyhow::ensure!(
-            m.is_file() && !m.file_type().is_symlink(),
+            metadata.is_file() && !metadata.file_type().is_symlink(),
             "INVALID_ARGUMENT: Temporary path is not a regular file"
         );
         Ok(OpenOptions::new().read(true).write(true).open(path)?)
@@ -78,11 +99,12 @@ fn local_temp(path: &Path) -> Result<File> {
             .open(path)?)
     }
 }
+
 fn remote_temp(sftp: &ssh2::Sftp, path: &Path) -> Result<ssh2::File> {
     match sftp.lstat(path) {
-        Ok(m) => {
+        Ok(metadata) => {
             anyhow::ensure!(
-                m.is_file(),
+                metadata.is_file(),
                 "INVALID_ARGUMENT: Remote temporary path is not a regular file"
             );
             Ok(sftp.open_mode(
@@ -92,7 +114,7 @@ fn remote_temp(sftp: &ssh2::Sftp, path: &Path) -> Result<ssh2::File> {
                 ssh2::OpenType::File,
             )?)
         }
-        Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => Ok(sftp.open_mode(
+        Err(error) if error.code() == ssh2::ErrorCode::SFTP(2) => Ok(sftp.open_mode(
             path,
             ssh2::OpenFlags::READ
                 | ssh2::OpenFlags::WRITE
@@ -101,30 +123,28 @@ fn remote_temp(sftp: &ssh2::Sftp, path: &Path) -> Result<ssh2::File> {
             0o600,
             ssh2::OpenType::File,
         )?),
-        Err(e) => Err(e.into()),
+        Err(error) => Err(error.into()),
     }
 }
-fn block_hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 
-// ssh2's std::io conversion discards the numeric SSH error. Preserve transport
-// classification at the boundary instead of guessing from English messages.
 struct RemoteFile<'a> {
     inner: ssh2::File,
     session: &'a ssh2::Session,
 }
+
 impl std::ops::Deref for RemoteFile<'_> {
     type Target = ssh2::File;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
+
 impl std::ops::DerefMut for RemoteFile<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
+
 fn io_error(session: &ssh2::Session, original: std::io::Error) -> std::io::Error {
     if let Some(native) = ssh2::Error::last_session_error(session) {
         if matches!(native.code(), ssh2::ErrorCode::Session(-9 | -30)) {
@@ -140,24 +160,37 @@ fn io_error(session: &ssh2::Session, original: std::io::Error) -> std::io::Error
     }
     original
 }
+
 impl Read for RemoteFile<'_> {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(b).map_err(|e| io_error(self.session, e))
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .read(buffer)
+            .map_err(|error| io_error(self.session, error))
     }
 }
+
 impl Write for RemoteFile<'_> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(b).map_err(|e| io_error(self.session, e))
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .write(buffer)
+            .map_err(|error| io_error(self.session, error))
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush().map_err(|e| io_error(self.session, e))
+        self.inner
+            .flush()
+            .map_err(|error| io_error(self.session, error))
     }
 }
+
 impl Seek for RemoteFile<'_> {
-    fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(p).map_err(|e| io_error(self.session, e))
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.inner
+            .seek(position)
+            .map_err(|error| io_error(self.session, error))
     }
 }
+
 fn remote_open<'a>(
     sftp: &ssh2::Sftp,
     path: &Path,
@@ -167,54 +200,6 @@ fn remote_open<'a>(
         inner: sftp.open(path)?,
         session,
     })
-}
-
-/// Verify retained blocks before seeking a newly opened stream. Unconfirmed tails
-/// are overwritten, never treated as acknowledged progress.
-fn verify_prefix(
-    source: &mut (impl Read + Seek),
-    destination: &mut (impl Read + Seek),
-    total: u64,
-    h: &Handle,
-    upload: bool,
-) -> Result<(u64, Sha256)> {
-    let hashes = h.checkpoint.lock().unwrap().hashes.clone();
-    let mut bytes = vec![0; CHUNK_BYTES];
-    let mut other = vec![0; CHUNK_BYTES];
-    let mut offset = 0;
-    let mut whole = Sha256::new();
-    let mut valid = 0;
-    for expected in &hashes {
-        h.check_cancelled()?;
-        let n = (total - offset).min(CHUNK_BYTES as u64) as usize;
-        if n == 0 {
-            break;
-        }
-        if upload {
-            source.read_exact(&mut other[..n])?;
-            anyhow::ensure!(
-                block_hash(&other[..n]) == *expected,
-                "SOURCE_CHANGED: Upload source content changed"
-            );
-        }
-        match destination.read_exact(&mut bytes[..n]) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        if block_hash(&bytes[..n]) != *expected {
-            break;
-        }
-        whole.update(&bytes[..n]);
-        offset += n as u64;
-        valid += 1;
-    }
-    h.checkpoint.lock().unwrap().hashes.truncate(valid);
-    // These handles have no in-flight writes; seeking them is safe.
-    source.seek(SeekFrom::Start(offset))?;
-    h.resumed(offset);
-    h.persist()?;
-    Ok((offset, whole))
 }
 
 fn stream(
@@ -239,27 +224,22 @@ fn stream(
     let mut offset = initial;
     let start = Instant::now();
     let mut progress = Instant::now();
-    let window = if h.operation.lock().unwrap().kind.is_empty() {
-        CHUNK_BYTES
-    } else if h.retry_count() > 0 {
-        64 * 1024
-    } else {
-        CHUNK_BYTES
-    };
     h.phase("transferring");
     h.report(offset, total, start, initial);
     while offset < total {
         h.check_cancelled()?;
-        let n = (total - offset).min(CHUNK_BYTES as u64) as usize;
+        let count = (total - offset).min(CHUNK_BYTES as u64) as usize;
         let mut read = 0;
         let mut last = Instant::now();
-        while read < n {
+        while read < count {
             h.check_cancelled()?;
-            anyhow::ensure!(
-                last.elapsed() < Duration::from_secs(settings.transfers.idle_timeout_secs),
-                "IO_TIMEOUT: Transfer made no progress"
-            );
-            match source.read(&mut bytes[read..n.min(read + window)]) {
+            if last.elapsed() >= Duration::from_secs(settings.transfers.idle_timeout_secs) {
+                h.window.lock().unwrap().failure(true);
+                return Err(error("IO_TIMEOUT", "Transfer made no progress"));
+            }
+            let window = h.window.lock().unwrap().bytes();
+            let end = count.min(read + window);
+            match source.read(&mut bytes[read..end]) {
                 Ok(0) => {
                     return Err(error(
                         "SOURCE_CHANGED",
@@ -270,19 +250,24 @@ fn stream(
                     read += amount;
                     last = Instant::now();
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    h.window.lock().unwrap().failure(transport_io(&error));
+                    return Err(error.into());
+                }
             }
         }
         let mut written = 0;
         let mut last = Instant::now();
-        while written < n {
+        while written < count {
             h.check_cancelled()?;
-            anyhow::ensure!(
-                last.elapsed() < Duration::from_secs(settings.transfers.idle_timeout_secs),
-                "IO_TIMEOUT: Transfer made no progress"
-            );
-            match destination.write(&bytes[written..n.min(written + window)]) {
+            if last.elapsed() >= Duration::from_secs(settings.transfers.idle_timeout_secs) {
+                h.window.lock().unwrap().failure(true);
+                return Err(error("IO_TIMEOUT", "Transfer made no progress"));
+            }
+            let window = h.window.lock().unwrap().bytes();
+            let end = count.min(written + window);
+            match destination.write(&bytes[written..end]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -294,8 +279,11 @@ fn stream(
                     written += amount;
                     last = Instant::now();
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    h.window.lock().unwrap().failure(transport_io(&error));
+                    return Err(error.into());
+                }
             }
             if progress.elapsed() >= Duration::from_millis(200) {
                 h.report(offset + written as u64, total, start, initial);
@@ -314,15 +302,16 @@ fn stream(
                 }
             }
         }
-        hash.update(&bytes[..n]);
-        offset += n as u64;
-        h.checkpoint
-            .lock()
-            .unwrap()
-            .hashes
-            .push(block_hash(&bytes[..n]));
+        hash.update(&bytes[..count]);
+        offset += count as u64;
+        {
+            let mut checkpoint = h.checkpoint.lock().unwrap();
+            checkpoint.hashes.push(block_hash(&bytes[..count]));
+            checkpoint.verified_bytes = offset;
+            checkpoint.temp_size = Some(offset);
+        }
+        h.window.lock().unwrap().success();
         h.report(offset, total, start, initial);
-        // Bound disk writes without losing the verified in-memory checkpoint.
         if offset % (4 * CHUNK_BYTES as u64) == 0 || offset == total {
             destination.flush()?;
             h.persist()?;
@@ -342,11 +331,40 @@ pub(crate) fn transfer(
 ) -> Result<Value> {
     h.check_cancelled()?;
     let mut connection = settings.clone();
-    connection.io_timeout_secs = settings
-        .transfers
-        .io_timeout_secs
-        .min(settings.transfers.idle_timeout_secs);
-    let session = crate::ssh::connect_with_settings(server, &connection)?;
+    connection.io_timeout_secs = settings.transfers.io_timeout_secs;
+    let mut lease = state
+        .sftp_sessions
+        .acquire(server, &connection)
+        .map_err(|error| crate::operation_error::with_stage(error, "connection"))?;
+    h.session_reused(lease.reused());
+    let outcome = transfer_with_session(
+        state,
+        server,
+        op,
+        settings,
+        source,
+        local,
+        h,
+        lease.session(),
+    );
+    let healthy = outcome
+        .as_ref()
+        .err()
+        .is_none_or(|error| !session_unhealthy(error));
+    lease.release(healthy);
+    outcome
+}
+
+fn transfer_with_session(
+    state: &AppState,
+    server: &Server,
+    op: &Operation,
+    settings: &RuntimeSettings,
+    source: &str,
+    local: &Path,
+    h: &Handle,
+    session: &mut ssh2::Session,
+) -> Result<Value> {
     let sftp = session.sftp()?;
     let upload = op.kind == "upload_file";
     let spec = op
@@ -361,15 +379,20 @@ pub(crate) fn transfer(
         crate::transfers::validate_commit(state, server, op, source, local)?;
         if upload {
             match sftp.lstat(&remote) {
-                Ok(st) => anyhow::ensure!(st.is_dir(), "ALREADY_EXISTS: Target is not a directory"),
-                Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => {
-                    if let Err(e) = sftp.mkdir(&remote, 0o755) {
-                        if !sftp.lstat(&remote).is_ok_and(|st| st.is_dir()) {
-                            return Err(e.into());
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.is_dir(),
+                        "ALREADY_EXISTS: Target is not a directory"
+                    )
+                }
+                Err(error) if error.code() == ssh2::ErrorCode::SFTP(2) => {
+                    if let Err(error) = sftp.mkdir(&remote, 0o755) {
+                        if !sftp.lstat(&remote).is_ok_and(|metadata| metadata.is_dir()) {
+                            return Err(error.into());
                         }
                     }
                 }
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             }
         } else {
             anyhow::ensure!(
@@ -380,6 +403,7 @@ pub(crate) fn transfer(
             crate::transfers::validate_commit(state, server, op, source, local)?;
         }
         h.resumed(0);
+        h.verified(0);
         return Ok(json!({"directory":true}));
     }
     if !upload && spec.create_parents {
@@ -399,14 +423,14 @@ pub(crate) fn transfer(
             .join(format!(".remote-ssh-brige-{id}.part"))
     };
     {
-        let mut cp = h.checkpoint.lock().unwrap();
-        if !cp.temp.is_empty() {
+        let mut checkpoint = h.checkpoint.lock().unwrap();
+        if !checkpoint.temp.is_empty() {
             anyhow::ensure!(
-                Path::new(&cp.temp) == temp,
+                Path::new(&checkpoint.temp) == temp,
                 "SOURCE_CHANGED: Temporary path changed"
             );
         }
-        cp.temp = if upload {
+        checkpoint.temp = if upload {
             temp.to_string_lossy().replace('\\', "/")
         } else {
             temp.to_string_lossy().into_owned()
@@ -418,11 +442,11 @@ pub(crate) fn transfer(
         h.phase("reconciling");
         let expected = pending.digest.context("Missing commit checksum")?;
         let result = if upload {
-            remote_open(&sftp, &remote, &session).and_then(|mut f| digest_reader(&mut f, h))
+            remote_open(&sftp, &remote, session).and_then(|mut file| digest_reader(&mut file, h))
         } else {
             File::open(local)
                 .map_err(anyhow::Error::from)
-                .and_then(|mut f| digest_reader(&mut f, h))
+                .and_then(|mut file| digest_reader(&mut file, h))
         };
         match result {
             Ok(actual) if actual == expected => {
@@ -451,13 +475,14 @@ pub(crate) fn transfer(
                     let _ = std::fs::remove_file(&temp);
                 }
                 h.digest(actual);
+                h.verified(0);
                 return Ok(json!({"reconciled":true}));
             }
-            Err(e) if error_code(&e) == "NOT_FOUND" => {
+            Err(error) if error_code(&error) == "NOT_FOUND" => {
                 h.checkpoint.lock().unwrap().commit_pending = false;
                 h.persist()?;
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
             _ => {
                 return Err(error(
                     "COMMIT_STATUS_UNKNOWN",
@@ -478,36 +503,39 @@ pub(crate) fn transfer(
         source_identity(h, identity.clone())?;
         if spec.skip_existing && sftp.stat(&remote).is_ok() {
             let digest = hash_local(local, h)?;
-            if digest_reader(&mut remote_open(&sftp, &remote, &session)?, h)? == digest {
+            if digest_reader(&mut remote_open(&sftp, &remote, session)?, h)? == digest {
                 h.resumed(total);
+                h.verified(total);
                 h.digest(digest);
                 return Ok(json!({"skipped":true}));
             }
         }
         let existing = match sftp.stat(&remote) {
-            Ok(st) => {
+            Ok(metadata) => {
                 anyhow::ensure!(
-                    st.is_file(),
+                    metadata.is_file(),
                     "INVALID_ARGUMENT: Destination must be a regular file"
                 );
                 anyhow::ensure!(
                     spec.overwrite,
                     "ALREADY_EXISTS: Destination exists and overwrite is disabled"
                 );
-                Some(st)
+                Some(metadata)
             }
-            Err(e) if e.code() == ssh2::ErrorCode::SFTP(2) => None,
-            Err(e) => return Err(e.into()),
+            Err(error) if error.code() == ssh2::ErrorCode::SFTP(2) => None,
+            Err(error) => return Err(error.into()),
         };
+        let temp_size = sftp.stat(&temp).ok().and_then(|metadata| metadata.size);
         let mut output = RemoteFile {
             inner: remote_temp(&sftp, &temp)?,
-            session: &session,
+            session,
         };
-        let (offset, hash) = verify_prefix(&mut input, &mut output, total, h, true)?;
+        let (offset, hash) =
+            verify_prefix(&mut input, &mut output, total, h, true, true, temp_size)?;
         output.close()?;
         let mut output = RemoteFile {
             inner: sftp.open_mode(&temp, ssh2::OpenFlags::WRITE, 0o600, ssh2::OpenType::File)?,
-            session: &session,
+            session,
         };
         output.seek(SeekFrom::Start(offset))?;
         output.setstat(ssh2::FileStat {
@@ -531,12 +559,16 @@ pub(crate) fn transfer(
             );
         }
         h.phase("verifying");
-        let actual = digest_reader(&mut remote_open(&sftp, &temp, &session)?, h)?;
-        anyhow::ensure!(
-            actual == digest,
-            "CHECKSUM_MISMATCH: Remote temporary file checksum differs"
-        );
-        if let Some(perm) = existing.and_then(|st| st.perm) {
+        let actual = digest_reader(&mut remote_open(&sftp, &temp, session)?, h)?;
+        if actual != digest {
+            h.reset_checkpoint();
+            return Err(error(
+                "CHECKSUM_MISMATCH",
+                "Remote temporary file checksum differs",
+            ));
+        }
+        h.verified(total);
+        if let Some(perm) = existing.and_then(|metadata| metadata.perm) {
             sftp.setstat(
                 &temp,
                 ssh2::FileStat {
@@ -559,7 +591,7 @@ pub(crate) fn transfer(
         let _guard = loop {
             h.check_cancelled()?;
             match lock.try_lock() {
-                Ok(g) => break g,
+                Ok(guard) => break guard,
                 Err(std::sync::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(20))
                 }
@@ -573,13 +605,13 @@ pub(crate) fn transfer(
         );
         h.begin_commit()?;
         {
-            let mut cp = h.checkpoint.lock().unwrap();
-            cp.digest = Some(digest.clone());
-            cp.commit_pending = true;
+            let mut checkpoint = h.checkpoint.lock().unwrap();
+            checkpoint.digest = Some(digest.clone());
+            checkpoint.commit_pending = true;
         }
         h.persist()?;
-        if let Err(e) = crate::ssh::commit_extension(
-            &session,
+        if let Err(failure) = crate::ssh::commit_extension(
+            session,
             if spec.overwrite {
                 "posix-rename@openssh.com"
             } else {
@@ -588,23 +620,26 @@ pub(crate) fn transfer(
             &temp,
             &remote,
         ) {
-            if error_code(&e) != "COMMIT_STATUS_UNKNOWN" {
+            if error_code(&failure) != "COMMIT_STATUS_UNKNOWN" {
                 h.checkpoint.lock().unwrap().commit_pending = false;
                 h.persist()?;
             }
-            if !spec.overwrite && error_code(&e) == "COMMIT_FAILED" && sftp.lstat(&remote).is_ok() {
+            if !spec.overwrite
+                && error_code(&failure) == "COMMIT_FAILED"
+                && sftp.lstat(&remote).is_ok()
+            {
                 return Err(error(
                     "ALREADY_EXISTS",
                     "Destination was concurrently created; it was not replaced",
                 ));
             }
-            return Err(e);
+            return Err(failure);
         }
         let _ = sftp.unlink(&temp);
         h.digest(digest);
         Ok(json!({"written_bytes":total}))
     } else {
-        let mut input = remote_open(&sftp, &remote, &session)?;
+        let mut input = remote_open(&sftp, &remote, session)?;
         let before = input.stat()?;
         anyhow::ensure!(
             before.is_file(),
@@ -613,9 +648,10 @@ pub(crate) fn transfer(
         let total = before.size.context("Remote file size unavailable")?;
         source_identity(h, json!({"size":total,"modified":before.mtime}))?;
         if spec.skip_existing && local.is_file() {
-            let digest = digest_reader(&mut remote_open(&sftp, &remote, &session)?, h)?;
+            let digest = digest_reader(&mut remote_open(&sftp, &remote, session)?, h)?;
             if hash_local(local, h)? == digest {
                 h.resumed(total);
+                h.verified(total);
                 h.digest(digest);
                 return Ok(json!({"skipped":true}));
             }
@@ -625,7 +661,9 @@ pub(crate) fn transfer(
             );
         }
         let mut output = local_temp(&temp)?;
-        let (offset, hash) = verify_prefix(&mut input, &mut output, total, h, false)?;
+        let temp_size = output.metadata().ok().map(|metadata| metadata.len());
+        let (offset, hash) =
+            verify_prefix(&mut input, &mut output, total, h, false, true, temp_size)?;
         output.seek(SeekFrom::Start(offset))?;
         output.set_len(offset)?;
         let digest = stream(&mut input, &mut output, total, offset, hash, settings, h)?;
@@ -636,17 +674,19 @@ pub(crate) fn transfer(
             "SOURCE_CHANGED: Remote source changed"
         );
         h.phase("verifying");
-        // Reopen to avoid seeking an SFTP handle with outstanding packets.
         if offset > 0 {
-            anyhow::ensure!(
-                digest_reader(&mut remote_open(&sftp, &remote, &session)?, h)? == digest,
-                "SOURCE_CHANGED: Remote content changed since checkpoint"
-            );
+            match &spec.sha256 {
+                Some(expected) => anyhow::ensure!(
+                    *expected == digest,
+                    "SOURCE_CHANGED: Remote content changed since checkpoint"
+                ),
+                None => anyhow::ensure!(
+                    digest_reader(&mut remote_open(&sftp, &remote, session)?, h)? == digest,
+                    "SOURCE_CHANGED: Remote content changed since checkpoint"
+                ),
+            }
         }
-        anyhow::ensure!(
-            hash_local(&temp, h)? == digest,
-            "CHECKSUM_MISMATCH: Download checksum differs"
-        );
+        h.verified(total);
         crate::transfers::validate_commit(state, server, op, source, local)?;
         anyhow::ensure!(
             crate::ssh::remote_path(&sftp, server, &spec.remote_path, false)? == remote,
@@ -654,9 +694,9 @@ pub(crate) fn transfer(
         );
         h.begin_commit()?;
         {
-            let mut cp = h.checkpoint.lock().unwrap();
-            cp.digest = Some(digest.clone());
-            cp.commit_pending = true;
+            let mut checkpoint = h.checkpoint.lock().unwrap();
+            checkpoint.digest = Some(digest.clone());
+            checkpoint.commit_pending = true;
         }
         h.persist()?;
         drop(output);
@@ -671,112 +711,49 @@ pub(crate) fn transfer(
     }
 }
 
-pub(crate) async fn cleanup(
-    state: &std::sync::Arc<AppState>,
-    h: &Handle,
-    source: &str,
-) -> Result<()> {
-    let cp = h.checkpoint.lock().unwrap().clone();
-    if cp.temp.is_empty() {
-        return Ok(());
-    }
-    let op = h.operation.lock().unwrap().clone();
-    let server = state.server(&op.server_id)?;
-    h.validate_server(&server)?;
-    let spec = op
-        .transfer_request
-        .as_ref()
-        .context("Missing transfer spec")?;
-    if op.kind == "upload_file" {
-        // Remote cleanup uses the same deletion protection and approvals as other removals.
-        let remove = Operation {
-            kind: "remove_path".into(),
-            server_id: op.server_id,
-            path: cp.temp,
-            file_request: Some(crate::model::FileRequest::Remove {
-                recursive: false,
-                missing_ok: true,
-            }),
-            ..Default::default()
-        };
-        // execute() requires a static source identifier.
-        Box::pin(crate::state::execute(
-            state.clone(),
-            remove,
-            if source == "mcp" { "mcp" } else { "desktop" },
-        ))
-        .await?;
-    } else {
-        let settings = state.settings.lock().unwrap().clone();
-        let temp_spec = crate::transfers::TransferSpec {
-            local_path: cp.temp.clone(),
-            overwrite: true,
-            ..spec.clone()
-        };
-        let path = crate::transfers::local_path(&temp_spec, false, &settings, source)?;
-        anyhow::ensure!(
-            path.file_name().and_then(|n| n.to_str())
-                == Some(format!(".remote-ssh-brige-{}.part", op.transfer_id).as_str()),
-            "Invalid temporary file name"
-        );
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let _ = server;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfers::testing_handle;
     use std::io::Cursor;
+
     #[test]
-    fn corrupted_checkpoint_tail_rolls_back_to_last_verified_block() {
-        let h = crate::transfers::testing_handle();
-        let data = vec![0x53; CHUNK_BYTES * 2 + 17];
-        h.checkpoint.lock().unwrap().hashes = vec![
-            block_hash(&data[..CHUNK_BYTES]),
-            block_hash(&data[CHUNK_BYTES..CHUNK_BYTES * 2]),
-        ];
-        let mut retained = data.clone();
-        retained[CHUNK_BYTES + 2] = 0;
-        let (offset, _) = verify_prefix(
-            &mut Cursor::new(data.clone()),
-            &mut Cursor::new(retained),
-            data.len() as u64,
-            &h,
-            true,
-        )
-        .unwrap();
-        assert_eq!(offset, CHUNK_BYTES as u64);
-        assert_eq!(h.checkpoint.lock().unwrap().hashes.len(), 1);
+    fn adaptive_window_grows_after_stable_io_and_shrinks_on_transport_errors() {
+        let mut window = AdaptiveWindow::default();
+        assert_eq!(window.bytes(), 256 * 1024);
+        for _ in 0..WINDOW_STREAK {
+            window.success();
+        }
+        assert_eq!(window.bytes(), 384 * 1024);
+        for _ in 0..1000 {
+            window.success();
+        }
+        assert_eq!(window.bytes(), MAX_WINDOW);
+        window.failure(true);
+        assert_eq!(window.bytes(), MAX_WINDOW / 2);
+        for _ in 0..10 {
+            window.failure(true);
+        }
+        assert_eq!(window.bytes(), MIN_WINDOW);
     }
-    #[test]
-    fn source_content_change_is_rejected_even_with_matching_metadata() {
-        let h = crate::transfers::testing_handle();
-        h.checkpoint.lock().unwrap().hashes = vec![block_hash(b"old")];
-        let e = verify_prefix(
-            &mut Cursor::new(b"new"),
-            &mut Cursor::new(b"old"),
-            3,
-            &h,
-            true,
-        )
-        .unwrap_err();
-        assert_eq!(error_code(&e), "SOURCE_CHANGED");
-    }
+
     #[test]
     fn resume_preserves_verified_prefix_and_hashes_complete_content() {
-        let h = crate::transfers::testing_handle();
+        let h = testing_handle();
         let bytes = vec![42; CHUNK_BYTES + 17];
         h.checkpoint.lock().unwrap().hashes = vec![block_hash(&bytes[..CHUNK_BYTES])];
         let mut input = Cursor::new(bytes.clone());
         let mut output = Cursor::new(bytes[..CHUNK_BYTES].to_vec());
-        let (offset, hash) =
-            verify_prefix(&mut input, &mut output, bytes.len() as u64, &h, true).unwrap();
+        let (offset, hash) = verify_prefix(
+            &mut input,
+            &mut output,
+            bytes.len() as u64,
+            &h,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
         let digest = stream(
             &mut input,
             &mut output,
@@ -790,17 +767,7 @@ mod tests {
         assert_eq!(output.into_inner(), bytes);
         assert_eq!(digest, block_hash(&bytes));
     }
-    #[test]
-    fn sparse_source_sizes_above_four_gib_are_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("large");
-        let file = File::create(path).unwrap();
-        file.set_len(5 * 1024 * 1024 * 1024 + 17).unwrap();
-        assert_eq!(
-            local_identity(&file).unwrap()["size"],
-            5u64 * 1024 * 1024 * 1024 + 17
-        );
-    }
+
     #[test]
     fn permanent_failures_are_never_retried() {
         let full: anyhow::Error = std::io::Error::from(std::io::ErrorKind::StorageFull).into();
@@ -824,4 +791,59 @@ mod tests {
             "temporary"
         )));
     }
+}
+
+pub(crate) async fn cleanup(
+    state: &std::sync::Arc<AppState>,
+    h: &Handle,
+    source: &str,
+) -> Result<()> {
+    let checkpoint = h.checkpoint.lock().unwrap().clone();
+    if checkpoint.temp.is_empty() {
+        return Ok(());
+    }
+    let op = h.operation.lock().unwrap().clone();
+    let server = state.server(&op.server_id)?;
+    h.validate_server(&server)?;
+    let spec = op
+        .transfer_request
+        .as_ref()
+        .context("Missing transfer spec")?;
+    if op.kind == "upload_file" {
+        let remove = Operation {
+            kind: "remove_path".into(),
+            server_id: op.server_id,
+            path: checkpoint.temp,
+            file_request: Some(crate::model::FileRequest::Remove {
+                recursive: false,
+                missing_ok: true,
+            }),
+            ..Default::default()
+        };
+        Box::pin(crate::state::execute(
+            state.clone(),
+            remove,
+            if source == "mcp" { "mcp" } else { "desktop" },
+        ))
+        .await?;
+    } else {
+        let settings = state.settings.lock().unwrap().clone();
+        let temp_spec = crate::transfers::TransferSpec {
+            local_path: checkpoint.temp.clone(),
+            overwrite: true,
+            ..spec.clone()
+        };
+        let path = crate::transfers::local_path(&temp_spec, false, &settings, source)?;
+        anyhow::ensure!(
+            path.file_name().and_then(|name| name.to_str())
+                == Some(format!(".remote-ssh-brige-{}.part", op.transfer_id).as_str()),
+            "Invalid temporary file name"
+        );
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }

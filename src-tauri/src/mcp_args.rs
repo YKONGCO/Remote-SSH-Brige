@@ -1,4 +1,3 @@
-//! Public tools expose only the fields they consume. Internal desktop Operations stay separate.
 use crate::model::{FileEdit, FileRequest, Operation, WriteMode};
 use serde::Deserialize;
 
@@ -27,7 +26,7 @@ macro_rules! args {
         #[derive(Debug, Deserialize, schemars::JsonSchema)]
         #[serde(deny_unknown_fields)]
         pub struct $name {
-            /// Configured server ID returned by list_servers.
+
             #[schemars(length(min = 1, max = 128))]
             pub server_id: String,
             $($(#[$attr])* pub $field: $ty),*
@@ -36,62 +35,61 @@ macro_rules! args {
 }
 
 args!(PathArgs {
-    /// Absolute remote POSIX path within the configured file root.
     #[schemars(length(min = 1, max = 8192))]
     path: String,
 });
 args!(ReadArgs {
-    /// Absolute remote UTF-8 file path.
+
     #[schemars(length(min = 1, max = 8192))]
     path: String,
-    /// First line to read (1-indexed; default 1).
+
     #[schemars(range(min = 1))]
     offset: Option<u64>,
-    /// Maximum lines (default and hard ceiling 2000). Output also capped at 50 KiB.
+
     #[schemars(range(min = 1, max = 2000))]
     limit: Option<u64>,
 });
 args!(ListArgs {
-    /// Absolute remote directory path within the configured file root.
+
     #[schemars(length(min = 1, max = 8192))]
     path: String,
-    /// Zero-based entry offset. Entries sort directories first, then by name.
+
     offset: Option<u64>,
-    /// Maximum entries, default 200, ceiling 1000. Response capped at 50 KiB.
+
     #[schemars(range(min = 1, max = 1000))]
     limit: Option<u64>,
 });
 args!(WriteArgs {
     #[schemars(length(min = 1, max = 8192))]
     path: String,
-    /// Complete UTF-8 file content. Use edit_file for targeted changes.
+
     content: String,
-    /// overwrite creates or replaces (default); create refuses existing targets.
+
     mode: Option<WriteMode>,
-    /// Create missing parent directories inside the file root. Default false.
+
     create_parents: Option<bool>,
 });
 args!(EditArgs {
     #[schemars(length(min = 1, max = 8192))]
     path: String,
-    /// Non-overlapping replacements, all matched against the original file, committed together.
+
     #[schemars(length(min = 1, max = 100))]
     edits: Vec<FileEdit>,
 });
 args!(ExecArgs {
     #[schemars(length(min = 1, max = 16384))]
     command: String,
-    /// Seconds, 0 uses application default; otherwise 1-300.
+
     #[schemars(range(max = 300))]
     timeout_secs: Option<u64>,
 });
 args!(RemoveArgs {
-    /// Exact absolute remote path inside the configured root. No wildcard expansion.
+
     #[schemars(length(min = 1, max = 8192))]
     path: String,
-    /// Explicitly allow non-empty directory deletion. Default false. Symlinks are never followed.
+
     recursive: Option<bool>,
-    /// Succeed when already absent, for idempotent cleanup. Default true.
+
     missing_ok: Option<bool>,
 });
 
@@ -111,111 +109,100 @@ into_op!(WriteArgs, a, {path:a.path, content:a.content, file_request:Some(FileRe
 into_op!(EditArgs, a, {path:a.path, file_request:Some(FileRequest::Edit {edits:a.edits})});
 into_op!(ExecArgs, a, {command:a.command, timeout_secs:a.timeout_secs.unwrap_or(0)});
 
-args!(TransferStartArgs {
-    /// Absolute file path on the computer running this app, within its configured MCP local roots.
-    #[schemars(length(min = 1, max = 8192))]
-    local_path: String,
-    /// Absolute remote POSIX file path within the server file root.
-    #[schemars(length(min = 1, max = 8192))]
-    remote_path: String,
-    /// Default false. Replace the destination only after the complete transfer succeeds.
-    overwrite: Option<bool>,
-    /// Optional retry-safe request identifier.
-    request_id: Option<String>,
-});
-into_op!(TransferStartArgs, a, { request_id:a.request_id, transfer_request: Some(crate::transfers::TransferSpec {local_path:a.local_path,remote_path:a.remote_path,overwrite:a.overwrite.unwrap_or(false),size:None,sha256:None,create_parents:false,skip_existing:false,directory:false}) });
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(extend("type" = "object"))]
 pub enum TransferArgs {
     List {
+        #[schemars(length(min = 1, max = 128))]
         server_id: String,
     },
     Read {
+        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        transfer_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        transfer_id: Option<String>,
+        #[schemars(length(min = 1, max = 128))]
+        group_id: Option<String>,
         version: Option<u64>,
         #[schemars(range(max = 30))]
         wait_secs: Option<u64>,
     },
     Cancel {
+        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        transfer_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        transfer_id: Option<String>,
+        #[schemars(length(min = 1, max = 128))]
+        group_id: Option<String>,
     },
     Pause {
+        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        transfer_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        transfer_id: Option<String>,
+        #[schemars(length(min = 1, max = 128))]
+        group_id: Option<String>,
     },
     Resume {
+        #[schemars(length(min = 1, max = 128))]
         server_id: String,
-        transfer_id: String,
-    },
-    Retry {
-        server_id: String,
-        transfer_id: String,
-    },
-    Cleanup {
-        server_id: String,
-        transfer_id: String,
-    },
-    Configure {
-        server_id: String,
-        transfer_id: String,
-        #[schemars(range(min=-10,max=10))]
-        priority: Option<i32>,
-        #[schemars(range(max = 1048576))]
-        bandwidth_kib: Option<u64>,
+        #[schemars(length(min = 1, max = 128))]
+        transfer_id: Option<String>,
+        #[schemars(length(min = 1, max = 128))]
+        group_id: Option<String>,
     },
 }
 impl From<TransferArgs> for Operation {
     fn from(a: TransferArgs) -> Self {
         let mut op = Self::default();
-        let (server, id, action) = match a {
-            TransferArgs::List { server_id } => (server_id, String::new(), "list"),
+        let (server, id, group, action) = match a {
+            TransferArgs::List { server_id } => (server_id, String::new(), None, "list"),
             TransferArgs::Read {
                 server_id,
                 transfer_id,
+                group_id,
                 version,
                 wait_secs,
             } => {
                 op.version = version;
                 op.wait_secs = wait_secs.unwrap_or(0);
-                (server_id, transfer_id, "read")
+                (server_id, transfer_id.unwrap_or_default(), group_id, "read")
             }
             TransferArgs::Cancel {
                 server_id,
                 transfer_id,
-            } => (server_id, transfer_id, "cancel"),
+                group_id,
+            } => (
+                server_id,
+                transfer_id.unwrap_or_default(),
+                group_id,
+                "cancel",
+            ),
             TransferArgs::Pause {
                 server_id,
                 transfer_id,
-            } => (server_id, transfer_id, "pause"),
+                group_id,
+            } => (
+                server_id,
+                transfer_id.unwrap_or_default(),
+                group_id,
+                "pause",
+            ),
             TransferArgs::Resume {
                 server_id,
                 transfer_id,
-            } => (server_id, transfer_id, "resume"),
-            TransferArgs::Retry {
+                group_id,
+            } => (
                 server_id,
-                transfer_id,
-            } => (server_id, transfer_id, "retry"),
-            TransferArgs::Cleanup {
-                server_id,
-                transfer_id,
-            } => (server_id, transfer_id, "cleanup"),
-            TransferArgs::Configure {
-                server_id,
-                transfer_id,
-                priority,
-                bandwidth_kib,
-            } => {
-                op.priority = priority;
-                op.bandwidth_kib = bandwidth_kib;
-                (server_id, transfer_id, "configure")
-            }
+                transfer_id.unwrap_or_default(),
+                group_id,
+                "resume",
+            ),
         };
         op.server_id = server;
         op.transfer_id = id;
+        op.transfer_group = group;
         op.transfer_action = action.into();
         op
     }
@@ -235,10 +222,10 @@ pub enum JobArgs {
         server_id: String,
         #[schemars(length(min = 1, max = 128))]
         job_id: String,
-        /// Absolute byte offsets returned by exec/job.read; initially zero.
+
         stdout_cursor: Option<u64>,
         stderr_cursor: Option<u64>,
-        /// Wait at most 0-30 seconds, returning early on output or completion.
+
         #[schemars(range(max = 30))]
         wait_secs: Option<u64>,
     },
@@ -281,8 +268,6 @@ impl From<JobArgs> for Operation {
     }
 }
 
-/// A discriminated union keeps action-specific required fields and rejects
-/// accidental combinations (for example, command on a read request).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(extend("type" = "object"))]
@@ -301,26 +286,19 @@ pub enum TerminalArgs {
         server_id: String,
         #[schemars(length(min = 1, max = 128))]
         session_id: String,
-        /// Byte cursor from the previous read, initially 0.
+
         cursor: Option<u64>,
+
+        #[schemars(range(max = 30))]
+        wait_secs: Option<u64>,
     },
     Write {
         #[schemars(length(min = 1, max = 128))]
         server_id: String,
         #[schemars(length(min = 1, max = 128))]
         session_id: String,
-        /// Raw input; include newline to execute a command.
+
         content: String,
-    },
-    Resize {
-        #[schemars(length(min = 1, max = 128))]
-        server_id: String,
-        #[schemars(length(min = 1, max = 128))]
-        session_id: String,
-        #[schemars(range(min = 20, max = 500))]
-        cols: u32,
-        #[schemars(range(min = 5, max = 200))]
-        rows: u32,
     },
     Close {
         #[schemars(length(min = 1, max = 128))]
@@ -349,11 +327,13 @@ impl TerminalArgs {
                 server_id,
                 session_id,
                 cursor,
+                wait_secs,
             } => {
                 op.kind = "terminal_read".into();
                 op.server_id = server_id;
                 op.session_id = session_id;
                 op.cursor = cursor.unwrap_or(0);
+                op.wait_secs = wait_secs.unwrap_or(0);
             }
             Self::Write {
                 server_id,
@@ -364,18 +344,6 @@ impl TerminalArgs {
                 op.server_id = server_id;
                 op.session_id = session_id;
                 op.content = content;
-            }
-            Self::Resize {
-                server_id,
-                session_id,
-                cols,
-                rows,
-            } => {
-                op.kind = "terminal_resize".into();
-                op.server_id = server_id;
-                op.session_id = session_id;
-                op.cols = cols;
-                op.rows = rows;
             }
             Self::Close {
                 server_id,
@@ -395,9 +363,9 @@ impl TerminalArgs {
 pub enum PortForwardArgs {
     Open {
         server_id: String,
-        /// Local port on the computer running this app. 0 selects a free port.
+
         local_port: Option<u16>,
-        /// Only 127.0.0.1 or ::1 on the SSH server. Defaults to 127.0.0.1.
+
         remote_host: Option<String>,
         #[schemars(range(min = 1, max = 65535))]
         remote_port: u16,

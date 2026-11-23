@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
   act,
@@ -13,12 +12,10 @@ import { SelectField } from "../components/SelectField";
 import { api } from "../api";
 import {
   defaultRuntimeSettings,
-  defaultAllowedCommands,
-  commandPresets,
   defaultCommandPolicy,
   parseCommandList,
   MAX_COMMAND_RULES,
-  validCommandLists,
+  validCommandRules,
 } from "../runtime-settings";
 import appPackage from "../../package.json";
 
@@ -135,7 +132,7 @@ test("select labels stay visible when values update with the menu closed", () =>
   expect(trigger.textContent).toContain("选项 B");
 });
 
-test("approval wait time can be shortened and persists independently of approval mode", async () => {
+test("approval wait time persists for protected command approvals", async () => {
   vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
   render(<Settings />);
   await act(async () => {});
@@ -152,374 +149,188 @@ test("approval wait time can be shortened and persists independently of approval
     .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
     .settings as import("../runtime-settings").RuntimeSettings;
   expect(saved.approval_timeout_secs).toBe(5);
-  expect(saved.approval_mode).toBe("off");
 });
 
-test("one advanced shell toggle saves all shell capabilities and leaves the AI terminal independent", async () => {
+test("one advanced shell toggle controls all shell capabilities and leaves advanced MCP tools independent", async () => {
   vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
   render(<Settings />);
   await act(async () => {});
   vi.mocked(api).mockImplementation(
     async (_command, args) => args?.settings as never,
   );
-  const pipes = screen.getByRole("switch", { name: "允许 Shell 高级功能" });
-  fireEvent.click(pipes);
-  await waitFor(() => expect(pipes.hasAttribute("disabled")).toBe(false));
+  const advanced = screen.getByRole("switch", {
+    name: "允许 Shell 高级功能",
+  });
+  expect(advanced.getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(advanced);
+  await waitFor(() => expect(advanced.hasAttribute("disabled")).toBe(false));
   const firstSave = vi
     .mocked(api)
     .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
     .settings as import("../runtime-settings").RuntimeSettings;
-  expect(firstSave.block_dangerous_commands).toBe(true);
-  expect(firstSave.command_policy?.allow_pipes).toBe(true);
-  expect(firstSave.command_policy?.allow_redirection).toBe(true);
-  expect(firstSave.command_policy?.allow_scripts).toBe(true);
-  expect(firstSave.command_policy?.allow_compound).toBe(true);
-  expect(firstSave.command_policy?.allow_substitution).toBe(true);
-  expect(firstSave.command_policy?.allow_mcp_terminal).toBe(false);
-  expect(firstSave.command_policy?.allow_advanced_shell).toBe(true);
-  fireEvent.click(screen.getByRole("switch", { name: "危险命令拦截" }));
-  await act(async () => {});
-  expect(pipes.getAttribute("aria-checked")).toBe("true");
-  expect(
-    screen
-      .getByRole("switch", { name: "允许 AI 交互终端" })
-      .getAttribute("aria-checked"),
-  ).toBe("false");
-});
-
-test("legacy unrestricted settings preserve shell permissions when enabling protection", async () => {
-  vi.mocked(api).mockResolvedValueOnce({
-    ...defaultRuntimeSettings,
-    block_dangerous_commands: false,
+  for (const key of [
+    "allow_pipes",
+    "allow_redirection",
+    "allow_compound",
+    "allow_scripts",
+    "allow_substitution",
+  ] as const)
+    expect(firstSave.command_policy?.[key]).toBe(false);
+  expect(firstSave.advanced_mcp_tools).toEqual({
+    terminal: false,
+    port_forward: true,
   });
-  render(<Settings />);
-  await act(async () => {});
-  vi.mocked(api).mockImplementation(
-    async (_command, args) => args?.settings as never,
+  const terminal = screen.getByRole("switch", { name: "交互式终端" });
+  expect(terminal.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(terminal);
+  await waitFor(() =>
+    expect(terminal.getAttribute("aria-checked")).toBe("true"),
   );
-  expect(
-    screen
-      .getByRole("switch", { name: "允许 Shell 高级功能" })
-      .getAttribute("aria-checked"),
-  ).toBe("true");
-  fireEvent.click(screen.getByRole("switch", { name: "危险命令拦截" }));
-  await act(async () => {});
-  const call = vi
-    .mocked(api)
-    .mock.calls.find(([command]) => command === "save_runtime_settings")!;
-  const saved = call[1]!
-    .settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.block_dangerous_commands).toBe(true);
-  expect(saved.command_policy?.allow_scripts).toBe(true);
-  expect(saved.command_policy?.diagnostic_only).toBe(false);
-});
-
-test("command lists can be edited, cleared and restored, and invalid rules stay unsaved", async () => {
-  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
-  render(<Settings />);
-  await act(async () => {});
-  vi.mocked(api).mockImplementation(
-    async (_command, args) => args?.settings as never,
-  );
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  const allowed = screen.getByRole("textbox", { name: "命令白名单" });
-  const blocked = screen.getByRole("textbox", { name: "命令黑名单" });
-  fireEvent.change(allowed, { target: { value: "ls\ngrep\n/opt/report\nls" } });
-  fireEvent.change(blocked, { target: { value: "rm -rf /" } });
-  fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
-  expect(screen.getByRole("alert").textContent).toContain("不要填写参数");
-  expect(
-    vi
-      .mocked(api)
-      .mock.calls.filter(([command]) => command === "save_runtime_settings"),
-  ).toHaveLength(0);
-  fireEvent.change(blocked, { target: { value: "grep\nrm" } });
-  fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  let saved = vi
+  const saved = vi
     .mocked(api)
     .mock.calls.filter(([command]) => command === "save_runtime_settings")
     .at(-1)![1]!.settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.command_policy?.execution_mode).toBe("whitelist");
-  expect(saved.command_policy?.allowed_commands).toEqual([
-    "ls",
-    "grep",
-    "/opt/report",
-  ]);
-  expect(saved.command_policy?.blocked_commands).toEqual(["grep", "rm"]);
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  expect(
-    (screen.getByRole("textbox", { name: "命令黑名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toBe("grep\nrm");
-  fireEvent.change(screen.getByRole("textbox", { name: "命令白名单" }), {
-    target: { value: "" },
+  expect(saved.advanced_mcp_tools).toEqual({
+    terminal: true,
+    port_forward: true,
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  saved = vi
-    .mocked(api)
-    .mock.calls.filter(([command]) => command === "save_runtime_settings")
-    .at(-1)![1]!.settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.command_policy?.allowed_commands).toEqual([]);
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  fireEvent.click(screen.getByRole("button", { name: "恢复默认名单" }));
-  expect(
-    (screen.getByRole("textbox", { name: "命令白名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toContain("pwd\nls");
-  expect(
-    (screen.getByRole("textbox", { name: "命令黑名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toBe("");
 });
 
-test("command presets merge into existing grants, support search and preserve the blacklist", async () => {
-  vi.mocked(api).mockResolvedValueOnce({
-    ...defaultRuntimeSettings,
-    command_policy: {
-      ...defaultCommandPolicy,
-      execution_mode: "whitelist",
-      allowed_commands: ["/opt/custom", "python"],
-      blocked_commands: ["pip"],
-    },
-  });
-  render(<Settings />);
-  await act(async () => {});
-  vi.mocked(api).mockImplementation(
-    async (_command, args) => args?.settings as never,
-  );
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  const allowed = screen.getByRole("textbox", {
-    name: "命令白名单",
-  }) as HTMLTextAreaElement;
-  expect(parseCommandList(allowed.value)).toEqual(["/opt/custom", "python"]);
-  fireEvent.click(screen.getByRole("button", { name: "全选Python 开发" }));
-  const python = commandPresets.find((preset) => preset.id === "python")!;
-  expect(parseCommandList(allowed.value)).toEqual([
-    "/opt/custom",
-    ...python.commands,
-  ]);
-  expect(
-    (screen.getByRole("textbox", { name: "命令黑名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toBe("pip");
-  fireEvent.change(screen.getByRole("textbox", { name: "搜索常用命令" }), {
-    target: { value: "torchrun" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "添加命令 torchrun" }));
-  expect(parseCommandList(allowed.value)).toContain("torchrun");
-  expect(
-    screen
-      .getByRole("button", { name: "取消命令 torchrun" })
-      .getAttribute("aria-pressed"),
-  ).toBe("true");
-  expect(
-    (
-      screen.getByRole("button", {
-        name: "取消命令 torchrun",
-      }) as HTMLButtonElement
-    ).disabled,
-  ).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "取消命令 torchrun" }));
-  expect(parseCommandList(allowed.value)).not.toContain("torchrun");
-  fireEvent.click(screen.getByRole("button", { name: "添加命令 torchrun" }));
-  expect(
-    vi
-      .mocked(api)
-      .mock.calls.some(([name]) => name === "save_runtime_settings"),
-  ).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "全选常用命令" }));
-  expect(new Set(parseCommandList(allowed.value))).toEqual(
-    new Set(["/opt/custom", "python", ...defaultAllowedCommands]),
-  );
-  fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  const saved = vi
-    .mocked(api)
-    .mock.calls.filter(([name]) => name === "save_runtime_settings")
-    .at(-1)![1]!.settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.command_policy?.blocked_commands).toEqual(["pip"]);
-  expect(saved.command_policy?.allowed_commands).toContain("/opt/custom");
-  expect(saved.command_policy?.allow_scripts).toBe(false);
-});
-
-test("bulk command names are deduplicated and presets cannot exceed the command limit", async () => {
+test("protected command dialog shows read-only builtin rules and saves custom rules", async () => {
   vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
   render(<Settings />);
   await act(async () => {});
-  vi.mocked(api).mockImplementation(
-    async (_command, args) => args?.settings as never,
-  );
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  const allowed = screen.getByRole("textbox", {
-    name: "命令白名单",
+  vi.mocked(api).mockImplementation(async (command, args) => {
+    if (command === "protected_rules")
+      return {
+        builtin: [
+          { command: "rm", reason: "Deletes files or directories" },
+          {
+            command: "find",
+            arguments: ["-delete", "-exec"],
+            reason: "find may delete files",
+          },
+        ],
+      } as never;
+    return args?.settings as never;
+  });
+  fireEvent.click(screen.getByRole("button", { name: "管理受保护命令" }));
+  expect(await screen.findByText("内置规则（只读，始终启用）")).toBeTruthy();
+  expect(await screen.findByText("rm")).toBeTruthy();
+  expect(await screen.findByText(/find may delete files/)).toBeTruthy();
+  const editor = screen.getByRole("textbox", {
+    name: "自定义受保护命令",
   }) as HTMLTextAreaElement;
-  const many = Array.from(
-    { length: MAX_COMMAND_RULES - 6 },
-    (_, index) => `custom${index}`,
-  ).join("\n");
-  fireEvent.change(allowed, { target: { value: many } });
-  fireEvent.click(screen.getByRole("button", { name: "全选Python 开发" }));
-  expect(screen.getByRole("alert").textContent).toContain(
-    String(MAX_COMMAND_RULES),
-  );
-  expect(allowed.value).toBe(many);
-  fireEvent.change(allowed, {
-    target: { value: "python3, pip；pytest\nnode npm、python3;uv" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "保存名单" }));
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  const saved = vi
-    .mocked(api)
-    .mock.calls.filter(([name]) => name === "save_runtime_settings")
-    .at(-1)![1]!.settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.command_policy?.allowed_commands).toEqual([
-    "python3",
-    "pip",
-    "pytest",
-    "node",
-    "npm",
-    "uv",
-  ]);
-});
-
-test("both command lists accept the expanded limit and reject overflow", () => {
-  const commands = Array.from(
-    { length: MAX_COMMAND_RULES },
-    (_, index) => `tool${index}`,
-  );
-  expect(validCommandLists(commands, commands)).toBe(true);
-  expect(validCommandLists([...commands, "extra"], [])).toBe(false);
-  expect(validCommandLists([], [...commands, "extra"])).toBe(false);
-});
-
-test("shell presets and the colon builtin validate without allowing arbitrary colons", () => {
-  for (const name of [
-    "true",
-    "false",
-    ":",
-    "yes",
-    "set",
-    "bash",
-    "sh",
-    "python3",
-  ]) {
-    expect(defaultAllowedCommands).toContain(name);
-  }
-  expect(defaultAllowedCommands).toContain("python");
-  expect(validCommandLists(defaultAllowedCommands, [":"])).toBe(true);
-  expect(parseCommandList("true false : yes set bash sh")).toContain(":");
-  expect(validCommandLists(["bad:name"], [])).toBe(false);
-  expect(validCommandLists(["/tmp/bad:name"], [])).toBe(false);
-});
-
-test("preset selection can be reversed globally, by category and within search results", async () => {
-  vi.mocked(api).mockResolvedValueOnce({
-    ...defaultRuntimeSettings,
-    command_policy: {
-      ...defaultCommandPolicy,
-      allowed_commands: ["/opt/custom", "node", "python"],
-      blocked_commands: ["pip"],
-    },
-  });
-  render(<Settings />);
-  await act(async () => {});
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  const allowed = screen.getByRole("textbox", {
-    name: "命令白名单",
-  }) as HTMLTextAreaElement;
-  fireEvent.click(screen.getByRole("button", { name: "全选Python 开发" }));
-  fireEvent.click(screen.getByRole("button", { name: "取消全选Python 开发" }));
-  expect(parseCommandList(allowed.value)).toEqual(["/opt/custom", "node"]);
-  fireEvent.click(screen.getByRole("button", { name: "全选常用命令" }));
-  expect(parseCommandList(allowed.value)).toHaveLength(
-    defaultAllowedCommands.length + 1,
-  );
-  fireEvent.click(screen.getByRole("button", { name: "取消全选" }));
-  expect(parseCommandList(allowed.value)).toEqual(["/opt/custom"]);
-  fireEvent.change(allowed, { target: { value: "/opt/custom\nnode\npython" } });
-  fireEvent.change(screen.getByRole("textbox", { name: "搜索常用命令" }), {
-    target: { value: "python3.1" },
-  });
-  fireEvent.click(
-    screen.getByRole("button", { name: "全选Python 开发搜索结果" }),
-  );
-  expect(parseCommandList(allowed.value)).toContain("python3.14");
-  fireEvent.click(
-    screen.getByRole("button", { name: "取消全选Python 开发搜索结果" }),
-  );
-  expect(parseCommandList(allowed.value)).toEqual([
-    "/opt/custom",
-    "node",
-    "python",
-  ]);
-  expect(
-    (screen.getByRole("textbox", { name: "命令黑名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toBe("pip");
+  fireEvent.change(editor, { target: { value: "rm -rf /\ncurl" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
+  expect(screen.getByRole("alert").textContent).toContain("不要参数");
   expect(
     vi
       .mocked(api)
-      .mock.calls.some(([name]) => name === "save_runtime_settings"),
+      .mock.calls.some(([command]) => command === "save_runtime_settings"),
   ).toBe(false);
+  fireEvent.change(editor, { target: { value: "curl\n/opt/deploy" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  const saved = vi
+    .mocked(api)
+    .mock.calls.filter(([command]) => command === "save_runtime_settings")
+    .at(-1)![1]!.settings as import("../runtime-settings").RuntimeSettings;
+  expect(saved.command_policy?.protected_commands).toEqual([
+    "curl",
+    "/opt/deploy",
+  ]);
+  expect(saved.command_policy?.allow_pipes).toBe(true);
 });
 
-test("language toolsets can be browsed and added without replacing existing commands", async () => {
+test("legacy whitelist restriction stays visible until explicitly cleared", async () => {
   vi.mocked(api).mockResolvedValueOnce({
     ...defaultRuntimeSettings,
     command_policy: {
       ...defaultCommandPolicy,
-      allowed_commands: ["/opt/custom"],
-      blocked_commands: ["rustup"],
+      protected_commands: ["curl"],
+      legacy_whitelist: ["ls", "date"],
     },
   });
   render(<Settings />);
   await act(async () => {});
-  fireEvent.click(screen.getByRole("button", { name: "管理名单" }));
-  for (const id of ["cpp", "java", "go", "rust", "dotnet", "containers"]) {
-    const preset = commandPresets.find((group) => group.id === id)!;
-    fireEvent.click(screen.getByTitle(preset.label));
+  expect(screen.getByText("旧版白名单限制")).toBeTruthy();
+  vi.mocked(api).mockImplementation(
+    async (_command, args) => args?.settings as never,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "改用新版受保护命令策略" }),
+  );
+  await waitFor(() =>
     expect(
-      screen.getByRole("button", { name: `添加命令 ${preset.commands[0]}` }),
-    ).toBeTruthy();
-    fireEvent.click(
-      screen.getByRole("button", { name: `全选${preset.label}` }),
-    );
-    const names = parseCommandList(
-      (
-        screen.getByRole("textbox", {
-          name: "命令白名单",
-        }) as HTMLTextAreaElement
-      ).value,
-    );
-    expect(names).toContain("/opt/custom");
-    for (const command of preset.commands) expect(names).toContain(command);
-  }
-  expect(
-    (screen.getByRole("textbox", { name: "命令黑名单" }) as HTMLTextAreaElement)
-      .value,
-  ).toBe("rustup");
-});
-
-test("execution mode changes are persisted without enabling advanced shell or the AI terminal", async () => {
-  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
-  render(<Settings />);
-  await act(async () => {});
-  vi.mocked(api).mockImplementation(
-    async (_command, args) => args?.settings as never,
+      vi
+        .mocked(api)
+        .mock.calls.some(([command]) => command === "save_runtime_settings"),
+    ).toBe(true),
   );
-  const mode = screen.getByRole("combobox", { name: "命令执行范围" });
-  fireEvent.keyDown(mode, { key: "ArrowDown" });
-  fireEvent.click(await screen.findByRole("option", { name: "禁止执行" }));
-  await waitFor(() => expect(mode.textContent).toContain("禁止执行"));
   const saved = vi
     .mocked(api)
     .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
     .settings as import("../runtime-settings").RuntimeSettings;
-  expect(saved.command_policy?.execution_mode).toBe("disabled");
-  expect(saved.command_policy?.allow_scripts).toBe(false);
-  expect(saved.command_policy?.allow_mcp_terminal).toBe(false);
+  expect(saved.command_policy?.legacy_whitelist).toBeNull();
+  expect(saved.command_policy?.protected_commands).toEqual(["curl"]);
+});
+
+test("approval mode can be disabled without changing command limits", async () => {
+  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
+  render(<Settings />);
+  await act(async () => {});
+  vi.mocked(api).mockImplementation(
+    async (_command, args) => args?.settings as never,
+  );
+  const approval = screen.getByRole("switch", { name: "审批模式" });
+  expect(approval.getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(approval);
+  await waitFor(() =>
+    expect(approval.getAttribute("aria-checked")).toBe("false"),
+  );
+  const saved = vi
+    .mocked(api)
+    .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
+    .settings as import("../runtime-settings").RuntimeSettings;
+  expect(saved.approval_mode).toBe(false);
+  expect(saved.command_policy?.exec_disabled).toBe(false);
+});
+
+test("command execution can be disabled without touching advanced shell permissions", async () => {
+  vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
+  render(<Settings />);
+  await act(async () => {});
+  vi.mocked(api).mockImplementation(
+    async (_command, args) => args?.settings as never,
+  );
+  fireEvent.click(screen.getByRole("switch", { name: "禁止命令执行" }));
+  await act(async () => {});
+  const saved = vi
+    .mocked(api)
+    .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
+    .settings as import("../runtime-settings").RuntimeSettings;
+  expect(saved.command_policy?.exec_disabled).toBe(true);
+  expect(saved.command_policy?.allow_pipes).toBe(true);
+  expect(saved.advanced_mcp_tools).toEqual({
+    terminal: false,
+    port_forward: true,
+  });
+});
+
+test("protected rule validation accepts names and absolute paths but rejects arguments", () => {
+  expect(validCommandRules(["curl", "/opt/deploy", ":", "python3.14"])).toBe(
+    true,
+  );
+  expect(validCommandRules(["rm -rf /"])).toBe(false);
+  expect(validCommandRules(["../escape"])).toBe(false);
+  const maximum = Array.from(
+    { length: MAX_COMMAND_RULES },
+    (_, index) => `tool${index}`,
+  );
+  expect(validCommandRules(maximum)).toBe(true);
+  expect(validCommandRules([...maximum, "extra"])).toBe(false);
+  expect(parseCommandList("curl, wget；nc")).toEqual(["curl", "wget", "nc"]);
 });
 
 test("local transfer directories are edited in a dialog and cancel leaves grants unchanged", async () => {

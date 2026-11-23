@@ -1,29 +1,26 @@
-//! Local execution sessions. Only the worker touches the SSH session/channel.
 use crate::{
-    model::{Operation, RuntimeSettings, Server},
+    model::Operation,
     operation_error::{error, error_with_details},
-    state::AppState,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
-    io::Read,
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
-const CAPACITY: usize = 4 * 1024 * 1024;
+pub(crate) const CAPACITY: usize = 4 * 1024 * 1024;
 const RETENTION: Duration = Duration::from_secs(30 * 60);
 pub type Progress = Option<tokio::sync::mpsc::Sender<Value>>;
 
 #[derive(Default)]
-struct Buffer {
+pub(crate) struct Buffer {
     bytes: VecDeque<u8>,
     end: u64,
 }
 impl Buffer {
-    fn append(&mut self, bytes: &[u8]) {
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
         self.end += bytes.len() as u64;
         let bytes = &bytes[bytes.len().saturating_sub(CAPACITY)..];
         let excess = (self.bytes.len() + bytes.len()).saturating_sub(CAPACITY);
@@ -40,8 +37,7 @@ impl Buffer {
             .take(limit)
             .copied()
             .collect();
-        // Keep an incomplete trailing UTF-8 character for the next read. Cursors
-        // still refer to raw bytes; invalid remote text is decoded lossily.
+
         if !finished || offset + (bytes.len() as u64) < self.end {
             let mut checked = 0;
             while let Err(e) = std::str::from_utf8(&bytes[checked..]) {
@@ -61,16 +57,16 @@ impl Buffer {
         )
     }
 }
-struct Data {
-    stdout: Buffer,
-    stderr: Buffer,
-    status: &'static str,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    finished: Option<Instant>,
-    retained: bool,
-    close: bool,
-    decided: bool,
+pub(crate) struct Data {
+    pub(crate) stdout: Buffer,
+    pub(crate) stderr: Buffer,
+    pub(crate) status: &'static str,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) error: Option<String>,
+    pub(crate) finished: Option<Instant>,
+    pub(crate) retained: bool,
+    pub(crate) close: bool,
+    pub(crate) decided: bool,
 }
 impl Default for Data {
     fn default() -> Self {
@@ -88,18 +84,19 @@ impl Default for Data {
     }
 }
 pub struct Job {
-    id: String,
+    pub(crate) id: String,
     server_id: String,
-    server_name: String,
-    command: String,
-    source: String,
+    pub(crate) server_name: String,
+    pub(crate) command: String,
+    pub(crate) source: String,
     created_at: String,
-    started: Instant,
-    data: Mutex<Data>,
-    changed: Condvar,
+    pub(crate) started: Instant,
+    pub(crate) data: Mutex<Data>,
+    pub(crate) changed: Condvar,
+    connection: Mutex<Value>,
 }
 impl Job {
-    fn new(server_id: &str) -> Self {
+    pub(crate) fn new(server_id: &str) -> Self {
         Self {
             id: format!("job_{}", uuid::Uuid::new_v4().simple()),
             server_id: server_id.into(),
@@ -110,7 +107,11 @@ impl Job {
             started: Instant::now(),
             data: Mutex::new(Data::default()),
             changed: Condvar::new(),
+            connection: Mutex::new(Value::Null),
         }
+    }
+    pub(crate) fn set_connection(&self, value: Value) {
+        *self.connection.lock().unwrap() = value;
     }
     fn info(&self) -> Value {
         let d = self.data.lock().unwrap();
@@ -118,9 +119,9 @@ impl Job {
             .finished
             .map(|end| end.duration_since(self.started))
             .unwrap_or_else(|| self.started.elapsed());
-        json!({"job_id":self.id,"server_id":self.server_id,"server_name":self.server_name,"command":self.command,"source":self.source,"created_at":self.created_at,"status":d.status,"exit_code":d.exit_code,"error":d.error,"duration_ms":elapsed.as_millis() as u64,"stdout_end_cursor":d.stdout.end,"stderr_end_cursor":d.stderr.end})
+        json!({"job_id":self.id,"server_id":self.server_id,"server_name":self.server_name,"command":self.command,"source":self.source,"created_at":self.created_at,"status":d.status,"exit_code":d.exit_code,"error":d.error,"duration_ms":elapsed.as_millis() as u64,"stdout_end_cursor":d.stdout.end,"stderr_end_cursor":d.stderr.end,"connection":*self.connection.lock().unwrap()})
     }
-    fn snapshot(&self, out: u64, err: u64, limit: usize) -> Result<Value> {
+    pub(crate) fn snapshot(&self, out: u64, err: u64, limit: usize) -> Result<Value> {
         let d = self.data.lock().unwrap();
         anyhow::ensure!(
             out <= d.stdout.end && err <= d.stderr.end,
@@ -134,7 +135,8 @@ impl Job {
             "stdout_start_cursor":d.stdout.end - d.stdout.bytes.len() as u64,"stderr_start_cursor":d.stderr.end - d.stderr.bytes.len() as u64,
             "stdout_end_cursor":d.stdout.end,"stderr_end_cursor":d.stderr.end,
             "stdout_truncated":out_truncated,"stderr_truncated":err_truncated,"truncated":out_truncated || err_truncated,
-            "stdout_has_more":next_out < d.stdout.end,"stderr_has_more":next_err < d.stderr.end}),
+            "stdout_has_more":next_out < d.stdout.end,"stderr_has_more":next_err < d.stderr.end,
+            "connection":*self.connection.lock().unwrap()}),
         )
     }
     fn wait(&self, out: u64, err: u64, duration: Duration) {
@@ -146,7 +148,7 @@ impl Job {
             })
             .unwrap();
     }
-    fn finish(&self, status: &'static str, code: Option<i32>, error: Option<String>) {
+    pub(crate) fn finish(&self, status: &'static str, code: Option<i32>, error: Option<String>) {
         let mut d = self.data.lock().unwrap();
         d.status = status;
         d.exit_code = code;
@@ -154,7 +156,7 @@ impl Job {
         d.finished = Some(Instant::now());
         self.changed.notify_all();
     }
-    fn close(&self) -> bool {
+    pub(crate) fn close(&self) -> bool {
         let mut d = self.data.lock().unwrap();
         if d.status == "running" {
             d.close = true;
@@ -189,7 +191,7 @@ impl JobManager {
                 .is_none_or(|t| t.elapsed() < RETENTION)
         });
     }
-    fn retain(&self, job: &Arc<Job>) -> Result<()> {
+    pub(crate) fn retain(&self, job: &Arc<Job>) -> Result<()> {
         let mut jobs = self.jobs.lock().unwrap();
         Self::prune(&mut jobs);
         let active = jobs
@@ -287,7 +289,7 @@ impl Drop for JobManager {
     }
 }
 
-fn send_progress(progress: &Progress, job: &Job, out: u64, err: u64) -> (u64, u64) {
+pub(crate) fn send_progress(progress: &Progress, job: &Job, out: u64, err: u64) -> (u64, u64) {
     if let Some(tx) = progress {
         if let Ok(value) = job.snapshot(out, err, 8192) {
             if value["next_stdout_cursor"] != out || value["next_stderr_cursor"] != err {
@@ -302,214 +304,6 @@ fn send_progress(progress: &Progress, job: &Job, out: u64, err: u64) -> (u64, u6
         }
     }
     (out, err)
-}
-
-pub fn execute(
-    state: &Arc<AppState>,
-    server: &Server,
-    op: &Operation,
-    settings: &RuntimeSettings,
-    source: &'static str,
-    progress: &Progress,
-) -> Result<Value> {
-    anyhow::ensure!(!op.command.trim().is_empty(), "command must not be empty");
-    let session = crate::ssh::connect_with_settings(server, settings)?;
-    let mut channel = session.channel_session()?;
-    channel.exec(&crate::ssh::command_with_login_path(server, &op.command))?; // Exactly once; this channel is moved intact to the worker.
-    session.set_blocking(false);
-    let mut execution = Job::new(&server.id);
-    execution.server_name = server.name.clone();
-    execution.command = op.command.clone();
-    execution.source = source.into();
-    let job = Arc::new(execution);
-    // Cancellation/error paths must release a foreground worker as well.
-    struct Foreground(Arc<Job>);
-    impl Drop for Foreground {
-        fn drop(&mut self) {
-            let mut d = self.0.data.lock().unwrap();
-            d.decided = true;
-            if !d.retained {
-                d.close = true;
-            }
-            self.0.changed.notify_all();
-        }
-    }
-    let _foreground = Foreground(job.clone());
-    let worker_job = job.clone();
-    let weak = Arc::downgrade(state);
-    let server = server.clone();
-    let operation = op.clone();
-    std::thread::Builder::new()
-        .name("ssh-exec".into())
-        .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Result<Option<i32>> {
-                    let mut bytes = [0; 8192];
-                    loop {
-                        if worker_job.data.lock().unwrap().close {
-                            let _ = channel.close();
-                            let _ = session.disconnect(None, "Execution session closed", None);
-                            return Ok(None);
-                        }
-                        // Bound work per stream so continuous stdout cannot starve stderr or close.
-                        for stream_id in [0, 1] {
-                            let mut stream = channel.stream(stream_id);
-                            for _ in 0..16 {
-                                match stream.read(&mut bytes) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        let mut d = worker_job.data.lock().unwrap();
-                                        if stream_id == 0 {
-                                            d.stdout.append(&bytes[..n]);
-                                        } else {
-                                            d.stderr.append(&bytes[..n]);
-                                        }
-                                        worker_job.changed.notify_all();
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                    Err(e) => return Err(e.into()),
-                                }
-                            }
-                        }
-                        if channel.eof() {
-                            match channel.wait_close() {
-                                Ok(()) => {
-                                    // libssh2 defaults exit_status to zero when the server sends none.
-                                    // Inspect exit signal as well; never invent success for a signal.
-                                    if channel.exit_signal()?.exit_signal.is_some() {
-                                        anyhow::bail!(
-                                            "SSH command ended by signal; exit code unknown"
-                                        );
-                                    }
-                                    return Ok(Some(channel.exit_status()?));
-                                }
-                                Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {}
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                },
-            ));
-            drop(channel);
-            drop(session);
-            match outcome {
-                Ok(Ok(Some(code))) => worker_job.finish("exited", Some(code), None),
-                Ok(Ok(None)) => worker_job.finish("closed", None, None),
-                Ok(Err(e)) => worker_job.finish(
-                    "disconnected",
-                    None,
-                    Some(crate::operation_error::error_message(&e)),
-                ),
-                Err(_) => worker_job.finish(
-                    "disconnected",
-                    None,
-                    Some("SSH worker stopped unexpectedly".into()),
-                ),
-            }
-            // The foreground decides whether this was handed over before final audit is written.
-            let mut d = worker_job.data.lock().unwrap();
-            while !d.decided {
-                d = worker_job.changed.wait(d).unwrap();
-            }
-            let retained = d.retained;
-            drop(d);
-            if retained {
-                audit_final(weak, &server, &operation, source, &worker_job);
-            }
-        })
-        .context("Cannot start SSH worker")?;
-    let timeout = Duration::from_secs(if op.timeout_secs == 0 {
-        settings.command_timeout_secs
-    } else {
-        op.timeout_secs.clamp(1, 300)
-    });
-    let deadline = Instant::now() + timeout;
-    let (mut out, mut err) = (0, 0);
-    let mut last_progress = Instant::now() - Duration::from_millis(100);
-    loop {
-        if last_progress.elapsed() >= Duration::from_millis(100) {
-            (out, err) = send_progress(progress, &job, out, err);
-            last_progress = Instant::now();
-        }
-        let mut d = job.data.lock().unwrap();
-        if d.status != "running" {
-            d.close = true;
-            job.changed.notify_all();
-            drop(d);
-            let mut value = job.snapshot(0, 0, CAPACITY)?;
-            if value["status"] == "exited" {
-                value.as_object_mut().unwrap().remove("job_id");
-                return Ok(value);
-            }
-            return Err(error_with_details(
-                "SSH_DISCONNECTED",
-                "SSH disconnected; final exit status is unknown",
-                value,
-            ));
-        }
-        if Instant::now() >= deadline {
-            drop(d);
-            let failure = if !settings.exec_timeout_to_job {
-                Some((
-                    "EXEC_TIMEOUT",
-                    "Command timed out; job retention is disabled",
-                ))
-            } else if !state.server(&op.server_id)?.permits_mcp("job") {
-                Some((
-                    "JOB_PERMISSION_DENIED",
-                    "Command timed out; missing job permission prevents retention",
-                ))
-            } else {
-                state.jobs.retain(&job).err().map(|_| {
-                    (
-                        "JOB_LIMIT",
-                        "Cannot retain session: server already has 4 active jobs",
-                    )
-                })
-            };
-            if let Some((code, reason)) = failure {
-                let close_confirmed = job.close();
-                let mut value = job.snapshot(0, 0, CAPACITY)?;
-                value["close_confirmed"] = json!(close_confirmed);
-                return Err(error_with_details(code, reason, value));
-            }
-            let value = job.snapshot(0, 0, CAPACITY)?;
-            // Serialize handoff audit before the worker's final audit.
-            state.log(
-                &state.server(&op.server_id)?,
-                source,
-                op,
-                &Ok(value.clone()),
-                timeout.as_millis() as u64,
-            )?;
-            job.changed.notify_all();
-            return Ok(value);
-        }
-        let _guard = job
-            .changed
-            .wait_timeout(d, Duration::from_millis(100))
-            .unwrap();
-    }
-}
-
-fn audit_final(state: Weak<AppState>, server: &Server, op: &Operation, source: &str, job: &Job) {
-    if let Some(state) = state.upgrade() {
-        let mut op = op.clone();
-        op.kind = "job".into();
-        op.job_action = "finish".into();
-        op.job_id = job.id.clone();
-        let result = job.snapshot(0, 0, 16384);
-        if let Err(e) = state.log(
-            server,
-            source,
-            &op,
-            &result,
-            job.started.elapsed().as_millis() as u64,
-        ) {
-            eprintln!("Job final audit failed: {e:#}");
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -27,13 +26,21 @@ function pending(
     username: "root",
     source: "mcp",
     kind: "exec",
-    path: "",
-    target: "",
     command: 'cat "<img src=x onerror=alert(1)>"',
-    content_preview: "",
-    content_bytes: 0,
-    content_sha256: "",
-    content_truncated: false,
+    reason: "Deletes files or directories; data may be unrecoverable",
+    risk: "high",
+    matched_rules: [
+      {
+        source: "builtin",
+        command: "rm",
+        reason: "Deletes files or directories; data may be unrecoverable",
+      },
+    ],
+    command_bytes: 41,
+    command_sha256: "a".repeat(64),
+    server_sha256: "b".repeat(64),
+    timeout_secs: 0,
+    created_at: new Date().toISOString(),
     expires_at: expires,
   };
 }
@@ -55,8 +62,10 @@ test("approval requires an explicit decision and renders remote commands as iner
   const user = userEvent.setup();
   const onResolved = vi.fn();
   render(<ApprovalCenter enabled onResolved={onResolved} />);
-  await screen.findByRole("dialog", { name: "审批操作" });
+  await screen.findByRole("dialog", { name: "审批命令执行" });
   expect(screen.getByText(mock.pending[0].command)).toBeTruthy();
+  expect(screen.getByText("高（命中内置受保护规则）")).toBeTruthy();
+  expect(screen.getByText("内置规则")).toBeTruthy();
   expect(document.querySelector("img")).toBeNull();
   expect(
     mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
@@ -72,50 +81,32 @@ test("approval requires an explicit decision and renders remote commands as iner
 test("expired approvals cannot be accepted", async () => {
   setup([pending(new Date(Date.now() - 1000).toISOString())]);
   render(<ApprovalCenter enabled onResolved={vi.fn()} />);
-  const approve = await screen.findByRole("button", { name: "批准本次" });
+  const approve = await screen.findByRole("button", {
+    name: "批准本次执行",
+  });
   expect((approve as HTMLButtonElement).disabled).toBe(true);
   expect(
     mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
   ).toBe(false);
 });
 
-test("recursive deletion scope is explicit before approval", async () => {
-  setup([
-    {
-      ...pending(),
-      kind: "remove_path",
-      path: "/srv/app/tmp",
-      command: "",
-      recursive: true,
-      missing_ok: true,
-    },
-  ]);
-  render(<ApprovalCenter enabled onResolved={vi.fn()} />);
-  await screen.findByRole("dialog", { name: "审批操作" });
-  expect(screen.getByText("安全删除文件 / 目录")).toBeTruthy();
-  expect(screen.getByText("整个目录及其内容（不跟随符号链接）")).toBeTruthy();
-  expect(screen.getByText("视为已完成")).toBeTruthy();
-  expect(
-    mock.api.mock.calls.some(([command]) => command === "resolve_approval"),
-  ).toBe(false);
-});
-test("approval entry is hidden while approval is disabled", () => {
+test("approval entry is hidden while approvals are unavailable", () => {
   setup([]);
   render(<ApprovalCenter enabled={false} onResolved={vi.fn()} />);
-  expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "命令审批" })).toBeNull();
 });
 
-test("approval entry with no requests links to approval settings", async () => {
+test("approval entry with no requests links to protected command settings", async () => {
   setup([]);
   const user = userEvent.setup();
   const settings = vi.fn();
   render(
     <ApprovalCenter enabled onResolved={vi.fn()} onOpenSettings={settings} />,
   );
-  await user.click(screen.getByRole("button", { name: "操作审批" }));
-  await screen.findByText("暂无待审批操作");
-  expect(screen.queryByRole("button", { name: "批准本次" })).toBeNull();
-  await user.click(screen.getByRole("button", { name: "审批设置" }));
+  await user.click(screen.getByRole("button", { name: "命令审批" }));
+  await screen.findByText("暂无待审批命令");
+  expect(screen.queryByRole("button", { name: "批准本次执行" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "查看受保护命令" }));
   expect(settings).toHaveBeenCalledOnce();
   expect(screen.queryByRole("dialog")).toBeNull();
 });

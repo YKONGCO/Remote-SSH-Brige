@@ -27,6 +27,17 @@ export interface FileTransfer {
   bandwidth_kib?: number;
   sha256?: string | null;
   group_id?: string | null;
+  verified_bytes?: number;
+  last_progress_at?: string | null;
+  retry_stage?: string | null;
+  failure_category?: string | null;
+  session_reuse_count?: number;
+  effective_throughput?: number;
+  queued_ms?: number;
+  transfer_ms?: number;
+  verify_ms?: number;
+  retry_wait_ms?: number;
+  batch_policy?: string | null;
 }
 export function formatBytes(bytes: number) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

@@ -1,6 +1,5 @@
 import type { ITheme } from "@xterm/xterm";
 
-/** xterm draws to canvas, so resolve the shared CSS tokens into its theme. */
 export function terminalTheme(
   element: HTMLElement = document.documentElement,
 ): ITheme {

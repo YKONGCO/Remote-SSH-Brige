@@ -1,23 +1,31 @@
 use serde::{Deserialize, Serialize};
 pub const MCP_SERVER_NAME: &str = "remote-ssh";
 pub const MCP_SERVER_TITLE: &str = "Remote SSH Brige";
-pub const MAX_TRANSFER_MIB: u64 = 8_589_934_591; // Exact byte counts in JavaScript; 0 means unlimited.
-pub const MAX_INLINE_TRANSFER_MIB: u64 = 256; // Text, Base64 and MCP payloads.
+pub const MAX_TRANSFER_MIB: u64 = 8_589_934_591;
+pub const MAX_INLINE_TRANSFER_MIB: u64 = 256;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
 pub const MAX_COMMAND_RULES: usize = 4096;
+
+pub const SETTINGS_VERSION: u32 = 4;
+
+pub const LEGACY_DIAGNOSTIC_COMMANDS: &[&str] = &[
+    "pwd", "ls", "cat", "head", "tail", "stat", "file", "du", "df", "free", "uptime", "whoami",
+    "id", "uname", "date", "hostname", "ps", "ss", "netstat", "wc", "readlink", "realpath", "true",
+    "false", ":", "yes", "set",
+];
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
+    pub settings_version: u32,
     pub close_to_tray: bool,
     pub mcp_auto_start: bool,
     pub mcp_host: String,
     pub mcp_port: u16,
     pub deletion_protection: bool,
-    pub block_dangerous_commands: bool,
     pub command_policy: Option<CommandPolicy>,
     pub remote_read_only: bool,
-    pub approval_mode: String,
+    pub approval_mode: bool,
     pub approval_timeout_secs: u64,
     pub upload_limit_mib: u64,
     pub download_limit_mib: u64,
@@ -29,20 +37,45 @@ pub struct RuntimeSettings {
     pub command_timeout_secs: u64,
     pub exec_timeout_to_job: bool,
     pub max_terminals: usize,
+    pub advanced_mcp_tools: AdvancedMcpTools,
     pub transfers: crate::transfers::TransferSettings,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdvancedMcpTools {
+    pub terminal: bool,
+    pub port_forward: bool,
+}
+impl Default for AdvancedMcpTools {
+    fn default() -> Self {
+        Self {
+            terminal: false,
+            port_forward: true,
+        }
+    }
+}
+impl AdvancedMcpTools {
+    pub fn enabled(&self, tool: &str) -> bool {
+        match tool {
+            "terminal" => self.terminal,
+            "port_forward" => self.port_forward,
+            _ => true,
+        }
+    }
 }
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
+            settings_version: SETTINGS_VERSION,
             close_to_tray: true,
             mcp_auto_start: true,
             mcp_host: "127.0.0.1".into(),
             mcp_port: 18920,
             deletion_protection: true,
-            block_dangerous_commands: true,
             command_policy: None,
             remote_read_only: false,
-            approval_mode: "off".into(),
+            approval_mode: true,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             upload_limit_mib: 0,
             download_limit_mib: 0,
@@ -54,41 +87,20 @@ impl Default for RuntimeSettings {
             command_timeout_secs: 30,
             exec_timeout_to_job: false,
             max_terminals: 32,
+            advanced_mcp_tools: AdvancedMcpTools::default(),
             transfers: crate::transfers::TransferSettings::default(),
         }
     }
 }
 impl RuntimeSettings {
     pub fn effective_command_policy(&self) -> CommandPolicy {
-        let mut policy = self.command_policy.clone().unwrap_or_else(|| {
-            if self.block_dangerous_commands {
-                CommandPolicy::default()
-            } else {
-                CommandPolicy {
-                    diagnostic_only: false,
-                    allow_pipes: true,
-                    allow_redirection: true,
-                    allow_compound: true,
-                    allow_scripts: true,
-                    allow_substitution: true,
-                    allow_mcp_terminal: true,
-                    ..Default::default()
-                }
-            }
-        });
-        if let Some(mode) = &policy.execution_mode {
-            policy.diagnostic_only = mode == "whitelist";
-        }
-        if let Some(advanced) = policy.allow_advanced_shell {
-            policy.allow_pipes = advanced;
-            policy.allow_redirection = advanced;
-            policy.allow_compound = advanced;
-            policy.allow_scripts = advanced;
-            policy.allow_substitution = advanced;
-        }
-        policy
+        self.command_policy.clone().unwrap_or_default()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.settings_version <= SETTINGS_VERSION,
+            "Runtime settings were written by a newer app version"
+        );
         anyhow::ensure!(self.mcp_port > 0, "MCP port must be 1-65535");
         anyhow::ensure!(
             self.mcp_host.parse::<std::net::IpAddr>().is_ok(),
@@ -98,10 +110,6 @@ impl RuntimeSettings {
         if let Some(policy) = &self.command_policy {
             policy.validate()?;
         }
-        anyhow::ensure!(
-            ["off", "mcp", "all"].contains(&self.approval_mode.as_str()),
-            "Invalid approval mode"
-        );
         anyhow::ensure!(
             (1..=120).contains(&self.approval_timeout_secs),
             "Approval timeout must be 1-120 seconds"
@@ -166,68 +174,55 @@ impl RuntimeSettings {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandPolicy {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_mode: Option<String>,
-    pub allowed_commands: Vec<String>,
-    pub blocked_commands: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allow_advanced_shell: Option<bool>,
-    pub diagnostic_only: bool,
+    pub protected_commands: Vec<String>,
+    #[serde(default = "default_true")]
     pub allow_pipes: bool,
+    #[serde(default = "default_true")]
     pub allow_redirection: bool,
+    #[serde(default = "default_true")]
     pub allow_compound: bool,
+    #[serde(default = "default_true")]
     pub allow_scripts: bool,
+    #[serde(default = "default_true")]
     pub allow_substitution: bool,
-    pub allow_mcp_terminal: bool,
+
+    pub exec_disabled: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_whitelist: Option<Vec<String>>,
 }
 impl Default for CommandPolicy {
     fn default() -> Self {
         Self {
-            execution_mode: None,
-            allowed_commands: default_allowed_commands(),
-            blocked_commands: vec![],
-            allow_advanced_shell: None,
-            diagnostic_only: true,
-            allow_pipes: false,
-            allow_redirection: false,
-            allow_compound: false,
-            allow_scripts: false,
-            allow_substitution: false,
-            allow_mcp_terminal: false,
+            protected_commands: vec![],
+            allow_pipes: true,
+            allow_redirection: true,
+            allow_compound: true,
+            allow_scripts: true,
+            allow_substitution: true,
+            exec_disabled: false,
+            legacy_whitelist: None,
         }
     }
-}
-
-pub fn default_allowed_commands() -> Vec<String> {
-    #[derive(Deserialize)]
-    struct Preset {
-        commands: Vec<String>,
-    }
-    let presets: Vec<Preset> = serde_json::from_str(include_str!("../../src/command-presets.json"))
-        .expect("bundled command presets must be valid JSON");
-    let mut commands = Vec::new();
-    for preset in presets {
-        for command in preset.commands {
-            if !commands.contains(&command) {
-                commands.push(command);
-            }
-        }
-    }
-    commands
 }
 
 impl CommandPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.execution_mode
-                .as_deref()
-                .is_none_or(|mode| matches!(mode, "disabled" | "whitelist" | "unrestricted")),
-            "Invalid command execution mode"
-        );
-        for list in [&self.allowed_commands, &self.blocked_commands] {
+        for list in [&self.protected_commands]
+            .into_iter()
+            .chain(self.legacy_whitelist.as_ref())
+        {
             anyhow::ensure!(
                 list.len() <= MAX_COMMAND_RULES,
                 "Each command list supports at most {MAX_COMMAND_RULES} entries"
@@ -251,6 +246,128 @@ impl CommandPolicy {
         }
         Ok(())
     }
+}
+
+pub fn migrate_settings_value(mut value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Runtime settings must be a JSON object"))?;
+    let version = object
+        .get("settings_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    anyhow::ensure!(
+        version <= SETTINGS_VERSION as u64,
+        "Runtime settings were written by a newer app version"
+    );
+    if version >= SETTINGS_VERSION as u64 {
+        return Ok(value);
+    }
+    let block_dangerous = object
+        .remove("block_dangerous_commands")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    if object
+        .get("approval_mode")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        object.remove("approval_mode");
+    }
+    let old_policy = object.remove("command_policy");
+    object.insert(
+        "command_policy".into(),
+        migrate_command_policy(old_policy, block_dangerous),
+    );
+    if let Some(policy) = object
+        .get_mut("command_policy")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        policy.remove("allow_mcp_terminal");
+    }
+    object
+        .entry("advanced_mcp_tools")
+        .or_insert_with(|| serde_json::to_value(AdvancedMcpTools::default()).unwrap());
+    object
+        .entry("approval_mode")
+        .or_insert(serde_json::json!(true));
+    object.insert(
+        "settings_version".into(),
+        serde_json::json!(SETTINGS_VERSION),
+    );
+    Ok(value)
+}
+
+fn migrate_command_policy(
+    old: Option<serde_json::Value>,
+    block_dangerous: bool,
+) -> serde_json::Value {
+    let Some(serde_json::Value::Object(mut old)) = old else {
+        return serde_json::to_value(CommandPolicy {
+            allow_pipes: !block_dangerous,
+            allow_redirection: !block_dangerous,
+            allow_compound: !block_dangerous,
+            allow_scripts: !block_dangerous,
+            allow_substitution: !block_dangerous,
+            legacy_whitelist: block_dangerous.then(|| {
+                LEGACY_DIAGNOSTIC_COMMANDS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }),
+            ..Default::default()
+        })
+        .expect("CommandPolicy serializes");
+    };
+    if old.contains_key("protected_commands") {
+        return serde_json::Value::Object(old);
+    }
+    let execution_mode = old
+        .remove("execution_mode")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let allowed_commands = old
+        .remove("allowed_commands")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    let blocked_commands = old
+        .remove("blocked_commands")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    let diagnostic_only = old
+        .remove("diagnostic_only")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let unified = old
+        .remove("allow_advanced_shell")
+        .and_then(|value| value.as_bool());
+    let advanced = |name: &str| {
+        unified.unwrap_or_else(|| {
+            old.get(name)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+    };
+    let legacy_whitelist = match execution_mode.as_deref() {
+        Some("whitelist") => Some(allowed_commands),
+        Some("disabled" | "unrestricted") => None,
+        _ if diagnostic_only => Some(
+            LEGACY_DIAGNOSTIC_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        _ => None,
+    };
+    serde_json::to_value(CommandPolicy {
+        protected_commands: blocked_commands,
+        allow_pipes: advanced("allow_pipes"),
+        allow_redirection: advanced("allow_redirection"),
+        allow_compound: advanced("allow_compound"),
+        allow_scripts: advanced("allow_scripts"),
+        allow_substitution: advanced("allow_substitution"),
+        exec_disabled: execution_mode.as_deref() == Some("disabled"),
+        legacy_whitelist,
+    })
+    .expect("CommandPolicy serializes")
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -326,23 +443,9 @@ pub const MCP_OPERATIONS: &[&str] = &[
     "terminal_open",
     "terminal_read",
     "terminal_write",
-    "terminal_resize",
     "terminal_close",
 ];
 impl Server {
-    pub fn terminal_actions(&self) -> Vec<&'static str> {
-        [
-            ("list", "list_terminals"),
-            ("open", "terminal_open"),
-            ("read", "terminal_read"),
-            ("write", "terminal_write"),
-            ("resize", "terminal_resize"),
-            ("close", "terminal_close"),
-        ]
-        .into_iter()
-        .filter_map(|(action, permission)| self.permits_mcp(permission).then_some(action))
-        .collect()
-    }
     pub fn permits_mcp(&self, kind: &str) -> bool {
         if !self.enabled || !self.mcp_enabled || !MCP_OPERATIONS.contains(&kind) {
             return false;
@@ -355,7 +458,7 @@ impl Server {
             "exec" => self.allow_exec,
             "write_file" => self.allow_write,
             "list_terminals" | "terminal_open" | "terminal_read" | "terminal_write"
-            | "terminal_resize" | "terminal_close" => self.allow_terminal,
+            | "terminal_close" => self.allow_terminal,
             "read_file" | "list_files" | "stat_file" => true,
             _ => false,
         }
@@ -422,7 +525,7 @@ pub struct Operation {
     pub stdout_cursor: u64,
     pub stderr_cursor: u64,
     pub wait_secs: u64,
-    /// Set by native pickers or validated MCP arguments, never by raw Operation IPC.
+
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub transfer_request: Option<crate::transfers::TransferSpec>,
     pub transfer_id: String,
@@ -430,6 +533,9 @@ pub struct Operation {
     pub priority: Option<i32>,
     pub bandwidth_kib: Option<u64>,
     pub request_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub approval_request: bool,
     pub transfer_group: Option<String>,
     pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,7 +553,7 @@ pub enum FileRequest {
         offset: u64,
         limit: u64,
     },
-    /// Bounded desktop text preview; MCP line pagination stays unchanged.
+
     Preview,
     List {
         offset: u64,
@@ -474,10 +580,9 @@ pub enum WriteMode {
 #[derive(Clone, Serialize, Deserialize, Debug, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileEdit {
-    /// Unique text from the original file. Never include read continuation notices.
     #[schemars(length(min = 1))]
     pub old_text: String,
-    /// Replacement text; empty deletes the matched block.
+
     pub new_text: String,
 }
 #[derive(Clone, Serialize)]
@@ -487,6 +592,8 @@ pub struct TerminalInfo {
     pub name: String,
     pub created_at: String,
     pub alive: bool,
+    #[serde(default)]
+    pub state: String,
 }
 #[derive(Clone, Serialize, Default)]
 pub struct McpStatus {

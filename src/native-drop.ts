@@ -6,7 +6,6 @@ export type NativeDropHandlers = {
   onDrop: (paths: string[]) => void;
 };
 
-/** Native file drops are only available inside the Tauri webview. */
 export function nativeDragDropAvailable() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }

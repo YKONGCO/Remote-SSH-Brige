@@ -68,7 +68,7 @@ fn time_range_filters_count_pages_export_and_delete_across_dates_and_timezones()
             end_time: "2026-11-02T16:00:00.000Z".into(),
             upper: page.upper,
         };
-        // A new record in the same date range is outside the confirmed preview.
+
         let mut later = db.audit("2").unwrap();
         later.id = "later".into();
         db.insert_audit(&later).unwrap();

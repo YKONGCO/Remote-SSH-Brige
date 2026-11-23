@@ -19,9 +19,7 @@ export async function runRecoveryChecks({
   await writeFile(source, bytes);
   fixture.dropTransferWriteAfter = 2 * 1024 * 1024;
   const upload = await value("upload_file", {
-    local_path: source,
-    remote_path: "/workspace/recover.bin",
-    request_id: "recover-upload",
+    items: [{ local_path: source, remote_path: "/workspace/recover.bin" }],
   });
   const uploaded = await wait(upload.transfer_id);
   assert.equal(uploaded.status, "completed", JSON.stringify(uploaded));
@@ -31,20 +29,7 @@ export async function runRecoveryChecks({
       uploaded.resumed_bytes >= 1024 * 1024 &&
       entries.get("/workspace/recover.bin").equals(bytes),
   );
-  check(
-    "Repeated request ID returns the original task",
-    (
-      await value("upload_file", {
-        local_path: source,
-        remote_path: "/workspace/recover.bin",
-        request_id: "recover-upload",
-      })
-    ).transfer_id === upload.transfer_id,
-  );
 
-  let download;
-  // READ offsets include speculative requests, not confirmed client progress.
-  // Hold the tail until transfer.read proves a complete block was retained.
   for (const delay of [0, 50]) {
     const gate = createTransferReadGate(
       "/workspace/recover.bin",
@@ -58,11 +43,10 @@ export async function runRecoveryChecks({
         delay ? "recover-delayed.bin" : "recover.bin",
       );
       const task = await value("download_file", {
-        local_path: destination,
-        remote_path: "/workspace/recover.bin",
-        request_id: delay ? "recover-delayed" : "recover-download",
+        items: [
+          { local_path: destination, remote_path: "/workspace/recover.bin" },
+        ],
       });
-      if (!delay) download = task;
       const retained = await wait(
         task.transfer_id,
         (s) =>
@@ -93,20 +77,15 @@ export async function runRecoveryChecks({
     }
   }
   check(
-    "Completed download request ID is safe to replay without overwrite",
-    (
-      await value("download_file", {
-        local_path: resolve(downloads, "recover.bin"),
-        remote_path: "/workspace/recover.bin",
-        request_id: "recover-download",
-      })
-    ).transfer_id === download.transfer_id,
+    "Completed download preserves the final local file",
+    (await readFile(resolve(downloads, "recover.bin"))).equals(bytes),
   );
 
   fixture.dropCommitResponse = true;
   const uncertain = await value("upload_file", {
-    local_path: source,
-    remote_path: "/workspace/uncertain-upload.bin",
+    items: [
+      { local_path: source, remote_path: "/workspace/uncertain-upload.bin" },
+    ],
   });
   const unknown = await wait(uncertain.transfer_id);
   fixture.dropCommitResponse = false;
@@ -118,7 +97,7 @@ export async function runRecoveryChecks({
   );
   const commits = fixture.commitCalls;
   await value("transfer", {
-    action: "retry",
+    action: "resume",
     transfer_id: uncertain.transfer_id,
   });
   check(
@@ -133,8 +112,12 @@ export async function runRecoveryChecks({
   );
   fixture.transferReadGate = pauseGate;
   const paused = await value("download_file", {
-    local_path: resolve(downloads, "paused.bin"),
-    remote_path: "/workspace/recover.bin",
+    items: [
+      {
+        local_path: resolve(downloads, "paused.bin"),
+        remote_path: "/workspace/recover.bin",
+      },
+    ],
   });
   await wait(
     paused.transfer_id,
@@ -159,12 +142,6 @@ export async function runRecoveryChecks({
     "Paused task retains progress without publishing a target",
     stopped.status === "paused" && stopped.transferred_bytes > 0,
   );
-  await value("transfer", {
-    action: "configure",
-    transfer_id: paused.transfer_id,
-    priority: 5,
-    bandwidth_kib: 8192,
-  });
   fixture.transferReadDelay = 0;
   await value("transfer", {
     action: "resume",
@@ -172,11 +149,9 @@ export async function runRecoveryChecks({
   });
   const continued = await wait(paused.transfer_id);
   check(
-    "Resume honors saved task controls and preserves file content",
+    "Resume preserves file content and checkpoint progress",
     continued.status === "completed" &&
       continued.resumed_bytes > 0 &&
-      continued.priority === 5 &&
-      continued.bandwidth_kib === 8192 &&
       (await readFile(resolve(downloads, "paused.bin"))).equals(bytes),
   );
 
@@ -184,16 +159,20 @@ export async function runRecoveryChecks({
   await mkdir(resolve(tree, "nested"), { recursive: true });
   await mkdir(resolve(tree, "empty"), { recursive: true });
   await writeFile(resolve(tree, "nested", "hello.txt"), "recursive content");
-  const batch = await value("transfer_batch", {
-    direction: "upload",
+  const batch = await value("upload_file", {
     items: [{ local_path: tree, remote_path: "/workspace/batch-tree" }],
     recursive: true,
     skip_existing: true,
-    request_id: "tree-upload",
   });
   assert.ok(
     batch.tasks.every((t) => t.transfer_id),
     JSON.stringify(batch),
+  );
+  check(
+    "Batch response includes a parent aggregate and policy",
+    batch.group?.group_id === batch.group_id &&
+      batch.group.total === batch.tasks.length &&
+      batch.group.batch_policy !== undefined,
   );
   const results = await Promise.all(
     batch.tasks.map((t) => wait(t.transfer_id)),
@@ -205,8 +184,34 @@ export async function runRecoveryChecks({
       entries.get("/workspace/batch-tree/nested/hello.txt").toString() ===
         "recursive content",
   );
-  const batchDownload = await value("transfer_batch", {
-    direction: "download",
+  const groupRead = await value("transfer", {
+    action: "read",
+    group_id: batch.group_id,
+  });
+  check(
+    "Group read returns the aggregate and every child task",
+    groupRead.tasks.length === batch.tasks.length &&
+      groupRead.group.status === "completed",
+  );
+  const groupPause = await value("transfer", {
+    action: "pause",
+    group_id: batch.group_id,
+  });
+  const groupResume = await value("transfer", {
+    action: "resume",
+    group_id: batch.group_id,
+  });
+  const groupCancel = await value("transfer", {
+    action: "cancel",
+    group_id: batch.group_id,
+  });
+  check(
+    "Group pause, resume and cancel route by group_id",
+    groupPause.paused === 0 &&
+      groupResume.resumed === 0 &&
+      groupCancel.cancelled === 0,
+  );
+  const batchDownload = await value("download_file", {
     items: [
       {
         local_path: resolve(downloads, "tree"),
@@ -231,8 +236,7 @@ export async function runRecoveryChecks({
         "utf8",
       )) === "recursive content",
   );
-  const skip = await value("transfer_batch", {
-    direction: "download",
+  const skip = await value("download_file", {
     items: [
       {
         local_path: resolve(downloads, "tree", "nested", "hello.txt"),
@@ -243,7 +247,7 @@ export async function runRecoveryChecks({
   });
   check(
     "Existing identical content is skipped after checksum verification",
-    (await wait(skip.tasks[0].transfer_id)).phase === "skipped",
+    (await wait(skip.transfer_id)).phase === "skipped",
   );
 
   fixture.transferReadDelay = 50;
@@ -251,8 +255,12 @@ export async function runRecoveryChecks({
   for (let i = 0; i < 6; i++)
     queued.push(
       await value("download_file", {
-        local_path: resolve(downloads, `queued-${i}.bin`),
-        remote_path: "/workspace/recover.bin",
+        items: [
+          {
+            local_path: resolve(downloads, `queued-${i}.bin`),
+            remote_path: "/workspace/recover.bin",
+          },
+        ],
       }),
     );
   const listing = (
@@ -278,8 +286,12 @@ export async function runRecoveryChecks({
   );
   fixture.transferReadGate = restartGate;
   const recovery = await value("download_file", {
-    local_path: resolve(downloads, "restart.bin"),
-    remote_path: "/workspace/recover.bin",
+    items: [
+      {
+        local_path: resolve(downloads, "restart.bin"),
+        remote_path: "/workspace/recover.bin",
+      },
+    ],
   });
   await wait(
     recovery.transfer_id,

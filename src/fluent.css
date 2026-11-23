@@ -1,4 +1,3 @@
-/* Application components use the CC Switch palette in theme-tokens.css. */
 @layer fluent {
   :root {
     --font-interface:
@@ -52,7 +51,6 @@
     font-family: var(--font-code);
   }
 
-  /* Window, navigation and page scaffolding. */
   .app {
     border: 0;
     background: var(--surface-0);
@@ -178,7 +176,6 @@
     color: var(--ink-secondary) !important;
   }
 
-  /* One control system: buttons, inputs, Radix selects, tabs and menus. */
   .fluent-button,
   .btn {
     border: 1px solid transparent;
@@ -527,7 +524,6 @@
     background: var(--control-off);
   }
 
-  /* Server and file lists, editors, history and settings. */
   .server-list {
     gap: 8px;
     background: transparent;
@@ -767,7 +763,6 @@
     background: var(--warning-text);
   }
 
-  /* Dialogs, permission prompts, error/info bars and notifications. */
   .fluent-overlay,
   .overlay {
     background: var(--overlay-fill);
@@ -866,7 +861,6 @@
     color: var(--error-text);
   }
 
-  /* Terminal chrome and xterm canvas share the resolved terminal palette. */
   .terminal-window,
   .terminal-host,
   .terminal-empty {
@@ -1362,7 +1356,6 @@
     padding-bottom: 4px;
   }
 
-  /* MCP shares the same card, action and status colors as the rest of the app. */
   .mcp-section-icon {
     color: var(--accent-text);
     background: var(--accent-subtle);

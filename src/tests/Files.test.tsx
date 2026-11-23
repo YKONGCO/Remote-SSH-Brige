@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import {
@@ -310,7 +309,7 @@ test("Escape closes editor search before closing the file dialog", async () => {
   expect(screen.queryByRole("dialog")).toBeNull();
 });
 
-test("transfer controls pause, resume, retry and persist priority without replaying file selection", async () => {
+test("transfer controls pause, resume and persist priority without replaying file selection", async () => {
   const tasks: FileTransfer[] = ["active", "failed"].map((id) => ({
     transfer_id: id,
     server_id: "server",
@@ -333,8 +332,7 @@ test("transfer controls pause, resume, retry and persist priority without replay
       return { transfers: tasks.map((t) => ({ ...t })) } as never;
     const task = tasks.find((t) => t.transfer_id === args.transferId)!;
     if (args.action === "pause") task.status = "paused";
-    if (args.action === "resume" || args.action === "retry")
-      task.status = "running";
+    if (args.action === "resume") task.status = "running";
     if (args.action === "configure") task.priority = Number(args.priority);
     task.phase = task.status === "running" ? "transferring" : task.status;
     return { ...task } as never;
@@ -375,7 +373,7 @@ test("transfer controls pause, resume, retry and persist priority without replay
   });
   expect(api).toHaveBeenCalledWith("transfer", {
     serverId: "server",
-    action: "retry",
+    action: "resume",
     transferId: "failed",
   });
 });

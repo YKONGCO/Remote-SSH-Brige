@@ -34,13 +34,12 @@ export const permissionGroups = [
   {
     id: "terminal",
     title: "终端操作",
-    description: "列出、打开、读取、输入、调整尺寸和关闭终端",
+    description: "列出、打开、读取、输入和关闭终端",
     operations: [
       "list_terminals",
       "terminal_open",
       "terminal_read",
       "terminal_write",
-      "terminal_resize",
       "terminal_close",
     ],
   },
@@ -106,11 +105,9 @@ const terminalPermissionKinds = [
   "terminal_open",
   "terminal_read",
   "terminal_write",
-  "terminal_resize",
   "terminal_close",
 ];
 
-// Absent permissions belong to the legacy three-switch configuration.
 export function selectedMcpPermissions(server: Server): string[] {
   if (server.mcp_permissions != null)
     return server.mcp_permissions.filter((permission) =>

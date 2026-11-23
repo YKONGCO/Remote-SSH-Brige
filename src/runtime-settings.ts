@@ -1,100 +1,83 @@
-import commandPresets from "./command-presets.json";
-
 export const MAX_TRANSFER_MIB = 8_589_934_591;
 export const RUNTIME_SETTINGS_CHANGED = "runtime-settings-changed";
+export const SETTINGS_VERSION = 4;
 export interface CommandPolicy {
-  execution_mode?: "disabled" | "whitelist" | "unrestricted";
-  allowed_commands?: string[];
-  blocked_commands?: string[];
-  allow_advanced_shell?: boolean;
-  diagnostic_only: boolean;
+  protected_commands: string[];
   allow_pipes: boolean;
   allow_redirection: boolean;
   allow_compound: boolean;
   allow_scripts: boolean;
   allow_substitution: boolean;
-  allow_mcp_terminal: boolean;
+  exec_disabled: boolean;
+  legacy_whitelist?: string[] | null;
 }
-export { commandPresets };
 export const MAX_COMMAND_RULES = 4096;
-export const defaultAllowedCommands = [
-  ...new Set(commandPresets.flatMap((preset) => preset.commands)),
-];
-
 export function parseCommandList(value: string): string[] {
   return [...new Set(value.split(/[\s,;，；、]+/u).filter(Boolean))];
 }
-export function commandMode(policy: CommandPolicy) {
+function validRule(name: unknown) {
   return (
-    policy.execution_mode ??
-    (policy.diagnostic_only ? "whitelist" : "unrestricted")
+    typeof name === "string" &&
+    name.length > 0 &&
+    name.length <= 512 &&
+    (name === ":" || /^[\p{L}\p{N}_.+\-/]+$/u.test(name)) &&
+    (!name.includes("/") ||
+      (name.startsWith("/") &&
+        name
+          .split("/")
+          .slice(1)
+          .every((part) => !!part && part !== "." && part !== "..")))
+  );
+}
+export function validCommandRules(rules: unknown) {
+  return (
+    Array.isArray(rules) &&
+    rules.length <= MAX_COMMAND_RULES &&
+    rules.every(validRule)
   );
 }
 export function advancedShell(policy: CommandPolicy) {
   return (
-    policy.allow_advanced_shell ??
-    (policy.allow_pipes ||
-      policy.allow_redirection ||
-      policy.allow_compound ||
-      policy.allow_scripts ||
-      policy.allow_substitution)
-  );
-}
-export function validCommandLists(allowed: unknown, blocked: unknown) {
-  return [allowed, blocked].every(
-    (list) =>
-      Array.isArray(list) &&
-      list.length <= MAX_COMMAND_RULES &&
-      list.every(
-        (name: unknown) =>
-          typeof name === "string" &&
-          name.length > 0 &&
-          name.length <= 512 &&
-          (name === ":" || /^[\p{L}\p{N}_.+\-/]+$/u.test(name)) &&
-          (!name.includes("/") ||
-            (name.startsWith("/") &&
-              name
-                .split("/")
-                .slice(1)
-                .every((part) => !!part && part !== "." && part !== ".."))),
-      ),
+    policy.allow_pipes &&
+    policy.allow_redirection &&
+    policy.allow_compound &&
+    policy.allow_scripts &&
+    policy.allow_substitution
   );
 }
 export const defaultCommandPolicy: CommandPolicy = {
-  diagnostic_only: true,
-  allow_pipes: false,
-  allow_redirection: false,
-  allow_compound: false,
-  allow_scripts: false,
-  allow_substitution: false,
-  allow_mcp_terminal: false,
+  protected_commands: [],
+  allow_pipes: true,
+  allow_redirection: true,
+  allow_compound: true,
+  allow_scripts: true,
+  allow_substitution: true,
+  exec_disabled: false,
+  legacy_whitelist: null,
 };
 export function effectiveCommandPolicy(
   settings: RuntimeSettings,
 ): CommandPolicy {
-  if (settings.command_policy)
-    return { ...defaultCommandPolicy, ...settings.command_policy };
-  if (settings.block_dangerous_commands) return { ...defaultCommandPolicy };
-  return {
-    diagnostic_only: false,
-    allow_pipes: true,
-    allow_redirection: true,
-    allow_compound: true,
-    allow_scripts: true,
-    allow_substitution: true,
-    allow_mcp_terminal: true,
-  };
+  return { ...defaultCommandPolicy, ...settings.command_policy };
 }
+export interface AdvancedMcpTools {
+  terminal: boolean;
+  port_forward: boolean;
+}
+export const defaultAdvancedMcpTools: AdvancedMcpTools = {
+  terminal: false,
+  port_forward: true,
+};
 export interface RuntimeSettings {
+  settings_version?: number;
   close_to_tray: boolean;
   mcp_auto_start: boolean;
   mcp_host: string;
   mcp_port: number;
   deletion_protection: boolean;
-  block_dangerous_commands: boolean;
   command_policy?: CommandPolicy | null;
   remote_read_only: boolean;
-  approval_mode: "off" | "mcp" | "all";
+  approval_mode: boolean;
   approval_timeout_secs: number;
   upload_limit_mib: number;
   download_limit_mib: number;
@@ -107,6 +90,7 @@ export interface RuntimeSettings {
   command_timeout_secs: number;
   exec_timeout_to_job: boolean;
   max_terminals: number;
+  advanced_mcp_tools: AdvancedMcpTools;
 }
 export interface TransferSettings {
   max_concurrent: number;
@@ -128,14 +112,14 @@ export const defaultTransferSettings: TransferSettings = {
   bandwidth_kib: 0,
 };
 export const defaultRuntimeSettings: RuntimeSettings = {
+  settings_version: SETTINGS_VERSION,
   close_to_tray: true,
   mcp_auto_start: true,
   mcp_host: "127.0.0.1",
   mcp_port: 18920,
   deletion_protection: true,
-  block_dangerous_commands: true,
   remote_read_only: false,
-  approval_mode: "off",
+  approval_mode: true,
   approval_timeout_secs: 120,
   upload_limit_mib: 0,
   download_limit_mib: 0,
@@ -148,7 +132,14 @@ export const defaultRuntimeSettings: RuntimeSettings = {
   command_timeout_secs: 30,
   exec_timeout_to_job: false,
   max_terminals: 32,
+  advanced_mcp_tools: { ...defaultAdvancedMcpTools },
 };
 export type NumericRuntimeSetting = {
   [K in keyof RuntimeSettings]-?: RuntimeSettings[K] extends number ? K : never;
 }[keyof RuntimeSettings];
+
+export interface BuiltinRule {
+  command: string;
+  arguments?: string[];
+  reason: string;
+}

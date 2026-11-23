@@ -1769,7 +1769,6 @@
   }
 }
 
-/* Dense rows retain two readable lines and keep all actions on a fixed baseline. */
 @layer utilities {
   .server-card {
     min-height: 60px;
@@ -1921,7 +1920,6 @@
   }
 }
 
-/* Use the available width rather than allowing table content to size the window. */
 @layer utilities {
   .app,
   .main-shell,
@@ -2307,7 +2305,6 @@
   }
 }
 
-/* Headers live outside the scroll containers so their position never depends on content. */
 @layer utilities {
   .app {
     grid-template-rows: 36px minmax(0, 1fr);
@@ -3551,7 +3548,7 @@
     }
   }
 }
-/* Fixed-size file streams are managed by the backend; only progress is rendered here. */
+
 .file-toolbar .path-input,
 .file-toolbar .file-filter,
 .file-toolbar > .btn,
@@ -4557,7 +4554,6 @@
   }
 }
 
-/* Compact command and transfer-directory editors. */
 .settings-editor-dialog {
   border-radius: 10px;
   box-shadow: var(--shadow-lg);
@@ -4609,11 +4605,12 @@
   color: var(--ink-secondary);
 }
 .command-list-modal {
-  height: min(700px, calc(100dvh - 48px));
+  height: auto;
+  max-height: calc(100dvh - 48px);
 }
 .command-list-modal > .modal-layout {
   flex: 1;
-  height: 100%;
+  height: auto;
 }
 .command-list-modal .modal-body {
   display: flex;
@@ -4867,15 +4864,88 @@
 }
 .command-list-modal .command-list-editors {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 12px;
   margin: 0;
   flex: 0 0 auto;
-  height: clamp(220px, 33dvh, 280px);
-  min-height: 180px;
-  max-height: 60%;
+  height: clamp(140px, 18dvh, 180px);
+  min-height: 120px;
+  max-height: 55%;
   resize: vertical;
   overflow: hidden;
+}
+.command-builtin {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+.protected-rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 120px;
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--surface-1);
+}
+.protected-rule-list li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12px;
+}
+.protected-rule-list li:last-child {
+  border-bottom: 0;
+}
+.protected-rule-list code {
+  flex: 0 0 auto;
+  min-width: 120px;
+  font-family: var(--font-code);
+  font-size: 12px;
+  color: var(--ink-primary);
+}
+.protected-rule-list span {
+  color: var(--ink-secondary);
+}
+.approval-rules {
+  font-size: 12px;
+}
+.approval-rules > p {
+  margin: 0 0 6px;
+  color: var(--ink-secondary);
+}
+.approval-rules ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.approval-rules li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--hairline);
+  align-items: baseline;
+}
+.approval-rules li:last-child {
+  border-bottom: 0;
+}
+.approval-rules strong {
+  font-weight: 600;
+  color: var(--ink-primary);
+}
+.approval-rules code {
+  font-family: var(--font-code);
+  color: var(--accent-text);
+}
+.approval-rules span {
+  color: var(--ink-secondary);
 }
 .command-list-modal .command-list-editors label {
   display: grid;
@@ -5120,7 +5190,7 @@
     font-size: 12px;
   }
 }
-/* Per-task controls stay compact inside the transfer menu. */
+
 .transfer-task-options {
   margin: 8px 0 0 36px;
   padding: 8px;

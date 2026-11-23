@@ -1,5 +1,3 @@
-//! MCP rendering is separate from execution. Failures are one short sentence;
-//! raw text results keep their metadata separate from the original body.
 use crate::{model::Operation, operation_error};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
@@ -44,21 +42,38 @@ pub fn compact_error(error: &Value) -> Value {
         "partial",
         "outcome_unknown",
         "removed_entries",
+        "command_sent",
+        "next_tool",
+        "next_action",
+        "reason",
+        "risk",
+        "uncertain",
+        "matched_rules",
+        "recovery",
+        "reconnect_required",
     ] {
         if let Some(field) = details.get(key) {
             value[key] = field.clone();
         }
     }
     let hint = match code {
+        "APPROVAL_REQUIRED" => Some(
+            "Call exec_approved with the same server_id, command and timeout_secs, then ask the desktop user to approve it",
+        ),
         "COMMAND_POLICY_DENIED" => {
-            Some("Review this executable or shell rule in server command settings")
+            Some("Adjust the command or the protected-command settings; approval cannot override this denial")
         }
+        "EXEC_DISABLED" => Some("Enable command execution in Settings first"),
         "MCP_PERMISSION_DENIED" | "PERMISSION_DENIED" => {
             Some("Check the operation's server permissions")
         }
         "LOCAL_PATH_DENIED" => Some("Configure the local transfer roots in Settings"),
         "PATH_OUTSIDE_ROOT" => Some("Use a path inside the server file root"),
         "COMMIT_STATUS_UNKNOWN" => Some("Inspect the destination before retrying"),
+        "SSH_SESSION_BUSY" => Some("Wait for a running command or job to finish, then retry"),
+        "SSH_CHANNEL_FAILED" => Some("The command was not sent; retry when the connection is healthy"),
+        "SSH_SUBMIT_FAILED" => Some("Do not retry blindly; inspect the server for side effects first"),
+        "SSH_DISCONNECTED" => Some("The command may have run; inspect the server before retrying"),
         _ => None,
     };
     if let Some(hint) = hint {
@@ -67,7 +82,6 @@ pub fn compact_error(error: &Value) -> Value {
     value
 }
 
-/// Full diagnostics stay in audit records; MCP only needs the actionable cause.
 fn error_text(error: &Value) -> String {
     let details = &error["details"];
     let mut text = if let Some(permissions) = details["missing_permissions"].as_array() {
@@ -133,7 +147,6 @@ fn native_error_text(error: &Value) -> Option<String> {
     )
 }
 
-/// Keep the offending field or type, without Serde's full expected-field list.
 pub fn parameter_error(text: &str) -> String {
     let reason = text
         .strip_prefix("failed to deserialize parameters: ")
@@ -156,7 +169,6 @@ pub fn normalize_tool_result(mut result: CallToolResult) -> CallToolResult {
             .filter(|error| error.get("code").is_some())
             .map(|error| error.to_string());
         let message = if let Some(json) = policy_json {
-            // Bound the message, never truncate the JSON or the original command.
             json
         } else if text.starts_with("failed to deserialize parameters: ") {
             parameter_error(&text)
@@ -169,7 +181,6 @@ pub fn normalize_tool_result(mut result: CallToolResult) -> CallToolResult {
     result
 }
 
-/// Status queries can succeed while the underlying transfer or session failed.
 fn compact_errors(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -257,34 +268,43 @@ mod tests {
     }
 
     #[test]
-    fn policy_failure_only_returns_the_specific_reason() {
+    fn approval_required_is_compact_but_names_the_retry_tool_and_rules() {
         let command = "find /tmp -maxdepth 1 -name 'wlx*' -exec rm -rf {} ';'";
         let op = Operation {
             kind: "exec".into(),
             command: command.into(),
             ..Default::default()
         };
-        let settings = crate::model::RuntimeSettings {
-            command_policy: Some(crate::model::CommandPolicy {
-                execution_mode: Some("whitelist".into()),
-                allow_advanced_shell: Some(true),
-                ..Default::default()
+        let assessment =
+            crate::command_policy::assess(command, &crate::model::RuntimeSettings::default());
+        assert_eq!(
+            assessment.decision,
+            crate::command_policy::Decision::RequireApproval
+        );
+        let error = operation_error::error_with_details(
+            "APPROVAL_REQUIRED",
+            "This command is protected and requires one-time approval",
+            json!({
+                "command":command,
+                "reason":assessment.reason,
+                "risk":assessment.risk,
+                "matched_rules":assessment.matched_rules,
+                "next_tool":"exec_approved",
+                "command_sent":false,
+                "outcome_unknown":false,
             }),
-            ..Default::default()
-        };
-        let error = crate::security::check(&settings, &op, "mcp").unwrap_err();
-        let diagnostic = operation_error::error_response(&error, &op);
-        assert!(diagnostic["details"].get("command_policy").is_none());
-        assert!(diagnostic["details"].get("command_protection").is_none());
+        );
         let result = wire(normalize_tool_result(failure(&op, &error)));
         assert_eq!(result["isError"], true);
         assert!(result.get("structuredContent").is_none());
         let data: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            data,
-            json!({"code":"COMMAND_POLICY_DENIED", "retryable":false,"hint":"Review this executable or shell rule in server command settings", "message":"find delete and execute actions are blocked"})
-        );
+        assert_eq!(data["code"], "APPROVAL_REQUIRED");
+        assert_eq!(data["retryable"], false);
+        assert_eq!(data["next_tool"], "exec_approved");
+        assert!(!data["matched_rules"].as_array().unwrap().is_empty());
+        assert!(data["hint"].as_str().unwrap().contains("exec_approved"));
+        assert!(data.get("details").is_none());
     }
 
     #[test]

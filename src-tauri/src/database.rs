@@ -90,7 +90,7 @@ impl Database {
             ],
             |row| row.get(0),
         )?;
-        // List pages never read or deserialize response payloads.
+
         let columns = AUDIT_COLUMNS.replace("response_json", "NULL");
         let mut statement = self.connection.prepare(&format!(
             "SELECT {columns} FROM audit_entries WHERE {AUDIT_FILTER} ORDER BY sequence DESC LIMIT ?6 OFFSET ?7"
@@ -152,16 +152,28 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        let settings: crate::model::RuntimeSettings = json
-            .map(|s| serde_json::from_str(&s))
-            .transpose()?
-            .unwrap_or_default();
+        let Some(json) = json else {
+            return Ok(crate::model::RuntimeSettings::default());
+        };
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let previous_version = value
+            .get("settings_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let migrated = crate::model::migrate_settings_value(value)?;
+        let settings: crate::model::RuntimeSettings =
+            serde_json::from_value(migrated).context("无法读取运行时设置；旧配置迁移失败")?;
         settings.validate()?;
+        if previous_version < crate::model::SETTINGS_VERSION as u64 {
+            self.save_settings(&settings)?;
+        }
         Ok(settings)
     }
     pub fn save_settings(&self, settings: &crate::model::RuntimeSettings) -> Result<()> {
+        let mut settings = settings.clone();
+        settings.settings_version = crate::model::SETTINGS_VERSION;
         settings.validate()?;
-        self.connection.execute("INSERT INTO metadata(key,value) VALUES('runtime_settings',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(settings)?])?;
+        self.connection.execute("INSERT INTO metadata(key,value) VALUES('runtime_settings',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&settings)?])?;
         Ok(())
     }
     pub fn open(dir: &Path) -> Result<Self> {
@@ -256,7 +268,7 @@ impl Database {
             "DELETE FROM audit_entries WHERE source='mcp' AND sequence <= ?3 AND julianday(time) >= julianday(?1) AND julianday(time) < julianday(?2)",
             params![range.start_time, range.end_time, range.upper],
         )?;
-        // Read the replacement cache before committing, so any failure rolls back deletion.
+
         let recent = {
             let mut statement = transaction.prepare(&format!(
                 "SELECT {AUDIT_COLUMNS} FROM audit_entries WHERE source='mcp' ORDER BY sequence DESC LIMIT 500"
@@ -312,7 +324,6 @@ fn server_row(row: &Row<'_>) -> rusqlite::Result<Server> {
         .map(|json| {
             serde_json::from_str::<Vec<String>>(&json)
                 .map(|mut permissions| {
-                    // Retire this grant without broadening existing read permissions.
                     permissions.retain(|permission| permission != "preview_file");
                     permissions
                 })

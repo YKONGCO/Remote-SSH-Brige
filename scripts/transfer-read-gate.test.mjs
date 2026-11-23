@@ -13,7 +13,6 @@ test("prefetch beyond a cutoff waits for explicit checkpoint confirmation", asyn
     client,
     reply: () => replies++,
   });
-  // The server can receive this before the application has written block one.
   assert.equal(gate.hold(request("/file", 4 * 1024 * 1024)), true);
   await gate.waitUntilBlocked();
   assert.equal(disconnects, 0);
@@ -21,7 +20,6 @@ test("prefetch beyond a cutoff waits for explicit checkpoint confirmation", asyn
   assert.equal(gate.hold(request("/other", 4 * 1024 * 1024)), false);
   assert.equal(gate.hold(request("/file", 0)), false);
   assert.equal(gate.hold(request("/file", 3 * 1024 * 1024)), true);
-  // The caller has now observed a verified client block via transfer.read.
   gate.disconnect();
   gate.disconnect();
   gate.release();

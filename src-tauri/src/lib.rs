@@ -1,7 +1,8 @@
 mod audit_input;
 pub mod clients;
-mod command_policy;
+pub mod command_policy;
 pub mod database;
+pub mod execution;
 pub mod file_tools;
 pub mod jobs;
 pub mod mcp;
@@ -11,12 +12,17 @@ pub mod model;
 pub mod operation_error;
 pub mod safe_remove;
 pub mod security;
+pub mod sftp_session;
 pub mod ssh;
+pub mod ssh_session;
 pub mod startup;
 pub mod state;
 pub mod terminal;
-pub mod transfer_batch;
-pub(crate) mod transfer_io;
+pub(crate) mod transfer_checkpoint;
+pub(crate) mod transfer_engine;
+pub mod transfer_planner;
+pub(crate) mod transfer_scheduler;
+pub(crate) mod transfer_verifier;
 pub mod transfers;
 pub mod tunnels;
 
@@ -233,10 +239,12 @@ mod desktop {
         .map(Some)
         .map_err(|e| format!("{e:#}"))
     }
-    fn single_regular_file(path: &str) -> bool {
-        std::fs::symlink_metadata(path)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
+    fn batch_result(result: serde_json::Value) -> serde_json::Value {
+        if result.get("group_id").is_some() {
+            result
+        } else {
+            serde_json::json!({"tasks":[result],"queued":1,"rejected":0,"group":null})
+        }
     }
     #[tauri::command]
     async fn upload_paths(
@@ -246,49 +254,24 @@ mod desktop {
         paths: Vec<String>,
     ) -> Result<serde_json::Value, String> {
         let items =
-            transfer_batch::upload_items(&remote_dir, paths).map_err(|e| format!("{e:#}"))?;
-        if items.len() == 1 && single_regular_file(&items[0].local_path) {
-            let item = &items[0];
-            let spec = transfers::TransferSpec {
-                local_path: item.local_path.clone(),
-                remote_path: item.remote_path.clone(),
-                overwrite: false,
-                size: None,
-                sha256: None,
-                create_parents: false,
-                skip_existing: true,
-                directory: false,
-            };
-            let task = transfers::start(
-                state.inner().clone(),
-                model::Operation {
-                    kind: "upload_file".into(),
-                    server_id,
-                    transfer_request: Some(spec),
-                    ..Default::default()
-                },
-                "desktop",
-            )
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-            return Ok(serde_json::json!({
-                "tasks": [task],
-                "queued": 1,
-                "rejected": 0
-            }));
-        }
-        let args = transfer_batch::BatchArgs {
+            transfer_planner::upload_items(&remote_dir, paths).map_err(|e| format!("{e:#}"))?;
+        let request = transfer_planner::TransferRequest {
             server_id,
-            direction: transfer_batch::Direction::Upload,
             items,
             recursive: true,
             overwrite: false,
             skip_existing: true,
-            request_id: None,
         };
-        transfer_batch::start(state.inner().clone(), args, "desktop")
-            .await
-            .map_err(|e| format!("{e:#}"))
+        let result = transfer_planner::start(
+            state.inner().clone(),
+            transfer_planner::Direction::Upload,
+            request,
+            transfer_planner::StartOptions::default(),
+            "desktop",
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(batch_result(result))
     }
     #[tauri::command]
     async fn transfer(
@@ -373,7 +356,7 @@ mod desktop {
             if name.contains(['\\', '/', '\0']) {
                 return Err("Invalid filename".into());
             }
-            items.push(transfer_batch::BatchItem {
+            items.push(transfer_planner::TransferItem {
                 local_path: if upload {
                     path.to_string_lossy().into_owned()
                 } else {
@@ -386,23 +369,27 @@ mod desktop {
                 },
             });
         }
-        let args = transfer_batch::BatchArgs {
+        let request = transfer_planner::TransferRequest {
             server_id,
-            direction: if upload {
-                transfer_batch::Direction::Upload
-            } else {
-                transfer_batch::Direction::Download
-            },
             items,
             recursive: directory,
             overwrite: false,
             skip_existing: true,
-            request_id: None,
         };
-        transfer_batch::start(state.inner().clone(), args, "desktop")
-            .await
-            .map(Some)
-            .map_err(|e| format!("{e:#}"))
+        let result = transfer_planner::start(
+            state.inner().clone(),
+            if upload {
+                transfer_planner::Direction::Upload
+            } else {
+                transfer_planner::Direction::Download
+            },
+            request,
+            transfer_planner::StartOptions::default(),
+            "desktop",
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(Some(batch_result(result)))
     }
     #[tauri::command]
     fn reveal_transfer(
@@ -440,6 +427,10 @@ mod desktop {
     #[tauri::command]
     fn runtime_settings(state: Shared<'_>) -> model::RuntimeSettings {
         state.settings.lock().unwrap().clone()
+    }
+    #[tauri::command]
+    fn protected_rules() -> serde_json::Value {
+        serde_json::json!({"builtin": command_policy::builtin_rules()})
     }
     #[tauri::command]
     fn list_jobs(state: Shared<'_>) -> serde_json::Value {
@@ -504,7 +495,6 @@ mod desktop {
             };
             let result = shared.jobs.operate_desktop(&op);
             if op.job_action == "close" {
-                // Local owners can close a retained connection after its server was disabled or removed.
                 let server = shared.server(&server_id).unwrap_or_else(|_| model::Server {
                     id: server_id.clone(),
                     name: server_id,
@@ -685,6 +675,7 @@ mod desktop {
                 mcp_clients,
                 configure_mcp_client,
                 runtime_settings,
+                protected_rules,
                 list_jobs,
                 list_port_forwards,
                 delete_port_forward,

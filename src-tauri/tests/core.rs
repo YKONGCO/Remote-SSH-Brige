@@ -581,7 +581,7 @@ async fn transfer_limits_apply_to_desktop_and_mcp_before_network_access() {
         for kind in ["upload", "write_file"] {
             if source == "mcp" && kind == "upload" {
                 continue;
-            } // upload remains desktop-only.
+            }
             let bytes = vec![b'x'; 1024 * 1024 + 1];
             let content = if kind == "upload" {
                 STANDARD.encode(bytes)
@@ -767,7 +767,7 @@ async fn mcp_start_stop_and_restart_releases_listener() {
             String::from_utf8_lossy(&response[..count])
         );
     }
-    // Session workers release their shared database after cancellation is observed.
+
     remote_ssh_brige_lib::mcp::stop(state.clone())
         .await
         .unwrap();
@@ -1067,7 +1067,7 @@ fn sqlite_retains_audit_history_beyond_recent_list_and_after_server_removal() {
     state.export_audits(&query, &output).unwrap();
     let exported: Vec<remote_ssh_brige_lib::model::Audit> =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    assert_eq!(exported.len(), 503); // Export ignores the visible page's offset/limit.
+    assert_eq!(exported.len(), 503);
     assert!(exported.iter().all(|entry| entry.response.is_some()));
     assert!(state.snapshot_with_audits(false)["audits"]
         .as_array()
@@ -1140,7 +1140,7 @@ fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
     query.search = "needle_119".into();
     assert_eq!(state.audit_page(&query).unwrap().total, 1);
     query.search = "%".into();
-    assert_eq!(state.audit_page(&query).unwrap().total, 0); // Search characters are literal.
+    assert_eq!(state.audit_page(&query).unwrap().total, 0);
     drop(state);
     cleanup(dir);
 }

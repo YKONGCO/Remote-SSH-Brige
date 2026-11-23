@@ -1,4 +1,4 @@
-// Persistent task lifecycle. Included in transfers.rs to keep manager internals private.
+
 impl Handle {
     pub(crate) fn validate_server(&self, server: &Server) -> Result<()> {
         anyhow::ensure!(
@@ -11,9 +11,6 @@ impl Handle {
             "Server configuration changed; inspect retained temporary files manually"
         );
         Ok(())
-    }
-    pub(crate) fn retry_count(&self) -> u32 {
-        self.snapshot.lock().unwrap().retry_count
     }
     pub(crate) fn persist(&self) -> Result<()> {
         let _serial = self.journal_lock.lock().unwrap();
@@ -33,6 +30,27 @@ impl Handle {
         result
     }
     pub(crate) fn phase(&self, phase: &str) {
+        let now = Instant::now();
+        let previous = {
+            let mut current = self.phase_started.lock().unwrap();
+            let previous = current.take();
+            if phase != "queued" {
+                *current = Some((phase.to_string(), now));
+            }
+            previous
+        };
+        if let Some((name, started)) = previous {
+            let elapsed = now.duration_since(started).as_millis() as u64;
+            match name.as_str() {
+                "transferring" => self.update(|s| {
+                    s.transfer_ms = s.transfer_ms.saturating_add(elapsed);
+                }),
+                "verifying" => self.update(|s| {
+                    s.verify_ms = s.verify_ms.saturating_add(elapsed);
+                }),
+                _ => {}
+            }
+        }
         self.update(|s| s.phase = phase.into());
     }
     pub(crate) fn report(&self, bytes: u64, total: u64, started: Instant, initial: u64) {
@@ -58,6 +76,7 @@ impl Handle {
         self.update(|s| {
             s.resumed_bytes = bytes;
             s.transferred_bytes = bytes;
+            s.verified_bytes = bytes;
         });
     }
     pub(crate) fn digest(&self, digest: String) {
@@ -65,25 +84,17 @@ impl Handle {
     }
 }
 
-struct RunningGuard {
-    state: Weak<AppState>,
-    id: String,
-}
-impl Drop for RunningGuard {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.upgrade() {
-            state.transfers.running.lock().unwrap().remove(&self.id);
-        }
-    }
-}
-
 impl TransferManager {
+    pub(crate) fn configure(&self, settings: &TransferSettings) {
+        self.scheduler.configure(settings);
+    }
     pub fn pause_all(&self) {
         for h in self.items.lock().unwrap().values() {
             if h.control
                 .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.scheduler.cancel(&h.snapshot().transfer_id);
                 h.update(|s| {
                     s.status = "paused".into();
                     s.phase = "paused".into();
@@ -94,6 +105,8 @@ impl TransferManager {
     }
     pub fn restore(&self, state: &Arc<AppState>) -> Result<()> {
         *self.state.lock().unwrap() = Arc::downgrade(state);
+        self.scheduler
+            .configure(&state.settings.lock().unwrap().transfers);
         let records = state.database.lock().unwrap().transfers()?;
         let mut items = self.items.lock().unwrap();
         for record in records {
@@ -130,74 +143,92 @@ impl TransferManager {
                 server_identity: Mutex::new(server),
                 journal_lock: Mutex::new(()),
                 lifecycle: tokio::sync::Mutex::new(()),
+                window: Mutex::new(Default::default()),
+                last_progress: Mutex::new(Instant::now()),
+                phase_started: Mutex::new(None),
+                queued_recorded: std::sync::atomic::AtomicBool::new(false),
             });
             items.insert(id, h);
         }
         Ok(())
     }
 
-    async fn acquire(&self, state: &Arc<AppState>, h: &Arc<Handle>) -> Result<RunningGuard> {
-        let id = h.snapshot().transfer_id;
-        loop {
-            h.check_cancelled()?;
-            let settings = state.settings.lock().unwrap().transfers.clone();
-            {
-                let items = self.items.lock().unwrap();
-                let mut running = self.running.lock().unwrap();
-                let endpoint = |item: &Handle| {
-                    item.server_identity
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|s| (s.host.clone(), s.port, s.username.clone()))
-                };
-                let own_endpoint = endpoint(h);
-                let used = running
-                    .iter()
-                    .filter(|id| {
-                        items
-                            .get(*id)
-                            .is_some_and(|item| endpoint(item) == own_endpoint)
-                    })
-                    .count();
-                let own = h.snapshot();
-                let earlier = running.len() < settings.max_concurrent
-                    && used < settings.per_server_concurrent
-                    && items.values().any(|item| {
-                        let v = item.snapshot();
-                        !running.contains(&v.transfer_id)
-                            && item.worker_active.load(Ordering::Acquire)
-                            && item.control.load(Ordering::Acquire) == 0
-                            && v.status == "queued"
-                            && (v.priority > own.priority
-                                || (v.priority == own.priority && v.created_at < own.created_at))
-                            && (endpoint(item) == own_endpoint
-                                || running.len() + 1 >= settings.max_concurrent)
-                            && running
-                                .iter()
-                                .filter(|id| {
-                                    items
-                                        .get(*id)
-                                        .is_some_and(|active| endpoint(active) == endpoint(item))
-                                })
-                                .count()
-                                < settings.per_server_concurrent
-                    });
-                if running.len() < settings.max_concurrent
-                    && used < settings.per_server_concurrent
-                    && !earlier
-                {
-                    running.insert(id.clone());
-                    return Ok(RunningGuard {
-                        state: Arc::downgrade(state),
-                        id,
-                    });
-                }
-                drop(running);
-                drop(items);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    pub(crate) async fn acquire(
+        &self,
+        state: &Arc<AppState>,
+        h: &Arc<Handle>,
+    ) -> Result<RunPermit> {
+        let settings = state.settings.lock().unwrap().transfers.clone();
+        self.scheduler.configure(&settings);
+        let endpoint = h
+            .server_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|server| format!("{}:{}:{}", server.host, server.port, server.username))
+            .unwrap_or_else(|| h.snapshot().server_id);
+        let view = h.snapshot();
+        self.scheduler
+            .acquire(&view.transfer_id, &endpoint, view.priority, h)
+            .await
+    }
+
+    pub(crate) fn pause_handle(&self, h: &Arc<Handle>) -> bool {
+        let accepted = h
+            .control
+            .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if accepted {
+            self.scheduler.cancel(&h.snapshot().transfer_id);
+            h.phase("pausing");
         }
+        accepted
+    }
+
+    pub(crate) async fn resume_handle(
+        &self,
+        state: &Arc<AppState>,
+        h: &Arc<Handle>,
+        source: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !h.worker_active.load(Ordering::Acquire),
+            "Transfer worker is still stopping"
+        );
+        let status = h.snapshot().status;
+        anyhow::ensure!(
+            matches!(status.as_str(), "paused" | "failed"),
+            "Only paused or failed transfers can be resumed"
+        );
+        let original = h.operation.lock().unwrap().clone();
+        let server = state.server(&original.server_id)?;
+        authorize(&server, &original, source)?;
+        if source == "mcp" {
+            *h.origin.lock().unwrap() = "mcp".into();
+        }
+        anyhow::ensure!(
+            h.worker_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "Transfer already resumed"
+        );
+        h.control.store(0, Ordering::Release);
+        h.update(|s| {
+            s.status = "queued".into();
+            s.phase = "queued".into();
+            s.error = None;
+            s.next_retry_at = None;
+            s.finished_at = None;
+            s.retry_count = 0;
+        });
+        *h.finished.lock().unwrap() = None;
+        if let Err(e) = h.persist() {
+            h.worker_active.store(false, Ordering::Release);
+            h.complete(&Err(error("JOURNAL_FAILED", "Cannot save transfer task")));
+            return Err(e);
+        }
+        spawn_worker(state.clone(), h.clone());
+        Ok(())
     }
 
     async fn control_task(
@@ -218,56 +249,13 @@ impl TransferManager {
         );
         match op.transfer_action.as_str() {
             "pause" => {
-                let accepted = h
-                    .control
-                    .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok();
-                if accepted {
-                    h.phase("pausing");
-                }
+                let accepted = self.pause_handle(h);
                 let mut value = serde_json::to_value(h.snapshot())?;
                 value["pause_requested"] = json!(accepted);
                 Ok(value)
             }
-            "resume" | "retry" => {
-                anyhow::ensure!(
-                    !h.worker_active.load(Ordering::Acquire),
-                    "Transfer worker is still stopping"
-                );
-                let status = h.snapshot().status;
-                anyhow::ensure!(
-                    matches!(status.as_str(), "paused" | "failed"),
-                    "Only paused or failed transfers can be resumed"
-                );
-                let original = h.operation.lock().unwrap().clone();
-                let server = state.server(&original.server_id)?;
-                authorize(&server, &original, source)?;
-                // A desktop picker grant must never be inherited by an MCP caller.
-                if source == "mcp" {
-                    *h.origin.lock().unwrap() = "mcp".into();
-                }
-                anyhow::ensure!(
-                    h.worker_active
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok(),
-                    "Transfer already resumed"
-                );
-                h.control.store(0, Ordering::Release);
-                h.update(|s| {
-                    s.status = "queued".into();
-                    s.phase = "queued".into();
-                    s.error = None;
-                    s.next_retry_at = None;
-                    s.finished_at = None;
-                    s.retry_count = 0;
-                });
-                *h.finished.lock().unwrap() = None;
-                if let Err(e) = h.persist() {
-                    h.worker_active.store(false, Ordering::Release);
-                    h.complete(&Err(error("JOURNAL_FAILED", "Cannot save transfer task")));
-                    return Err(e);
-                }
-                spawn_worker(state.clone(), h.clone());
+            "resume" => {
+                self.resume_handle(state, h, source).await?;
                 Ok(serde_json::to_value(h.snapshot())?)
             }
             "configure" => {
@@ -285,6 +273,9 @@ impl TransferManager {
                         s.bandwidth_kib = rate;
                     }
                 });
+                if let Some(priority) = op.priority {
+                    self.scheduler.update_priority(&op.transfer_id, priority);
+                }
                 h.persist()?;
                 Ok(serde_json::to_value(h.snapshot())?)
             }
@@ -294,8 +285,9 @@ impl TransferManager {
                         && (terminal(&h.snapshot().status) || h.snapshot().status == "paused"),
                     "Stop the transfer before cleanup"
                 );
-                crate::transfer_io::cleanup(state, h, source).await?;
+                crate::transfer_engine::cleanup(state, h, source).await?;
                 let id = h.snapshot().transfer_id;
+                self.scheduler.cancel(&id);
                 state.database.lock().unwrap().delete_transfer(&id)?;
                 self.items.lock().unwrap().remove(&id);
                 Ok(json!({"transfer_id":id,"removed":true}))
@@ -334,6 +326,11 @@ fn spawn_worker(state: Arc<AppState>, h: Arc<Handle>) {
         let result = run_task(state.clone(), h.clone(), source).await;
         h.complete(&result);
         h.worker_active.store(false, Ordering::Release);
+        if let Some(group) = h.snapshot().group_id {
+            state
+                .transfers
+                .group_terminal(&group, &h.snapshot().status);
+        }
         if let Ok(server) = state.server(&op.server_id) {
             let value = serde_json::to_value(h.snapshot()).unwrap_or_default();
             if let Err(e) = state.log(
@@ -350,8 +347,7 @@ fn spawn_worker(state: Arc<AppState>, h: Arc<Handle>) {
 }
 
 async fn run_task(state: Arc<AppState>, h: Arc<Handle>, source: &'static str) -> Result<Value> {
-    let _slot = state.transfers.acquire(&state, &h).await?;
-    let mut op = h.operation.lock().unwrap().clone();
+    let op = h.operation.lock().unwrap().clone();
     let server = state.server(&op.server_id)?;
     let settings = state.settings.lock().unwrap().clone();
     authorize(&server, &op, source)?;
@@ -375,93 +371,52 @@ async fn run_task(state: Arc<AppState>, h: Arc<Handle>, source: &'static str) ->
         resolved.to_string_lossy() == op.target,
         "Local path changed; create a new transfer"
     );
-    let approved = crate::security::needs_approval(&settings, &op, source);
-    if approved {
-        if op.kind == "upload_file" && !op.transfer_request.as_ref().is_some_and(|s| s.directory) {
-            h.phase("hashing");
-            let path = resolved.clone();
-            let hashing = h.clone();
-            let digest = tokio::task::spawn_blocking(move || {
-                crate::transfer_io::hash_local(&path, &hashing)
-            })
-            .await??;
-            op.transfer_request.as_mut().unwrap().sha256 = Some(digest);
-        }
-        h.phase("awaiting_approval");
-        let wait =
-            state
-                .approvals
-                .wait_with_timeout(&server, &op, source, settings.approval_timeout_secs);
-        tokio::pin!(wait);
-        loop {
-            tokio::select! {r=&mut wait=>{r?;break;},_=tokio::time::sleep(Duration::from_millis(100))=>h.check_cancelled()?}
-        }
-    }
     *h.operation.lock().unwrap() = op.clone();
     h.persist()?;
     let mut attempt = 0;
     loop {
         h.check_cancelled()?;
-        let work_state = state.clone();
-        let work_h = h.clone();
-        let work_op = op.clone();
-        let work_server = server.clone();
-        let path = resolved.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-            let live = work_state.server(&work_server.id)?;
-            authorize(&live, &work_op, source)?;
-            anyhow::ensure!(
-                serde_json::to_value(&live)? == serde_json::to_value(&work_server)?,
-                "Server configuration changed; create a new transfer"
-            );
-            let settings = work_state.settings.lock().unwrap().clone();
-            crate::security::check(&settings, &work_op, source)?;
-            anyhow::ensure!(
-                approved || !crate::security::needs_approval(&settings, &work_op, source),
-                "Approval policy changed; resume the transfer"
-            );
-            local_path(
-                work_op.transfer_request.as_ref().unwrap(),
-                work_op.kind == "upload_file",
-                &settings,
-                source,
-            )?;
-            work_h.update(|s| {
-                s.status = "running".into();
-                s.phase = "connecting".into();
-                s.next_retry_at = None;
-            });
-            crate::transfer_io::transfer(
-                &work_state,
-                &live,
-                &work_op,
-                &settings,
-                source,
-                &path,
-                &work_h,
-            )
-        })
-        .await?;
+        let permit = state.transfers.acquire(&state, &h).await?;
+        h.check_cancelled()?;
+        h.mark_running();
+        let result = attempt_transfer(
+            state.clone(),
+            h.clone(),
+            op.clone(),
+            server.clone(),
+            resolved.clone(),
+            source,
+        )
+        .await;
+        drop(permit);
         match result {
             Ok(value) => return Ok(value),
-            Err(e) => {
+            Err(error) => {
                 let current = state.settings.lock().unwrap().transfers.clone();
-                if !crate::operation_error::retryable(&e)
+                if !crate::operation_error::retryable(&error)
                     || attempt >= current.max_retries
                     || h.control.load(Ordering::Acquire) != 0
                 {
-                    return Err(e);
+                    h.failure(&error);
+                    return Err(error);
                 }
                 attempt += 1;
+                if matches!(
+                    failure_category(crate::operation_error::error_code(&error)),
+                    "network" | "connection"
+                ) {
+                    h.window.lock().unwrap().failure(true);
+                }
                 let jitter = (uuid::Uuid::new_v4().as_u128() % 500) as u64;
                 let delay = Duration::from_millis(
                     (current.retry_base_secs * 1000 * (1u64 << (attempt - 1))).min(30000) + jitter,
                 );
+                h.failure(&error);
                 h.update(|s| {
                     s.status = "retrying".into();
-                    s.phase = "retrying".into();
+                    s.phase = "retry_wait".into();
                     s.retry_count = attempt;
-                    s.error = Some(crate::operation_error::error_response(&e, &op));
+                    s.error = Some(crate::transfers::transfer_error_response(&error, &op));
                     s.next_retry_at = Some(
                         (chrono::Utc::now()
                             + chrono::Duration::milliseconds(delay.as_millis() as i64))
@@ -469,13 +424,92 @@ async fn run_task(state: Arc<AppState>, h: Arc<Handle>, source: &'static str) ->
                     );
                     s.bytes_per_second = 0;
                 });
+                h.retry_wait(delay);
                 h.persist()?;
-                let until = Instant::now() + delay;
-                while Instant::now() < until {
-                    h.check_cancelled()?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+                wait_retry(&h, delay).await?;
+                h.update(|s| {
+                    s.status = "queued".into();
+                    s.phase = "queued".into();
+                    s.next_retry_at = None;
+                });
             }
+        }
+    }
+}
+
+async fn attempt_transfer(
+    state: Arc<AppState>,
+    h: Arc<Handle>,
+    op: Operation,
+    server: Server,
+    resolved: std::path::PathBuf,
+    source: &'static str,
+) -> Result<Value> {
+    let idle = state
+        .settings
+        .lock()
+        .unwrap()
+        .transfers
+        .idle_timeout_secs;
+    let watchdog_handle = h.clone();
+    let watchdog = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if watchdog_handle.control.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            if watchdog_handle
+                .last_progress
+                .lock()
+                .unwrap()
+                .elapsed()
+                > Duration::from_secs(idle)
+            {
+                watchdog_handle.phase("stalled");
+            }
+        }
+    });
+    let joined = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let live = state.server(&server.id)?;
+        authorize(&live, &op, source)?;
+        anyhow::ensure!(
+            serde_json::to_value(&live)? == serde_json::to_value(&server)?,
+            "Server configuration changed; create a new transfer"
+        );
+        let settings = state.settings.lock().unwrap().clone();
+        crate::security::check(&settings, &op, source)?;
+        local_path(
+            op.transfer_request.as_ref().unwrap(),
+            op.kind == "upload_file",
+            &settings,
+            source,
+        )?;
+        h.update(|s| {
+            s.status = "running".into();
+            s.next_retry_at = None;
+        });
+        h.phase("connecting");
+        crate::transfer_engine::transfer(&state, &live, &op, &settings, source, &resolved, &h)
+    })
+    .await;
+    watchdog.abort();
+    joined?
+}
+
+async fn wait_retry(h: &Handle, delay: Duration) -> Result<()> {
+    let until = Instant::now() + delay;
+    loop {
+        h.check_cancelled()?;
+        let notified = h.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(remaining) => {},
+            _ = notified => {},
         }
     }
 }

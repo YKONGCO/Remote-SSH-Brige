@@ -168,8 +168,7 @@ export default function CodeEditor(props: {
               {
                 backgroundColor: "var(--code-selection)",
               },
-            // CodeMirror draws selections behind the syntax-highlighted text.
-            // Override the global white selection foreground, including token spans.
+
             ".cm-content ::selection, .cm-content::selection": {
               color: "currentColor",
               backgroundColor: "transparent",
@@ -222,7 +221,7 @@ export default function CodeEditor(props: {
               background: "var(--action-soft)",
               borderColor: "var(--action-bg)",
             },
-            // Keep global form label/input rules out of the search options.
+
             ".cm-search label": {
               display: "inline-flex",
               flexDirection: "row",
@@ -342,7 +341,6 @@ export default function CodeEditor(props: {
   useEffect(() => {
     const editor = view.current;
     if (editor && editor.state.sliceDoc() !== props.value) {
-      // External loads must not create an undo step restoring a truncated preview.
       editor.dispatch({
         changes: { from: 0, to: editor.state.doc.length, insert: props.value },
         annotations: Transaction.addToHistory.of(false),

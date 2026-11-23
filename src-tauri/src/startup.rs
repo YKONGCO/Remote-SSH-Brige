@@ -16,7 +16,7 @@ async fn run_with_targets(
     }
     let result = async {
         let status = mcp::start_on(state.clone(), settings.mcp_port, &settings.mcp_host).await?;
-        // Keep the token stable until all client configurations have been refreshed.
+
         let _guard = state.service_lock.lock().await;
         tokio::task::spawn_blocking(move || clients::refresh_configured(&targets()?, &status))
             .await??;
@@ -24,7 +24,6 @@ async fn run_with_targets(
     }
     .await;
     if let Err(error) = result {
-        // A client write failure leaves the service running and is visible in the UI.
         state.mcp.lock().unwrap().error = Some(format!("自动启动 MCP：{error:#}"));
     }
 }

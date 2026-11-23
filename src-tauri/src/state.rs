@@ -14,6 +14,8 @@ pub struct AppState {
     pub config: Mutex<Config>,
     pub settings: Mutex<RuntimeSettings>,
     pub jobs: crate::jobs::JobManager,
+    pub sessions: crate::ssh_session::SessionManager,
+    pub sftp_sessions: crate::sftp_session::SftpSessionManager,
     pub tunnels: crate::tunnels::TunnelManager,
     pub transfers: crate::transfers::TransferManager,
     pub approvals: crate::security::ApprovalQueue,
@@ -22,6 +24,7 @@ pub struct AppState {
     pub terminal_open_lock: Mutex<()>,
     pub file_mutation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub mcp: Mutex<McpStatus>,
+    pub mcp_sessions: crate::mcp::McpSessionRegistry,
     pub cancel: Mutex<Option<CancellationToken>>,
     pub service_lock: tokio::sync::Mutex<()>,
 }
@@ -33,7 +36,7 @@ impl AppState {
         };
         let audit = database.recent_audits(500)?;
         let settings = database.settings()?;
-        // Listeners are process-local. Retain their metadata after a restart.
+
         for mut info in database.tunnel_history()? {
             if info.status != "closed" {
                 info.status = "closed".into();
@@ -48,6 +51,8 @@ impl AppState {
             config: Mutex::new(config),
             settings: Mutex::new(settings),
             jobs: crate::jobs::JobManager::default(),
+            sessions: crate::ssh_session::SessionManager::default(),
+            sftp_sessions: crate::sftp_session::SftpSessionManager::default(),
             tunnels: crate::tunnels::TunnelManager::default(),
             transfers: crate::transfers::TransferManager::default(),
             approvals: crate::security::ApprovalQueue::default(),
@@ -56,6 +61,7 @@ impl AppState {
             terminal_open_lock: Mutex::new(()),
             file_mutation_locks: Mutex::new(HashMap::new()),
             mcp: Mutex::new(McpStatus::default()),
+            mcp_sessions: crate::mcp::McpSessionRegistry::default(),
             cancel: Mutex::new(None),
             service_lock: tokio::sync::Mutex::new(()),
         });
@@ -67,7 +73,10 @@ impl AppState {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 let Some(state) = weak.upgrade() else { break };
                 state.jobs.prune_expired();
+                state.sessions.prune();
+                state.sftp_sessions.prune();
                 state.transfers.prune();
+                crate::terminal::prune(&state.terminals);
             })?;
         Ok(state)
     }
@@ -87,13 +96,33 @@ impl AppState {
                 )
             })
     }
-    pub fn save_settings(&self, settings: RuntimeSettings) -> Result<RuntimeSettings> {
+    pub fn save_settings(&self, mut settings: RuntimeSettings) -> Result<RuntimeSettings> {
+        settings.settings_version = SETTINGS_VERSION;
         settings.validate()?;
         let mut current = self.settings.lock().unwrap();
+        let previous = current.clone();
         self.database.lock().unwrap().save_settings(&settings)?;
         *current = settings.clone();
+        drop(current);
+        self.transfers.configure(&settings.transfers);
         if settings.remote_read_only {
             self.tunnels.stop_all();
+        }
+        if previous.advanced_mcp_tools != settings.advanced_mcp_tools {
+            if previous.advanced_mcp_tools.terminal && !settings.advanced_mcp_tools.terminal {
+                crate::terminal::stop_mcp(&self.terminals);
+            }
+            if previous.advanced_mcp_tools.port_forward && !settings.advanced_mcp_tools.port_forward
+            {
+                self.tunnels.stop_mcp();
+            }
+            self.mcp_sessions.notify_tools_changed();
+        }
+        if previous.approval_mode && !settings.approval_mode {
+            self.approvals.cancel_all();
+        }
+        if previous.approval_mode != settings.approval_mode {
+            self.mcp_sessions.notify_tools_changed();
         }
         Ok(settings)
     }
@@ -127,7 +156,6 @@ impl AppState {
         self.database.lock().unwrap().audit(id)
     }
     pub fn delete_audits(&self, range: &crate::database::AuditDeleteRange) -> Result<usize> {
-        // Match log()'s lock order and replace the cache only after a successful commit.
         let mut audits = self.audit.lock().unwrap();
         let (deleted, recent) = self.database.lock().unwrap().delete_audits(range)?;
         *audits = recent;
@@ -144,8 +172,6 @@ impl AppState {
         query: &crate::database::AuditQuery,
         path: &std::path::Path,
     ) -> Result<()> {
-        // A separate WAL reader lets new operations keep writing while a large
-        // history is exported.
         Database::open_reader(&self.dir)?.export_audits(query, std::fs::File::create(path)?)
     }
     pub fn resolve_approval(&self, id: &str, approved: bool) -> Result<()> {
@@ -153,16 +179,18 @@ impl AppState {
             let server = Server { id: view.server_id.clone(), name: view.server_name.clone(), ..Default::default() };
             let op = Operation {
                 kind: if approved { "security_approve".into() } else { "security_reject".into() },
-                server_id: view.server_id.clone(), path: view.path.clone(), command: view.command.clone(), ..Default::default()
+                server_id: view.server_id.clone(), command: view.command.clone(), ..Default::default()
             };
             self.log(&server, &view.source, &op, &Ok(json!({"approval":{
                 "request_id":view.id,"status":if approved {"approved"} else {"rejected"},
                 "approved":approved,"kind":view.kind,"request_source":view.source,"decision_by":"desktop",
                 "server_name":view.server_name,"host":view.host,"username":view.username,
-                "path":view.path,"target":view.target,"command":view.command,
-                "recursive":view.recursive,"missing_ok":view.missing_ok,"create_parents":view.create_parents,
+                "command":view.command,"reason":view.reason,"risk":view.risk,
+                "matched_rules":view.matched_rules,
                 "requested_at":view.created_at,"decided_at":chrono::Utc::now().to_rfc3339(),"expires_at":view.expires_at,
-                "content_bytes":view.content_bytes,"content_sha256":view.content_sha256
+                "timeout_secs":view.timeout_secs,
+                "command_bytes":view.command_bytes,"command_sha256":view.command_sha256,
+                "server_sha256":view.server_sha256
             }})), 0)
         }).map(|_| ())
     }
@@ -186,6 +214,7 @@ impl AppState {
             );
         }
         if let Some(permissions) = &mut server.mcp_permissions {
+            permissions.retain(|kind| kind != "terminal_resize");
             anyhow::ensure!(
                 permissions
                     .iter()
@@ -275,6 +304,9 @@ impl AppState {
         {
             self.tunnels.stop_server(&server.id);
         }
+
+        self.sessions.remove(&server.id);
+        self.sftp_sessions.remove(&server.id);
         *config = next;
         Ok(server)
     }
@@ -323,6 +355,8 @@ impl AppState {
         let mut next = config.clone();
         next.servers.retain(|s| s.id != id);
         self.database.lock().unwrap().remove_server(id)?;
+        self.sessions.remove(id);
+        self.sftp_sessions.remove(id);
         self.tunnels.stop_server(id);
         *config = next;
         match keyring::Entry::new("dev.remotedesk.ssh", id)?.delete_credential() {
@@ -338,8 +372,6 @@ impl AppState {
         result: &Result<Value>,
         elapsed: u64,
     ) -> Result<()> {
-        // The activity log is an MCP audit trail; manual desktop actions are
-        // intentionally not recorded.
         if source != "mcp" {
             return Ok(());
         }
@@ -396,14 +428,15 @@ impl AppState {
                 .as_ref()
                 .ok()
                 .is_some_and(|v| op.kind == "exec" && v.get("job_id").is_some())
-                || (!result.as_ref().ok().is_some_and(|v| {
-                    match v["status"].as_str() {
-                        // A closed tunnel is the expected outcome of a successful close.
+                || (!result
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|v| match v["status"].as_str() {
                         Some("closed") => op.kind != "port_forward_close",
                         Some("disconnected" | "failed" | "cancelled") => true,
                         _ => false,
-                    }
-                }) && op.kind != "security_reject"
+                    })
+                    && op.kind != "security_reject"
                     && result.is_ok()
                     && result
                         .as_ref()
@@ -463,24 +496,11 @@ pub async fn execute_with_progress(
     }
     let start = std::time::Instant::now();
     let server = state.server(&op.server_id)?;
-    let approval = async {
-        let settings = validate_operation(&state, &server, &op, source)?;
-        let needed = crate::security::needs_approval(&settings, &op, source);
-        if needed {
-            state
-                .approvals
-                .wait_with_timeout(&server, &op, source, settings.approval_timeout_secs)
-                .await
-                .map_err(|e| crate::operation_error::with_stage(e, "approval"))?;
-        }
-        Ok::<bool, anyhow::Error>(needed)
+    if op.kind == "exec" {
+        return execute_exec(state, server, op, source, progress, start).await;
     }
-    .await;
     tokio::task::spawn_blocking(move || {
-        let result = approval.and_then(|approved| {
-            // Serialize directory moves and child writes as well as edits, across MCP and desktop.
-            // Approval waits happen before acquiring the lock. A blocking SFTP call retains it
-            // until settled even if its async caller disconnects.
+        let result = (|| -> Result<Value> {
             let file_lock = if crate::file_tools::mutates(&op.kind) {
                 Some(
                     state
@@ -496,21 +516,13 @@ pub async fn execute_with_progress(
             };
             let _guard = file_lock.as_ref().map(|lock| lock.lock().unwrap());
             let live = state.server(&op.server_id)?;
-            if approved && serde_json::to_value(&live)? != serde_json::to_value(&server)? {
-                bail!("Server configuration changed; approval is invalid")
-            }
             let settings = validate_operation(&state, &live, &op, source)?;
-            if !approved && crate::security::needs_approval(&settings, &op, source) {
-                bail!("Approval policy changed; submit the operation again")
-            }
             if op.kind.starts_with("port_forward_") {
                 crate::tunnels::operate(&state, &live, &op, source)
-            } else if op.kind == "exec" {
-                crate::jobs::execute(&state, &live, &op, &settings, source, &progress)
             } else if op.kind == "job" {
                 state.jobs.operate(&op, &progress)
             } else if op.kind.starts_with("terminal_") {
-                crate::terminal::operate(&state, &live, &op)
+                crate::terminal::operate(&state, &live, &op, source)
             } else {
                 let mut attempts = 0;
                 loop {
@@ -535,16 +547,8 @@ pub async fn execute_with_progress(
                     validate_operation(&state, &current, &op, source)?;
                 }
             }
-        });
-        if (source == "mcp"
-            || (op.kind != "terminal_read"
-                && op.kind != "terminal_resize"
-                && !(op.kind == "job" && op.job_action != "close" && result.is_ok())))
-            && !result
-                .as_ref()
-                .ok()
-                .is_some_and(|v| v.get("job_id").is_some() && op.kind == "exec")
-        {
+        })();
+        if source == "mcp" {
             state
                 .log(
                     &server,
@@ -558,6 +562,209 @@ pub async fn execute_with_progress(
         result
     })
     .await?
+}
+
+async fn execute_exec(
+    state: Arc<AppState>,
+    server: Server,
+    op: Operation,
+    source: &'static str,
+    progress: crate::jobs::Progress,
+    start: std::time::Instant,
+) -> Result<Value> {
+    let mut settings = match validate_operation(&state, &server, &op, source) {
+        Ok(settings) => settings,
+        Err(error) => return exec_failure(&state, &server, &op, source, start, error),
+    };
+    let assessment = crate::command_policy::assess(&op.command, &settings);
+    let mut approval = None;
+    match assessment.decision {
+        crate::command_policy::Decision::Deny => {
+            return exec_failure(
+                &state,
+                &server,
+                &op,
+                source,
+                start,
+                crate::operation_error::error_with_details(
+                    "COMMAND_POLICY_DENIED",
+                    "Command rejected by the command policy",
+                    serde_json::json!({
+                        "reason": assessment.reason,
+                        "risk": assessment.risk,
+                        "matched_rules": assessment.matched_rules,
+                        "command_sent": false,
+                        "outcome_unknown": false,
+                    }),
+                ),
+            );
+        }
+        crate::command_policy::Decision::RequireApproval if !settings.approval_mode => {
+            return exec_failure(
+                &state,
+                &server,
+                &op,
+                source,
+                start,
+                crate::operation_error::error_with_details(
+                    "APPROVAL_DISABLED",
+                    "This command is protected and approval mode is disabled",
+                    serde_json::json!({
+                        "reason": assessment.reason,
+                        "risk": assessment.risk,
+                        "matched_rules": assessment.matched_rules,
+                        "next_action": "Enable approval mode in desktop settings to allow a one-time approval",
+                        "command_sent": false,
+                        "outcome_unknown": false,
+                    }),
+                ),
+            );
+        }
+        crate::command_policy::Decision::RequireApproval if source == "mcp" => {
+            if !op.approval_request {
+                return exec_failure(
+                    &state,
+                    &server,
+                    &op,
+                    source,
+                    start,
+                    crate::operation_error::error_with_details(
+                        "APPROVAL_REQUIRED",
+                        "This command is protected and requires one-time approval",
+                        serde_json::json!({
+                            "command": op.command,
+                            "reason": assessment.reason,
+                            "risk": assessment.risk,
+                            "matched_rules": assessment.matched_rules,
+                            "uncertain": assessment.uncertain,
+                            "next_tool": "exec_approved",
+                            "next_action": "Call exec_approved with the same server_id, command and timeout_secs",
+                            "command_sent": false,
+                            "outcome_unknown": false,
+                        }),
+                    ),
+                );
+            }
+
+            let view = match state
+                .approvals
+                .request(
+                    &server,
+                    &op,
+                    &assessment,
+                    source,
+                    settings.approval_timeout_secs,
+                )
+                .await
+                .map_err(|error| crate::operation_error::with_stage(error, "approval"))
+            {
+                Ok(view) => view,
+                Err(error) => return exec_failure(&state, &server, &op, source, start, error),
+            };
+            let live = match state.server(&server.id) {
+                Ok(live) => live,
+                Err(error) => return exec_failure(&state, &server, &op, source, start, error),
+            };
+            if serde_json::to_value(&live)? != serde_json::to_value(&server)? {
+                return exec_failure(
+                    &state,
+                    &server,
+                    &op,
+                    source,
+                    start,
+                    crate::operation_error::error(
+                        "SOURCE_CHANGED",
+                        "Server configuration changed; approval is invalid",
+                    ),
+                );
+            }
+            if view.command != op.command || view.server_id != live.id {
+                return exec_failure(
+                    &state,
+                    &server,
+                    &op,
+                    source,
+                    start,
+                    crate::operation_error::error(
+                        "SOURCE_CHANGED",
+                        "Approval does not match this command; it was not executed",
+                    ),
+                );
+            }
+            settings = match validate_operation(&state, &live, &op, source) {
+                Ok(settings) => settings,
+                Err(error) => return exec_failure(&state, &server, &op, source, start, error),
+            };
+            let fresh = crate::command_policy::assess(&op.command, &settings);
+            if fresh.decision == crate::command_policy::Decision::Deny {
+                return exec_failure(
+                    &state,
+                    &server,
+                    &op,
+                    source,
+                    start,
+                    crate::operation_error::error(
+                        "COMMAND_POLICY_DENIED",
+                        "Command policy changed after approval; the command was not executed",
+                    ),
+                );
+            }
+            approval = Some(view);
+        }
+        crate::command_policy::Decision::RequireApproval
+        | crate::command_policy::Decision::Allow => {}
+    }
+    tokio::task::spawn_blocking(move || {
+        let result = crate::execution::execute(
+            &state,
+            &server,
+            &op,
+            &settings,
+            source,
+            &progress,
+            approval.as_ref(),
+        );
+        let handed_off = result
+            .as_ref()
+            .ok()
+            .is_some_and(|value| value.get("job_id").is_some());
+        if source == "mcp" && !handed_off {
+            state
+                .log(
+                    &server,
+                    source,
+                    &op,
+                    &result,
+                    start.elapsed().as_millis() as u64,
+                )
+                .context("Operation processed, but audit write failed; check the data directory")?;
+        }
+        result
+    })
+    .await?
+}
+
+fn exec_failure(
+    state: &AppState,
+    server: &Server,
+    op: &Operation,
+    source: &str,
+    start: std::time::Instant,
+    error: anyhow::Error,
+) -> Result<Value> {
+    let result: Result<Value> = Err(error);
+    if source == "mcp" {
+        state
+            .log(
+                server,
+                source,
+                op,
+                &result,
+                start.elapsed().as_millis() as u64,
+            )
+            .context("Operation processed, but audit write failed; check the data directory")?;
+    }
+    result
 }
 
 fn validate_operation(
@@ -634,6 +841,12 @@ fn validate_operation(
                 "INVALID_ARGUMENT: session_id is required"
             );
         }
+        if op.kind == "terminal_read" {
+            anyhow::ensure!(
+                op.wait_secs <= 30,
+                "INVALID_ARGUMENT: wait_secs must be 0-30"
+            );
+        }
     }
     anyhow::ensure!(
         op.path.len() <= 8192
@@ -670,7 +883,6 @@ fn clip_text(text: &str, max_bytes: usize, truncated: &mut bool) -> String {
     text[..end].to_string()
 }
 
-/// Return bounded previews without persisting uploaded data, file bodies or terminal keystrokes.
 fn audit_response(op: &Operation, result: &Result<Value>) -> AuditResponse {
     let mut truncated = false;
     let data = match result {

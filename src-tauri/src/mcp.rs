@@ -1,4 +1,5 @@
 use crate::mcp_args::*;
+use crate::transfer_planner::{Direction, StartOptions, TransferRequest};
 use crate::{model::*, state::AppState};
 use anyhow::Result;
 use axum::{
@@ -11,7 +12,7 @@ use axum::{
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
-    service::RequestContext,
+    service::{Peer, RequestContext},
     tool, tool_handler, tool_router,
     transport::{
         streamable_http_server::{
@@ -21,9 +22,41 @@ use rmcp::{
     },
     RoleServer, ServerHandler,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Default)]
+pub struct McpSessionRegistry {
+    peers: Mutex<Vec<Peer<RoleServer>>>,
+}
+impl McpSessionRegistry {
+    fn register(&self, peer: Peer<RoleServer>) {
+        let mut peers = self.peers.lock().unwrap();
+        if peers.len() >= 256 {
+            peers.remove(0);
+        }
+        peers.push(peer);
+    }
+    pub fn notify_tools_changed(&self) {
+        let peers = self.peers.lock().unwrap().clone();
+        let notify = async move {
+            for peer in peers {
+                let _ = peer.notify_tool_list_changed().await;
+            }
+        };
+        #[cfg(feature = "desktop")]
+        {
+            tauri::async_runtime::spawn(notify);
+        }
+        #[cfg(not(feature = "desktop"))]
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(notify);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RemoteMcp {
@@ -49,6 +82,13 @@ impl RemoteMcp {
     ) -> CallToolResult {
         let mut op = args.into();
         op.kind = kind.into();
+        self.call_operation(op, ctx).await
+    }
+    async fn call_operation(
+        &self,
+        op: Operation,
+        ctx: Option<RequestContext<RoleServer>>,
+    ) -> CallToolResult {
         let token = ctx
             .as_ref()
             .and_then(|ctx| ctx.meta.get("progressToken"))
@@ -69,7 +109,7 @@ impl RemoteMcp {
                 Some(chunk) = rx.recv(), if token.is_some() => {
                     count += 1;
                     if let (Some(ctx), Some(token)) = (&ctx, &token) {
-                        // Notifications are best effort; a slow client must never stall SSH reads.
+
                         let notification = ProgressNotificationParam::new(ProgressToken(token.clone()), count as f64).with_message(chunk.to_string());
                         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ctx.peer.notify_progress(notification)).await;
                     }
@@ -93,7 +133,7 @@ impl RemoteMcp {
         self.global_result("list_servers", serde_json::json!(servers))
     }
     #[tool(
-        description = "Inspect one server's permissions, transfer settings or command rules on demand."
+        description = "Inspect a server's permissions, transfer limits or command availability on demand."
     )]
     async fn server_info(&self, Parameters(a): Parameters<ServerInfoArgs>) -> CallToolResult {
         let result = (|| -> anyhow::Result<serde_json::Value> {
@@ -103,15 +143,96 @@ impl RemoteMcp {
                 "Server is unavailable to MCP"
             );
             let policy = self.state.settings.lock().unwrap().clone();
+            let command_policy = policy.effective_command_policy();
+            let exec_available = server.permits_mcp("exec")
+                && !command_policy.exec_disabled
+                && !policy.remote_read_only;
+            let approval_available = exec_available && policy.approval_mode;
+            let capabilities: Vec<_> = server
+                .effective_mcp_permissions()
+                .into_iter()
+                .filter(|kind| *kind != "remove_path" || !policy.deletion_protection)
+                .filter(|kind| {
+                    let kind = *kind;
+                    let terminal = kind.starts_with("terminal_") || kind == "list_terminals";
+                    let port_forward = kind.starts_with("port_forward_");
+                    (!terminal && !port_forward)
+                        || policy.advanced_mcp_tools.enabled(if terminal {
+                            "terminal"
+                        } else {
+                            "port_forward"
+                        })
+                })
+                .filter(|kind| {
+                    if *kind == "exec" && !exec_available {
+                        return false;
+                    }
+                    !policy.remote_read_only
+                        || !matches!(
+                            *kind,
+                            "write_file"
+                                | "edit_file"
+                                | "remove_path"
+                                | "upload_file"
+                                | "exec"
+                                | "terminal_open"
+                                | "terminal_write"
+                                | "port_forward_open"
+                        )
+                })
+                .collect();
             Ok(match a.topic {
                 ServerInfoTopic::Permissions => {
-                    serde_json::json!({"mcp_permissions":server.effective_mcp_permissions().into_iter().filter(|kind| *kind != "remove_path" || !policy.deletion_protection).collect::<Vec<_>>(),"terminal_actions":server.terminal_actions(),"read_only":policy.remote_read_only,"deletion_protection":policy.deletion_protection,"approval_mode":policy.approval_mode,"approval_timeout_secs":policy.approval_timeout_secs,"exec_timeout_to_job":policy.exec_timeout_to_job})
+                    serde_json::json!({
+                        "server_id":server.id,
+                        "server_name":server.name,
+                        "read_only":policy.remote_read_only,
+                        "deletion_protected":policy.deletion_protection,
+                        "capabilities":capabilities,
+                        "approval":{
+                            "tool":"exec_approved",
+                            "available":approval_available,
+                            "timeout_secs":policy.approval_timeout_secs,
+                        },
+                        "advanced_tools":{
+                            "terminal":policy.advanced_mcp_tools.terminal,
+                            "port_forward":policy.advanced_mcp_tools.port_forward,
+                        },
+                    })
                 }
                 ServerInfoTopic::Transfers => {
-                    serde_json::json!({"upload_limit_mib":policy.upload_limit_mib,"download_limit_mib":policy.download_limit_mib,"local_upload_roots":if server.permits_mcp("upload_file") {policy.local_upload_roots} else {vec![]},"local_download_roots":if server.permits_mcp("download_file") {policy.local_download_roots} else {vec![]},"settings":policy.transfers})
+                    let upload =
+                        server.permits_mcp("upload_file") && server.permits_mcp("transfer");
+                    let download =
+                        server.permits_mcp("download_file") && server.permits_mcp("transfer");
+                    serde_json::json!({
+                        "upload":{
+                            "allowed":upload,
+                            "limit_mib":policy.upload_limit_mib,
+                            "local_roots":if upload {policy.local_upload_roots} else {vec![]},
+                        },
+                        "download":{
+                            "allowed":download,
+                            "limit_mib":policy.download_limit_mib,
+                            "local_roots":if download {policy.local_download_roots} else {vec![]},
+                        },
+                        "limits":{
+                            "max_items":100,
+                            "max_entries":1000,
+                            "max_depth":64,
+                        },
+                    })
                 }
                 ServerInfoTopic::Commands => {
-                    serde_json::json!({"command_policy":policy.effective_command_policy(),"command_protection":policy.block_dangerous_commands})
+                    serde_json::json!({
+                        "exec":{"available":exec_available},
+                        "exec_approved":{
+                            "available":approval_available,
+                            "timeout_secs":policy.approval_timeout_secs,
+                        },
+                        "approval_required":policy.approval_mode,
+                        "timeout_to_job":policy.exec_timeout_to_job,
+                    })
                 }
             })
         })();
@@ -125,7 +246,7 @@ impl RemoteMcp {
         )
     }
     #[tool(
-        description = "Execute a command. Check exit_code; on timeout a retained session returns job_id for job.read."
+        description = "Execute a normal command. Protected commands return APPROVAL_REQUIRED with the matching rules when approval mode is enabled; retry them with exec_approved using the same arguments. Check exit_code; on timeout a retained session returns job_id for job.read."
     )]
     async fn exec(
         &self,
@@ -133,6 +254,19 @@ impl RemoteMcp {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call_with_progress("exec", a, Some(ctx)).await
+    }
+    #[tool(
+        description = "Execute a protected command after the desktop user approves this exact request once. Same arguments as exec; approval is bound to the server, command and timeout and is never reusable."
+    )]
+    async fn exec_approved(
+        &self,
+        Parameters(a): Parameters<ExecArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let mut op: Operation = a.into();
+        op.kind = "exec".into();
+        op.approval_request = true;
+        self.call_operation(op, Some(ctx)).await
     }
     #[tool(
         description = "Open, list, read or close SSH TCP forwarding from app-host loopback to server loopback."
@@ -153,19 +287,49 @@ impl RemoteMcp {
         self.call_with_progress("job", a, Some(ctx)).await
     }
     #[tool(
-        description = "Queue a binary upload from the app host. Poll transfer.read; completed confirms destination commit."
+        description = "Upload one or more files or recursive directories from the app host. Use items for every request; a single file returns transfer_id, a batch or directory returns group_id."
     )]
-    async fn upload_file(&self, Parameters(a): Parameters<TransferStartArgs>) -> CallToolResult {
-        self.call("upload_file", a).await
+    async fn upload_file(&self, Parameters(a): Parameters<TransferRequest>) -> CallToolResult {
+        let op = Operation {
+            kind: "upload_file".into(),
+            server_id: a.server_id.clone(),
+            ..Default::default()
+        };
+        crate::mcp_response::from_outcome(
+            &op,
+            crate::transfer_planner::start(
+                self.state.clone(),
+                Direction::Upload,
+                a,
+                StartOptions::default(),
+                "mcp",
+            )
+            .await,
+        )
     }
     #[tool(
-        description = "Queue a binary download to the app host. Poll transfer.read; completed confirms destination commit."
+        description = "Download one or more files or recursive directories to the app host. Use items for every request; a single file returns transfer_id, a batch or directory returns group_id."
     )]
-    async fn download_file(&self, Parameters(a): Parameters<TransferStartArgs>) -> CallToolResult {
-        self.call("download_file", a).await
+    async fn download_file(&self, Parameters(a): Parameters<TransferRequest>) -> CallToolResult {
+        let op = Operation {
+            kind: "download_file".into(),
+            server_id: a.server_id.clone(),
+            ..Default::default()
+        };
+        crate::mcp_response::from_outcome(
+            &op,
+            crate::transfer_planner::start(
+                self.state.clone(),
+                Direction::Download,
+                a,
+                StartOptions::default(),
+                "mcp",
+            )
+            .await,
+        )
     }
     #[tool(
-        description = "Manage transfers: list/read/cancel/pause/resume/retry/cleanup/configure. Read supports version and wait_secs."
+        description = "Manage transfers by transfer_id or group_id: list/read/pause/resume/cancel. Read supports version and wait_secs; resume also retries failed tasks."
     )]
     async fn transfer(
         &self,
@@ -173,23 +337,6 @@ impl RemoteMcp {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call_with_progress("transfer", a, Some(ctx)).await
-    }
-    #[tool(
-        description = "Queue a batch of files or recursive directories; returns group_id and child task IDs. Symlinks are rejected."
-    )]
-    async fn transfer_batch(
-        &self,
-        Parameters(a): Parameters<crate::transfer_batch::BatchArgs>,
-    ) -> CallToolResult {
-        let op = Operation {
-            kind: "transfer_batch".into(),
-            server_id: a.server_id.clone(),
-            ..Default::default()
-        };
-        crate::mcp_response::from_outcome(
-            &op,
-            crate::transfer_batch::start(self.state.clone(), a, "mcp").await,
-        )
     }
     #[tool(
         description = "Read UTF-8 text, at most 2000 lines/50 KiB. Continue at next_offset; metadata is in structuredContent."
@@ -226,7 +373,7 @@ impl RemoteMcp {
         self.call("remove_path", a).await
     }
     #[tool(
-        description = "Manage SSH PTYs: list/open/read/write/resize/close. Read returns text and a byte cursor; drain while has_more."
+        description = "Manage SSH PTYs: list/open/read/write/close. Read waits for output when wait_secs is set and returns text with a byte cursor."
     )]
     async fn terminal(&self, Parameters(a): Parameters<TerminalArgs>) -> CallToolResult {
         match a.operation() {
@@ -235,6 +382,14 @@ impl RemoteMcp {
                 self.call(&kind, op).await
             }
             None => self.list_terminal_sessions(),
+        }
+    }
+    fn tool_registered(&self, name: &str) -> bool {
+        let settings = self.state.settings.lock().unwrap();
+        match name {
+            "terminal" | "port_forward" => settings.advanced_mcp_tools.enabled(name),
+            "exec_approved" => settings.approval_mode,
+            _ => true,
         }
     }
     fn list_terminal_sessions(&self) -> CallToolResult {
@@ -282,12 +437,40 @@ impl RemoteMcp {
 }
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RemoteMcp {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, rmcp::ErrorData> {
+        self.state.mcp_sessions.register(context.peer.clone());
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| self.tool_registered(&tool.name))
+            .collect();
+        Ok(ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_registered(name)
+            .then(|| self.tool_router.get(name).cloned())
+            .flatten()
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, rmcp::ErrorData> {
+        self.state.mcp_sessions.register(context.peer.clone());
         let tool_name = request.name.clone();
+        if !self.tool_registered(&tool_name) {
+            return Err(rmcp::ErrorData::invalid_params("tool not found", None));
+        }
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router
             .call(call)
@@ -314,10 +497,19 @@ impl ServerHandler for RemoteMcp {
         let mut info = Implementation::from_build_env();
         info.name = MCP_SERVER_NAME.into();
         info.title = Some(MCP_SERVER_TITLE.into());
-        info.description =
-            Some("Remote SSH commands, file editing and persistent terminals over MCP.".into());
+        info.description = Some(
+            "Remote SSH commands, protected-command approval, file editing and persistent terminals over MCP."
+                .into(),
+        );
         info.version = env!("CARGO_PKG_VERSION").into();
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(info).with_instructions("Use list_servers for IDs. Local paths belong to the app host. Permissions are checked at runtime; server_info provides details on demand. Check exit_code/status, and inspect unknown outcomes before retrying.")
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(info)
+        .with_instructions("Use list_servers for IDs. Local paths belong to the app host. Ordinary commands run directly; a protected or statically unresolved command returns APPROVAL_REQUIRED and must be retried with exec_approved using identical arguments when approval mode is enabled, then approved by the desktop user once. Permissions, read-only mode and policy denials cannot be bypassed by approval. Upload and download accept an items array for single files, batches and recursive directories. Check exit_code/status, and inspect unknown outcomes before retrying.")
     }
 }
 async fn authorize(
@@ -325,15 +517,13 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> std::result::Result<Response, (StatusCode, &'static str)> {
-    // No browser origins are allowed: clients connect server-to-server using a bearer token.
     if request.headers().contains_key("origin") {
         return Err((
             StatusCode::FORBIDDEN,
             "Browser-origin MCP requests are not allowed",
         ));
     }
-    // Wildcard listeners accept literal IP hosts, never arbitrary DNS names.
-    // This replaces the SDK's loopback-only host list for remote IP access.
+
     if address.is_unspecified() {
         let authority = request
             .headers()
@@ -364,8 +554,7 @@ async fn authorize(
             "Missing or invalid MCP bearer token",
         ));
     }
-    // Bound both Content-Length and chunked bodies using the current settings.
-    // JSON escaping can expand UTF-8 text sixfold; base64 needs less space.
+
     let limit = state.settings.lock().unwrap().transfer_limit("write_file") as usize * 6 + 65536;
     if let Some(length) = request.headers().get("content-length") {
         let length = length
@@ -402,7 +591,7 @@ pub async fn start_on(state: Arc<AppState>, port: u16, host: &str) -> Result<Mcp
         .parse()
         .map_err(|_| anyhow::anyhow!("Listen address must be a valid IPv4 or IPv6 address"))?;
     let listener = tokio::net::TcpListener::bind((address, port)).await?;
-    // Remember only successfully bound endpoints for the next desktop launch.
+
     let mut settings = state.settings.lock().unwrap().clone();
     settings.mcp_host = address.to_string();
     settings.mcp_port = port;
@@ -430,7 +619,6 @@ pub async fn start_on(state: Arc<AppState>, port: u16, host: &str) -> Result<Mcp
         move || Ok(RemoteMcp::new(shared.clone())),
         sessions.clone(),
         config
-            // The middleware applies the live limit; this is the supported ceiling.
             .with_max_request_body_bytes(MAX_INLINE_TRANSFER_MIB as usize * 1024 * 1024 * 6 + 65536)
             .with_cancellation_token(cancel.child_token()),
     );
@@ -479,7 +667,8 @@ pub async fn stop(state: Arc<AppState>) -> Result<()> {
         cancel.cancel();
     }
     state.tunnels.stop_mcp();
-    // Wait for the old listener to stop before permitting a restart.
+    crate::terminal::stop_mcp(&state.terminals);
+
     for _ in 0..100 {
         if !state.mcp.lock().unwrap().running {
             return Ok(());
@@ -487,4 +676,33 @@ pub async fn stop(state: Arc<AppState>) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     anyhow::bail!("MCP server is waiting for connections to close; retry shortly")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_and_advanced_tools_follow_live_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(dir.path().to_path_buf()).unwrap();
+        let mcp = RemoteMcp::new(state.clone());
+        assert!(mcp.tool_registered("exec_approved"));
+        assert!(!mcp.tool_registered("terminal"));
+        assert!(mcp.tool_registered("port_forward"));
+        state
+            .save_settings(RuntimeSettings {
+                approval_mode: false,
+                advanced_mcp_tools: AdvancedMcpTools {
+                    terminal: true,
+                    port_forward: false,
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!mcp.tool_registered("exec_approved"));
+        assert!(mcp.tool_registered("terminal"));
+        assert!(!mcp.tool_registered("port_forward"));
+        assert!(mcp.tool_registered("exec"));
+    }
 }

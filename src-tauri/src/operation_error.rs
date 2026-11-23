@@ -1,4 +1,3 @@
-//! Shared error classification and public responses for MCP, transfers and audit.
 use crate::model::Operation;
 use serde_json::{json, Value};
 use std::fmt;
@@ -12,8 +11,7 @@ pub struct OperationError {
 impl fmt::Display for OperationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.code, self.message)?;
-        // Desktop IPC still renders errors as strings. Preserve the actionable
-        // reason there while structured responses read message and details directly.
+
         if let Some(reason) = self
             .details
             .as_ref()
@@ -36,11 +34,10 @@ pub fn error(code: &'static str, message: &'static str) -> anyhow::Error {
     .into()
 }
 
-/// Only transport failures may be replayed. Never replay an uncertain mutation.
 pub fn retryable(error: &anyhow::Error) -> bool {
     match error_code(error) {
         "SSH_TIMEOUT" | "IO_TIMEOUT" | "CONNECTION_LOST" | "CONNECTION_REFUSED" => true,
-        "SSH_CONNECT_FAILED" => true,
+        "SSH_CONNECT_FAILED" | "SSH_SESSION_BUSY" => true,
         "SSH_ERROR" => error.downcast_ref::<ssh2::Error>().is_some_and(|e| {
             matches!(
                 e.code(),
@@ -110,6 +107,10 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
         "NOT_FOUND",
         "PERMISSION_DENIED",
         "SERVER_DISABLED",
+        "SSH_SESSION_BUSY",
+        "SSH_CHANNEL_FAILED",
+        "SSH_SUBMIT_FAILED",
+        "SSH_DISCONNECTED",
         "IO_TIMEOUT",
         "CHECKSUM_MISMATCH",
         "TRANSFER_PAUSED",
@@ -138,7 +139,6 @@ pub fn with_stage(error: anyhow::Error, stage: &'static str) -> anyhow::Error {
     error.context(ErrorStage(stage, message))
 }
 
-/// Shared by MCP results, asynchronous transfer failures and audit previews.
 pub fn error_response(error: &anyhow::Error, op: &Operation) -> Value {
     let code = error_code(error);
     let stage = error
@@ -152,8 +152,10 @@ pub fn error_response(error: &anyhow::Error, op: &Operation) -> Value {
             "READ_ONLY_POLICY"
             | "DELETION_PROTECTED"
             | "TERMINAL_POLICY_DENIED"
+            | "EXEC_DISABLED"
             | "COMMAND_POLICY_DENIED" => "policy",
-            "APPROVAL_TIMEOUT" | "APPROVAL_REJECTED" | "APPROVAL_CANCELLED" => "approval",
+            "APPROVAL_REQUIRED" | "APPROVAL_TIMEOUT" | "APPROVAL_REJECTED"
+            | "APPROVAL_CANCELLED" => "approval",
             _ => "execution",
         });
     let mut details = error
@@ -193,7 +195,6 @@ pub fn error_response(error: &anyhow::Error, op: &Operation) -> Value {
     json!({"code":code,"stage":stage,"message":message,"details":details})
 }
 
-/// A business error owns its public message; context belongs in details.
 pub fn error_message(error: &anyhow::Error) -> String {
     if let Some(known) = error.downcast_ref::<OperationError>() {
         return known.message.into();
@@ -211,7 +212,6 @@ pub fn error_message(error: &anyhow::Error) -> String {
     "Operation failed".into()
 }
 
-/// Native OS diagnostics can be localized; public error templates stay English.
 pub(crate) fn native_message(code: &str) -> Option<&'static str> {
     Some(match code {
         "NOT_FOUND" => "Path not found",

@@ -75,9 +75,7 @@ function rememberFilePath(serverId: string, path: string) {
     ) as Record<string, string>;
     paths[serverId] = path;
     localStorage.setItem(filePathsKey, JSON.stringify(paths));
-  } catch {
-    // Ignore storage failures; the file browser still works for this session.
-  }
+  } catch {}
 }
 
 export function Files({
@@ -357,7 +355,6 @@ export function Files({
     downloading.current.add(entry.path);
     try {
       if (!desktop) {
-        // Browser preview has only a small in-memory demo, never a real SSH transfer.
         const save = await chooseBrowserSave(entry.name);
         if (!save) return;
         const data = await operate<{ base64: string }>({

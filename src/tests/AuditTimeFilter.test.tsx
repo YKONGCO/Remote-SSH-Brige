@@ -1,4 +1,3 @@
-﻿// @vitest-environment jsdom
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { AuditTimeFilter } from "../components/AuditTimeFilter";

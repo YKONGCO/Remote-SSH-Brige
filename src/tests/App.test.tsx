@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
   act,
@@ -13,10 +12,7 @@ import userEvent from "@testing-library/user-event";
 import App from "../App";
 import { EditorView } from "@codemirror/view";
 import * as remoteApi from "../api";
-import {
-  defaultRuntimeSettings,
-  RUNTIME_SETTINGS_CHANGED,
-} from "../runtime-settings";
+import { defaultRuntimeSettings } from "../runtime-settings";
 beforeAll(() => {
   Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
   Range.prototype.getBoundingClientRect = () => new DOMRect();
@@ -705,7 +701,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(23);
+  expect(screen.getAllByRole("combobox")).toHaveLength(21);
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");
@@ -843,34 +839,24 @@ test("server creation uses its toolbar while terminal actions use the titlebar",
   expect(screen.queryByRole("button", { name: "新建终端" })).toBeNull();
 });
 
-test("approval entry follows the runtime approval setting", async () => {
+test("command approval entry is always available for protected commands", async () => {
+  localStorage.clear();
+  render(<App />);
+  await screen.findByRole("button", { name: "服务器" });
+  expect(screen.getByRole("button", { name: "命令审批" })).toBeTruthy();
+});
+
+test("approval entry is hidden when approval mode is disabled", async () => {
   localStorage.clear();
   const realApi = remoteApi.api;
-  let mode: "off" | "mcp" = "off";
-  const requests = vi
-    .spyOn(remoteApi, "api")
-    .mockImplementation(async (command, args) => {
-      if (command === "runtime_settings")
-        return { ...defaultRuntimeSettings, approval_mode: mode } as never;
-      return realApi(command, args);
-    });
-  try {
-    render(<App />);
-    await screen.findByRole("button", { name: "服务器" });
-    expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull();
-    mode = "mcp";
-    await act(async () => {
-      window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
-    });
-    await screen.findByRole("button", { name: "操作审批" });
-    mode = "off";
-    await act(async () => {
-      window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
-    });
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: "操作审批" })).toBeNull(),
-    );
-  } finally {
-    requests.mockRestore();
-  }
+  vi.spyOn(remoteApi, "api").mockImplementation(async (command, args) => {
+    if (command === "runtime_settings")
+      return { ...defaultRuntimeSettings, approval_mode: false } as never;
+    return realApi(command, args);
+  });
+  render(<App />);
+  await screen.findByRole("button", { name: "服务器" });
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "命令审批" })).toBeNull(),
+  );
 });

@@ -31,7 +31,7 @@ fn desktop_preview_supports_twenty_mib_and_bounded_utf8_prefixes() {
     let prefix = read_preview(&mut source, 100, 7).unwrap();
     assert_eq!(prefix["content"], "abc中");
     assert_eq!(prefix["truncated"], true);
-    assert_eq!(source.position(), 8); // exactly one byte of lookahead
+    assert_eq!(source.position(), 8);
     assert_eq!(
         read_preview(Cursor::new("exact"), 5, 5).unwrap()["truncated"],
         false
@@ -129,7 +129,6 @@ fn read_caps_lines_and_bytes_without_cutting_utf8_or_partial_lines() {
 
 #[test]
 fn read_streams_and_enforces_scan_budget_without_partial_results() {
-    // A read that loads the whole input would hit the injected I/O failure.
     struct FailsAfterPrefix {
         prefix: Cursor<Vec<u8>>,
     }
@@ -275,8 +274,6 @@ fn edits_are_sensitive_and_payload_validation_happens_before_io() {
     assert!(security::sensitive(&op, "mcp"));
     settings.remote_read_only = true;
     assert!(security::check(&settings, &op, "mcp").is_err());
-    settings.approval_mode = "mcp".into();
-    assert!(security::needs_approval(&settings, &op, "mcp"));
     op.file_request = Some(FileRequest::Edit { edits: vec![] });
     assert!(file_tools::validate(&op, &settings).is_err());
 }

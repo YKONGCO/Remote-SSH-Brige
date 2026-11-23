@@ -1,8 +1,3 @@
-/* CC Switch palette, pinned to 9941a6455ef9405cf9d3620057fddd283223a607.
- * Source: https://github.com/farion1231/cc-switch/blob/9941a6455ef9405cf9d3620057fddd283223a607/src/index.css
- * MIT: Copyright (c) 2025 Jason Young. See docs/licenses/CC_SWITCH_LICENSE.txt.
- * Base palette follows upstream; action colors use the requested deep blue.
- */
 @layer fluent {
   :root {
     --bg-app: #ffffff;

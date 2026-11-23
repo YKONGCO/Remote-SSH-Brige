@@ -179,7 +179,6 @@ export default function App() {
     [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(
       null,
     ),
-    [approvalEnabled, setApprovalEnabled] = useState(false),
     [mcpBusy, setMcpBusy] = useState(false),
     [loadError, setLoadError] = useState("");
   const notify = useCallback(
@@ -206,7 +205,6 @@ export default function App() {
         setRuntimeSettings(settings);
         setMcpHost(settings.mcp_host);
         setPort(settings.mcp_port);
-        setApprovalEnabled(settings.approval_mode !== "off");
       } catch (error) {
         if (active) notify(String(error), true);
       }
@@ -302,7 +300,6 @@ export default function App() {
           query: auditQuery,
         });
         if (active) {
-          // Keep the previous rows visible until the replacement is ready.
           if (!loaded && auditQuery.offset === 0 && auditScroll.current) {
             auditScroll.current.scrollTop = 0;
           }
@@ -550,18 +547,20 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <ApprovalCenter
-            enabled={approvalEnabled}
-            onResolved={() => void refresh()}
-            onOpenSettings={() => {
-              setPage("settings");
-              requestAnimationFrame(() =>
-                document
-                  .getElementById("security-settings")
-                  ?.scrollIntoView({ block: "start" }),
-              );
-            }}
-          />
+          {runtimeSettings?.approval_mode !== false && (
+            <ApprovalCenter
+              enabled
+              onResolved={() => void refresh()}
+              onOpenSettings={() => {
+                setPage("settings");
+                requestAnimationFrame(() =>
+                  document
+                    .getElementById("security-settings")
+                    ?.scrollIntoView({ block: "start" }),
+                );
+              }}
+            />
+          )}
           <button
             title="MCP 服务"
             aria-label="MCP 服务"

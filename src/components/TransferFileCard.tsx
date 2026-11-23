@@ -27,6 +27,8 @@ const phases: Record<string, string> = {
   queued: "排队中",
   connecting: "正在连接",
   retrying: "等待自动重试",
+  retry_wait: "等待自动重试",
+  stalled: "传输无进度",
   paused: "已暂停",
   pausing: "正在暂停",
   hashing: "正在计算校验值",
@@ -125,9 +127,7 @@ export function TransferFileCard({
               disabled={busy}
               aria-label={`${item.status === "paused" ? "继续" : "重试"} ${name}`}
               title={item.status === "paused" ? "校验断点并继续" : "从断点重试"}
-              onClick={() =>
-                onControl(item, item.status === "paused" ? "resume" : "retry")
-              }
+              onClick={() => onControl(item, "resume")}
             >
               {item.status === "paused" ? (
                 <Play size={14} />

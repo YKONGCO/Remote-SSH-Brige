@@ -1,4 +1,3 @@
-//! Root-scoped SFTP deletion. Preflight first; never recurse through symlinks.
 use crate::operation_error::{error, error_code, error_with_details};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -21,9 +20,9 @@ pub struct Metadata {
 
 pub trait FileSystem {
     fn realpath(&self, path: &str) -> Result<String>;
-    /// lstat, not stat: the final symlink is not followed.
+
     fn metadata(&self, path: &str) -> Result<Metadata>;
-    /// Return exact single-component names; fail rather than exceeding the bound.
+
     fn entries(&self, path: &str, limit: usize, exhaustive: bool) -> Result<Vec<String>>;
     fn unlink(&self, path: &str) -> Result<()>;
     fn rmdir(&self, path: &str) -> Result<()>;
@@ -89,7 +88,6 @@ fn missing(error: &anyhow::Error) -> bool {
     error_code(error) == "NOT_FOUND"
 }
 
-/// Resolve the parent only, preserving the final link itself even if dangling or external.
 fn target(fs: &impl FileSystem, root: &str, path: &str) -> Result<String> {
     let canonical_parent = absolute(&fs.realpath(parent(path))?)?;
     let leaf = path.rsplit('/').next().unwrap();
@@ -205,7 +203,6 @@ pub fn remove(
     let mut removed = 0usize;
     for entry in plan.entries {
         let result = (|| -> Result<bool> {
-            // Parent aliases cannot redirect a planned deletion into a different tree.
             if absolute(&fs.realpath(parent(&entry.path))?)? != parent(&entry.path) {
                 return Err(error(
                     "PATH_CHANGED",

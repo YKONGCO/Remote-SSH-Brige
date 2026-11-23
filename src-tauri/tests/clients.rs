@@ -135,7 +135,7 @@ fn automatic_refresh_only_updates_existing_entries_and_continues_after_errors() 
     let dir = workspace();
     let targets = clients::targets_at(&dir);
     fs::write(&targets[0].path, "{invalid").unwrap();
-    // A mention in an unrelated field must not opt a client into MCP.
+
     fs::create_dir_all(targets[1].path.parent().unwrap()).unwrap();
     fs::write(&targets[1].path, "# remote-ssh\nmodel = 'keep'\n").unwrap();
     fs::create_dir_all(targets[2].path.parent().unwrap()).unwrap();

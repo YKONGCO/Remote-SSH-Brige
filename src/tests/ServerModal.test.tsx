@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -271,7 +270,6 @@ test("explicitly selecting a partial terminal category grants all actions", asyn
       "terminal_open",
       "terminal_read",
       "terminal_write",
-      "terminal_resize",
       "terminal_close",
     ]),
   );
