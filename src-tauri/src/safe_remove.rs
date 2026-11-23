@@ -242,7 +242,7 @@ pub fn remove(
                 return Err(error_with_details(
                     code,
                     "Deletion stopped; inspect the failed path before retrying",
-                    json!({"failed_path":entry.path,"removed_entries":removed,"partial":removed>0 || code=="COMMIT_STATUS_UNKNOWN","outcome_unknown":code=="COMMIT_STATUS_UNKNOWN"}),
+                    json!({"failed_path":entry.path,"removed_entries":removed,"partial":removed>0 || code=="COMMIT_STATUS_UNKNOWN","outcome_unknown":code=="COMMIT_STATUS_UNKNOWN","reason":crate::operation_error::error_message(&e)}),
                 ));
             }
         }

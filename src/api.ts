@@ -3,6 +3,7 @@ import {
   defaultCommandPolicy,
   MAX_TRANSFER_MIB,
   validCommandRules,
+  validProtectedCommandRules,
   type RuntimeSettings,
 } from "./runtime-settings";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -383,7 +384,9 @@ export async function api<T = unknown>(
       throw new Error("高级 MCP 工具设置无效");
     if (
       next.command_policy &&
-      (!validCommandRules(next.command_policy.protected_commands ?? []) ||
+      (!validProtectedCommandRules(
+        next.command_policy.protected_commands ?? [],
+      ) ||
         (next.command_policy.legacy_whitelist != null &&
           !validCommandRules(next.command_policy.legacy_whitelist)))
     )

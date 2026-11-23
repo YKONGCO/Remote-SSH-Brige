@@ -246,6 +246,29 @@ fn invalid_migrated_rule_lists_are_rejected() {
 }
 
 #[test]
+fn literal_combinations_are_valid_only_in_protected_rules() {
+    let policy = CommandPolicy {
+        protected_commands: vec!["docker\trmi".into(), "/opt/deploy --target=prod".into()],
+        ..Default::default()
+    };
+    assert!(policy.validate().is_ok());
+    for invalid in ["docker && rmi", "docker *", "docker\nrmi", "docker $ACTION"] {
+        assert!(CommandPolicy {
+            protected_commands: vec![invalid.into()],
+            ..policy.clone()
+        }
+        .validate()
+        .is_err());
+    }
+    assert!(CommandPolicy {
+        legacy_whitelist: Some(vec!["docker rmi".into()]),
+        ..policy
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
 fn base_checks_keep_read_only_deletion_and_terminal_limits() {
     let mut settings = RuntimeSettings::default();
     let remove = Operation {

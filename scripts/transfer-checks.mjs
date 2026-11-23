@@ -106,7 +106,37 @@ export async function runTransferChecks({
   const value = async (name, args) => {
     const r = await call(name, args);
     assert.ok(!r.isError, r.content[0].text);
-    return JSON.parse(r.content[0].text);
+    if (name === "upload_file" || name === "download_file") {
+      assert.match(r.content[0].text, /^Queued[ :]/);
+      assert.ok(!Object.hasOwn(r.structuredContent, "tasks"));
+      return r.structuredContent;
+    }
+    const text = r.content[0].text;
+    return text.startsWith("{") ? JSON.parse(text) : text;
+  };
+  const readTask = (id) => {
+    const db = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      db.exec("PRAGMA busy_timeout=5000");
+      const row = db
+        .prepare("SELECT record_json FROM transfer_tasks WHERE id=?")
+        .get(id);
+      return row ? JSON.parse(row.record_json) : undefined;
+    } finally {
+      db.close();
+    }
+  };
+  const readSavedSnapshot = async (id, status) => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const snapshot = readTask(id)?.snapshot;
+      if (snapshot?.status === status) return snapshot;
+      assert.ok(
+        Date.now() < deadline,
+        `Task ${id} did not persist status ${status}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   };
   const wait = async (
     id,
@@ -131,7 +161,7 @@ export async function runTransferChecks({
         Date.now() - lastPrinted > 10000
       ) {
         console.log(
-          `TRANSFER ${current.direction}: ${current.transferred_bytes}/${current.total_bytes} bytes (${current.phase})`,
+          `TRANSFER ${id}: ${current.transferred_bytes}/${current.total_bytes} bytes (${current.status})`,
         );
         lastPrinted = Date.now();
       }
@@ -195,10 +225,11 @@ export async function runTransferChecks({
       wait_secs: 10,
     });
     check(
-      "Unversioned transfer.read waits for tiny upload completion and preserves speed",
+      "Unversioned transfer.read waits for tiny upload completion",
       tinyCompleted.status === "completed" &&
         tinyCompleted.transferred_bytes === 28 &&
-        tinyCompleted.bytes_per_second > 0,
+        (await readSavedSnapshot(tiny.transfer_id, "completed"))
+          .bytes_per_second > 0,
     );
     const source = resolve(uploads, "source.bin"),
       destination = resolve(downloads, "saved.bin");
@@ -228,7 +259,7 @@ export async function runTransferChecks({
     });
     check(
       "MCP upload starts with metadata only",
-      upload.status === "queued" &&
+      Boolean(upload.transfer_id) &&
         !Object.hasOwn(upload, "content") &&
         !Object.hasOwn(upload, "base64"),
     );
@@ -276,7 +307,10 @@ export async function runTransferChecks({
     );
     check(
       "SFTP sessions are reused across consecutive transfers",
-      uploaded.session_reuse_count > 0 || downloaded.session_reuse_count > 0,
+      (await readSavedSnapshot(upload.transfer_id, "completed"))
+        .session_reuse_count > 0 ||
+        (await readSavedSnapshot(download.transfer_id, "completed"))
+          .session_reuse_count > 0,
     );
     check(
       "Existing local destination is refused by default",
@@ -478,18 +512,16 @@ export async function runTransferChecks({
     check(
       "Waiting read returns a new version and streamed byte counts",
       running.status === "running" &&
-        running.version > cancelled.version &&
+        running.version > 0 &&
         running.transferred_bytes > 0,
     );
     await cancelGate.waitUntilBlocked();
     check(
       "Cancel acknowledges the request",
-      (
-        await value("transfer", {
-          action: "cancel",
-          transfer_id: cancelled.transfer_id,
-        })
-      ).cancel_requested,
+      (await value("transfer", {
+        action: "cancel",
+        transfer_id: cancelled.transfer_id,
+      })) === "Cancellation requested",
     );
     fixture.transferReadGate = null;
     cancelGate.release();
@@ -546,18 +578,8 @@ export async function runTransferChecks({
       uploads,
       downloads,
       check,
-      readCheckpoint: (id) => {
-        const db = new DatabaseSync(databasePath, { readOnly: true });
-        try {
-          db.exec("PRAGMA busy_timeout=5000");
-          const row = db
-            .prepare("SELECT record_json FROM transfer_tasks WHERE id=?")
-            .get(id);
-          return row ? JSON.parse(row.record_json).checkpoint.hashes.length : 0;
-        } finally {
-          db.close();
-        }
-      },
+      readTask,
+      readSavedSnapshot,
       restart: async () => {
         await client.close();
         const exited = new Promise((r) => proc.once("exit", r));

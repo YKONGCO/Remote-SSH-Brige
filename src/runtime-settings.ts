@@ -12,15 +12,22 @@ export interface CommandPolicy {
   legacy_whitelist?: string[] | null;
 }
 export const MAX_COMMAND_RULES = 4096;
-export function parseCommandList(value: string): string[] {
-  return [...new Set(value.split(/[\s,;，；、]+/u).filter(Boolean))];
+export function parseProtectedCommandRules(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(/\r\n?|\n/)
+        .map((line) => line.trim().replace(/[ \t]+/g, " "))
+        .filter(Boolean),
+    ),
+  ];
 }
 function validRule(name: unknown) {
   return (
     typeof name === "string" &&
     name.length > 0 &&
-    name.length <= 512 &&
-    (name === ":" || /^[\p{L}\p{N}_.+\-/]+$/u.test(name)) &&
+    [...name].length <= 512 &&
+    (name === ":" || !/[^\p{L}\p{N}_.+\-/]/u.test(name)) &&
     (!name.includes("/") ||
       (name.startsWith("/") &&
         name
@@ -34,6 +41,20 @@ export function validCommandRules(rules: unknown) {
     Array.isArray(rules) &&
     rules.length <= MAX_COMMAND_RULES &&
     rules.every(validRule)
+  );
+}
+export function validProtectedCommandRules(rules: unknown) {
+  return (
+    Array.isArray(rules) &&
+    rules.length <= MAX_COMMAND_RULES &&
+    rules.every((rule: unknown) => {
+      if (typeof rule !== "string" || [...rule].length > 512) return false;
+      const [name, ...args] = rule.split(/[ \t]+/).filter(Boolean);
+      return (
+        validRule(name) &&
+        args.every((arg) => !/[^\p{L}\p{N}_.+\-/:=@%]/u.test(arg))
+      );
+    })
   );
 }
 export function advancedShell(policy: CommandPolicy) {

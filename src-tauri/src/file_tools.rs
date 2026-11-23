@@ -210,11 +210,7 @@ pub fn read_page(
             }
         }
         if long_line {
-            reason = Some(if returned == 0 {
-                "long_line"
-            } else {
-                "output_bytes"
-            });
+            reason = Some("long_line");
             break;
         }
         if !complete {
@@ -255,13 +251,13 @@ pub fn read_page(
         } else {
             error(
                 "READ_SCAN_LIMIT",
-                "Cannot locate offset within scan budget; use bounded exec inspection if permitted",
+                "Scan budget exhausted before reading a complete line at this offset; use bounded exec inspection if permitted",
             )
         });
     }
-    let has_more = !eof;
+    let has_more = reason.is_some();
     let first_line_exceeds_limit = returned == 0 && long_line;
-    let next = if has_more && !first_line_exceeds_limit {
+    let next = if matches!(reason, Some("requested_limit" | "output_bytes")) {
         Some(offset + returned)
     } else {
         None
@@ -270,7 +266,7 @@ pub fn read_page(
         "content":content, "start_line":if returned > 0 {Some(offset)} else {None},
         "end_line":if returned > 0 {Some(offset + returned - 1)} else {None},
         "returned_lines":returned, "has_more":has_more, "next_offset":next,
-        "total_lines":if eof {Some(line_number.saturating_sub(1))} else {None},
+        "total_lines":if !has_more {Some(line_number.saturating_sub(1))} else {None},
         "truncated":has_more, "truncated_by":reason,
         "first_line_exceeds_limit":first_line_exceeds_limit, "scanned_bytes":scanned
     }))

@@ -658,32 +658,16 @@ try {
             ? args
             : { server_id: "test-host", ...args },
       });
+      const blocks = result.content.map((block) => block.text);
       if (result.isError) {
-        assert.equal(
-          result.structuredContent,
-          undefined,
-          "Error payload must not be duplicated",
-        );
-        assert.equal(result.content.length, 1);
-        const text = result.content[0].text;
-        assert.equal(typeof text, "string");
-        assert.ok(text.length > 0);
-        assert.ok(!text.includes("\n"));
-        assert.ok(!text.includes('"command_policy"'));
-        if (text.startsWith("{")) {
-          const denial = JSON.parse(text);
-          assert.equal(typeof denial.code, "string");
-          assert.equal(typeof denial.retryable, "boolean");
-          assert.ok(!denial.details);
-          assert.ok([...denial.message].length <= 240);
-        } else {
-          assert.ok([...text].length <= 240);
-        }
-        assert.ok(!/[\u3400-\u9fff]/u.test(text), text);
+        assert.equal(result.structuredContent, undefined);
+        assert.match(blocks[0], /^[A-Z_]+: /);
+        assert.ok(!blocks[0].includes('"command_policy"'));
       }
       return {
         error: result.isError,
-        value: result.content?.map((c) => c.text || "").join(""),
+        value: blocks[0],
+        notices: blocks.slice(1),
         metadata: result.structuredContent,
       };
     } catch (error) {
@@ -694,25 +678,22 @@ try {
   const value = async (name, args) => {
     const r = await call(name, args);
     assert.ok(!r.error, r.value);
-    return name === "read_file"
-      ? { content: r.value, ...r.metadata }
-      : name === "terminal" && args?.action === "read"
-        ? { stdout: r.value, ...r.metadata }
-        : JSON.parse(r.value);
+    if (name === "read_file") return { content: r.value, ...r.metadata };
+    if (name === "terminal" && args?.action === "read")
+      return { stdout: r.value, ...r.metadata };
+    if (name === "exec" || (name === "job" && args.action !== "list"))
+      return { output: r.value, notices: r.notices, ...r.metadata };
+    return /^[{\[]/.test(r.value) ? JSON.parse(r.value) : r.value;
   };
   const jobSchema = tools.tools.find((t) => t.name === "job").inputSchema;
   const blockedFindCommand =
     "find /tmp -maxdepth 1 -name 'wlx*' -exec rm -rf {} ';'";
   const blockedFind = await call("exec", { command: blockedFindCommand });
-  const blockedFindError = blockedFind.error
-    ? JSON.parse(blockedFind.value)
-    : {};
   check(
     "Protected exec returns compact approval guidance without connecting",
     blockedFind.error &&
-      blockedFindError.code === "APPROVAL_REQUIRED" &&
-      blockedFindError.next_tool === "exec_approved" &&
-      blockedFindError.matched_rules.length > 0 &&
+      blockedFind.value ===
+        "APPROVAL_REQUIRED: Use exec_approved with the same arguments." &&
       (executionCounts.get(blockedFindCommand) || 0) === 0,
   );
   check(
@@ -840,9 +821,9 @@ try {
   check(
     "Directory listing is paginated and contains metadata",
     listing.entries.length === 1 &&
-      listing.has_more &&
       listing.next_offset === 1 &&
-      typeof listing.entries[0].permissions === "string",
+      typeof listing.entries[0].type === "string" &&
+      !Object.hasOwn(listing.entries[0], "path"),
   );
   const metadata = await value("stat_file", { path: "/workspace/hello.txt" });
   check(
@@ -905,7 +886,6 @@ try {
     shellInfo.exec.available &&
       shellInfo.exec_approved.available &&
       shellInfo.exec_approved.timeout_secs >= 1 &&
-      shellInfo.approval_required &&
       !Object.hasOwn(shellInfo, "command_policy") &&
       !Object.hasOwn(shellInfo, "protected_commands"),
   );
@@ -919,7 +899,7 @@ try {
     const result = await call("exec", { command });
     check(
       `Enabled Shell feature reaches SSH: ${command}`,
-      !result.error && JSON.parse(result.value).stdout.includes(command),
+      !result.error && result.value.includes(command) && !result.metadata,
     );
   }
   for (const command of [
@@ -930,7 +910,7 @@ try {
     const result = await call("exec", { command });
     check(
       `High-risk command requires approval with Shell enabled: ${command}`,
-      result.error && JSON.parse(result.value).code === "APPROVAL_REQUIRED",
+      result.error && result.value.startsWith("APPROVAL_REQUIRED:"),
     );
   }
   check(
@@ -960,8 +940,6 @@ try {
     limitedHost.capabilities.includes("read_file") &&
       !limitedHost.capabilities.includes("exec") &&
       !limitedHost.capabilities.includes("upload_file") &&
-      limitedHost.advanced_tools.terminal === true &&
-      limitedHost.advanced_tools.port_forward === true &&
       limitedHost.capabilities.includes("terminal_open") &&
       limitedHost.capabilities.includes("terminal_read") &&
       limitedHost.capabilities.includes("terminal_close"),
@@ -1002,8 +980,9 @@ try {
   check(
     "Real SSH exec captures stdout, stderr and nonzero exit",
     exec.exit_code === 7 &&
-      exec.stdout.includes("stdout ✓") &&
-      exec.stderr.includes("stderr ✓"),
+      exec.output.startsWith("Exit 7\n") &&
+      exec.output.includes("stdout ✓") &&
+      exec.output.includes("stderr ✓"),
   );
   for (const command of [
     "ls -la /workspace",
@@ -1016,12 +995,12 @@ try {
     const result = await value("exec", { command });
     check(
       "Use exec instead of a dedicated tool: " + command,
-      result.stdout.includes(command),
+      result.output.includes(command),
     );
   }
   check(
     "Repeated execs reuse a healthy SSH session",
-    (await value("exec", { command: "pwd" })).stdout.length > 0,
+    (await value("exec", { command: "pwd" })).output.length > 0,
   );
   const text = await value("read_file", { path: "/workspace/hello.txt" });
   check("Read remote UTF-8 file", text.content === "hello SSH\n");
@@ -1052,7 +1031,9 @@ try {
     "Read returns raw text with continuation metadata",
     !page.error &&
       page.value === "一\r\n二\r\n" &&
-      page.metadata.next_offset === 3,
+      page.metadata.next_offset === 3 &&
+      page.notices[0].includes("Showing lines 1-2") &&
+      page.notices[0].includes("offset=3"),
   );
   check(
     "Read continuation preserves original bytes",
@@ -1215,8 +1196,7 @@ try {
   });
   check(
     "Safe removal requires deletion protection off while command protection stays on",
-    cleanup.removed &&
-      cleanup.removed_entries === 1 &&
+    cleanup === "OK" &&
       !entries.has("/workspace/mcp_test_remote_ssh.txt") &&
       !(await value("server_info", { topic: "permissions" }))
         .deletion_protected &&
@@ -1226,10 +1206,7 @@ try {
   const repeated = await value("remove_path", {
     path: "/workspace/mcp_test_remote_ssh.txt",
   });
-  check(
-    "Safe cleanup is idempotent",
-    repeated.missing && !repeated.removed && repeated.removed_entries === 0,
-  );
+  check("Safe cleanup is idempotent", repeated === "Already absent");
   check(
     "Strict missing mode reports a missing target",
     /not found|no such|不存在/i.test(
@@ -1263,21 +1240,21 @@ try {
   });
   check(
     "Recursive deletion unlinks symlinks instead of their targets",
-    removedTree.removed_entries === 5 &&
+    removedTree === "Removed 5 entries" &&
       !entries.has("/workspace/delete-tree") &&
       entries.has("/outside/secret"),
   );
   entries.set("/workspace/empty-dir", null);
   check(
     "Empty directories need no recursive flag",
-    (await value("remove_path", { path: "/workspace/empty-dir" })).kind ===
-      "directory",
+    (await value("remove_path", { path: "/workspace/empty-dir" })) === "OK" &&
+      !entries.has("/workspace/empty-dir"),
   );
   entries.set("/workspace/dangling-link", { link: "/outside/absent" });
   check(
     "Dangling link itself is removed",
-    (await value("remove_path", { path: "/workspace/dangling-link" })).kind ===
-      "symlink",
+    (await value("remove_path", { path: "/workspace/dangling-link" })) ===
+      "OK" && !entries.has("/workspace/dangling-link"),
   );
   const outside = await call("remove_path", { path: "/outside/secret" });
   check(
@@ -1309,7 +1286,8 @@ try {
   check(
     "Recursive deletion reports partial progress on server denial",
     partial.error &&
-      partial.value.includes("removed entries: 1") &&
+      partial.value.includes("Removed entries: 1") &&
+      partial.value.includes("Failed path: /workspace/partial/b") &&
       !entries.has("/workspace/partial/a") &&
       entries.has("/workspace/partial/b"),
   );
@@ -1324,13 +1302,14 @@ try {
   check(
     "Lost delete response reports unknown outcome without retry",
     unknownDelete.error &&
-      unknownDelete.value.includes("outcome unknown") &&
+      unknownDelete.value.includes("Outcome unknown") &&
       fixture.deleteCalls === deleteCalls + 1 &&
       !entries.has("/workspace/delete-unknown"),
   );
   check(
     "Cleanup can be safely retried after inspecting unknown outcome",
-    (await value("remove_path", { path: "/workspace/delete-unknown" })).missing,
+    (await value("remove_path", { path: "/workspace/delete-unknown" })) ===
+      "Already absent",
   );
   const terminal = await value("terminal", {
     action: "open",
@@ -1434,10 +1413,11 @@ try {
       timeout_secs: 1,
     });
     check(
-      "Timeout error returns only its concise reason",
+      "Timeout reports why retention was disabled and any partial output",
       timed.error &&
         timed.value.includes("job") &&
-        !timed.value.includes("before ✓"),
+        timed.value.includes("Outcome unknown") &&
+        timed.notices.some((part) => part.includes("before ✓")),
     );
   } else {
     const notifications = [];
@@ -1454,13 +1434,13 @@ try {
       { onprogress: (p) => notifications.push(p) },
     );
     check("Timeout handoff is a successful tool result", !result.isError);
-    const retained = JSON.parse(result.content[0].text);
+    const retained = result.structuredContent;
     check(
       "Retained execution returns output, byte cursors and running state",
       retained.status === "running" &&
-        retained.stdout === "before ✓\n" &&
-        retained.stderr === "error before ✓\n" &&
-        retained.next_stdout_cursor === Buffer.byteLength(retained.stdout),
+        result.content[0].text.includes("before ✓\n") &&
+        result.content[0].text.includes("error before ✓\n") &&
+        retained.stdout_cursor === Buffer.byteLength("before ✓\n"),
     );
     check(
       "Foreground exec sends bounded progress notifications",
@@ -1477,30 +1457,29 @@ try {
     const incremental = await value("job", {
       action: "read",
       job_id: retained.job_id,
-      stdout_cursor: retained.next_stdout_cursor,
-      stderr_cursor: retained.next_stderr_cursor,
+      stdout_cursor: retained.stdout_cursor,
+      stderr_cursor: retained.stderr_cursor,
       wait_secs: 10,
     });
     check(
       "job.read wakes early and returns only incremental bytes",
       Date.now() - readStarted < 2000 &&
-        incremental.stdout === "after ✓\n" &&
-        incremental.stderr === "error after ✓\n",
+        incremental.output === "stdout:\nafter ✓\n\n\nstderr:\nerror after ✓\n",
     );
     held.stream.exit(9);
     held.stream.end();
     const final = await value("job", {
       action: "read",
       job_id: retained.job_id,
-      stdout_cursor: incremental.next_stdout_cursor,
-      stderr_cursor: incremental.next_stderr_cursor,
+      stdout_cursor: incremental.stdout_cursor,
+      stderr_cursor: incremental.stderr_cursor,
       wait_secs: 10,
     });
     check(
       "Final nonzero exit code remains available without repeated execution",
-      final.status === "exited" &&
-        final.exit_code === 9 &&
-        final.stdout === "" &&
+      final.exit_code === 9 &&
+        final.output === "Exit 9" &&
+        final.stdout_cursor === undefined &&
         executionCounts.get("fixture:job-incremental") === 1,
     );
     check(
@@ -1519,7 +1498,7 @@ try {
         await call("job", {
           action: "read",
           job_id: retained.job_id,
-          stdout_cursor: final.next_stdout_cursor + 1,
+          stdout_cursor: incremental.stdout_cursor + 1,
         })
       ).error,
     );
@@ -1606,14 +1585,16 @@ try {
       if (highFinal.status !== "running") break;
       await new Promise((r) => setTimeout(r, 20));
     }
+    const retainedStreams = highFinal.output.match(/x+/g);
     check(
       "Both streams drain without readers and retain only 4 MiB each",
-      highFinal.status === "exited" &&
-        highFinal.stdout.length === 4 * 1024 * 1024 &&
-        highFinal.stderr.length === 4 * 1024 * 1024 &&
-        highFinal.stdout_truncated &&
-        highFinal.stderr_truncated &&
-        highFinal.next_stdout_cursor === high.next_stdout_cursor + block.length,
+      highFinal.status === undefined &&
+        highFinal.output.startsWith("stdout:\n") &&
+        retainedStreams?.length === 2 &&
+        retainedStreams.every((stream) => stream.length === 4 * 1024 * 1024) &&
+        highFinal.notices[0].includes("Earlier stdout lost") &&
+        highFinal.notices[0].includes("Earlier stderr lost") &&
+        highFinal.stdout_cursor === high.stdout_cursor + block.length,
     );
     const active = await Promise.all(
       Array.from({ length: 4 }, (_, i) =>
@@ -1635,8 +1616,8 @@ try {
     check(
       "Close confirms closed with unknown exit code and preserves output",
       closed.status === "closed" &&
-        closed.exit_code === null &&
-        closed.stdout === "before ✓\n",
+        closed.exit_code === undefined &&
+        closed.output.includes("before ✓\n"),
     );
     check(
       "Closing a completed session preserves its result",
@@ -1646,15 +1627,19 @@ try {
     const disconnectedPromise = value("job", {
       action: "read",
       job_id: active[1].job_id,
-      stdout_cursor: active[1].next_stdout_cursor,
-      stderr_cursor: active[1].next_stderr_cursor,
+      stdout_cursor: active[1].stdout_cursor,
+      stderr_cursor: active[1].stderr_cursor,
       wait_secs: 10,
     });
     heldExecutions.get("fixture:job-active-1").client.end();
     const disconnected = await disconnectedPromise;
     check(
       "SSH disconnect has unknown final result",
-      disconnected.status === "disconnected" && disconnected.exit_code === null,
+      disconnected.status === "disconnected" &&
+        disconnected.exit_code === undefined &&
+        [disconnected.output, ...disconnected.notices]
+          .join("\n")
+          .includes("execution outcome unknown"),
     );
     await Promise.all(
       active

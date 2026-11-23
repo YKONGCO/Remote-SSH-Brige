@@ -227,25 +227,45 @@ impl CommandPolicy {
                 list.len() <= MAX_COMMAND_RULES,
                 "Each command list supports at most {MAX_COMMAND_RULES} entries"
             );
-            for name in list {
+        }
+        for (index, rule) in self.protected_commands.iter().enumerate() {
+            let mut words = protected_rule_words(rule);
+            anyhow::ensure!(
+                rule.chars().count() <= 512
+                    && words.next().is_some_and(valid_command_name)
+                    && words.all(|arg| arg.chars().all(|c| c.is_alphanumeric() || "_.+-/:=@%".contains(c))),
+                "Protected rule {} must contain a command name or absolute path followed by optional literal arguments",
+                index + 1
+            );
+        }
+        if let Some(whitelist) = &self.legacy_whitelist {
+            for name in whitelist {
                 anyhow::ensure!(
-                    !name.is_empty()
-                        && name.chars().count() <= 512
-                        && (name == ":" || name
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || "_.+-/".contains(c)))
-                        && (!name.contains('/')
-                            || (name.starts_with('/')
-                                && name
-                                    .split('/')
-                                    .skip(1)
-                                    .all(|part| !part.is_empty() && part != "." && part != ".."))),
-                    "Command rules must be names or absolute paths without arguments, wildcards or shell syntax"
+                    name.chars().count() <= 512 && valid_command_name(name),
+                    "Legacy allowlist entries must be command names or absolute paths"
                 );
             }
         }
         Ok(())
     }
+}
+
+pub(crate) fn protected_rule_words(rule: &str) -> impl Iterator<Item = &str> {
+    rule.split([' ', '\t']).filter(|word| !word.is_empty())
+}
+
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && (name == ":"
+            || name
+                .chars()
+                .all(|c| c.is_alphanumeric() || "_.+-/".contains(c)))
+        && (!name.contains('/')
+            || (name.starts_with('/')
+                && name
+                    .split('/')
+                    .skip(1)
+                    .all(|part| !part.is_empty() && part != "." && part != "..")))
 }
 
 pub fn migrate_settings_value(mut value: serde_json::Value) -> anyhow::Result<serde_json::Value> {

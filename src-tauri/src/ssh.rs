@@ -541,7 +541,8 @@ pub fn operate_with_settings(
             }
             let mut entries = scanned.into_iter().map(|(p, st)| {
                 json!({"name":p.file_name().unwrap_or_default().to_string_lossy(), "path": p.to_string_lossy().replace('\\', "/"),
-                    "is_dir": st.is_dir(), "is_symlink": st.file_type().is_symlink(), "size":st.size.unwrap_or(0),
+                    "is_dir": st.is_dir(), "is_symlink": st.file_type().is_symlink(),
+                    "size":if op.file_request.is_some() {st.size} else {Some(st.size.unwrap_or(0))},
                     "modified":st.mtime.unwrap_or(0), "permissions": format!("{:o}", st.perm.unwrap_or(0) & 0o777)})
             }).collect::<Vec<_>>();
             entries.sort_by(|a, b| {

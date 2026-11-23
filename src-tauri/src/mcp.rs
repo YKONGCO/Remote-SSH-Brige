@@ -107,11 +107,12 @@ impl RemoteMcp {
                 biased;
                 result = &mut execution => break result,
                 Some(chunk) = rx.recv(), if token.is_some() => {
-                    count += 1;
                     if let (Some(ctx), Some(token)) = (&ctx, &token) {
-
-                        let notification = ProgressNotificationParam::new(ProgressToken(token.clone()), count as f64).with_message(chunk.to_string());
-                        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ctx.peer.notify_progress(notification)).await;
+                        if let Some(message) = crate::mcp_response::progress(&chunk) {
+                            count += 1;
+                            let notification = ProgressNotificationParam::new(ProgressToken(token.clone()), count as f64).with_message(message);
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ctx.peer.notify_progress(notification)).await;
+                        }
                     }
                 }
             }
@@ -138,9 +139,10 @@ impl RemoteMcp {
     async fn server_info(&self, Parameters(a): Parameters<ServerInfoArgs>) -> CallToolResult {
         let result = (|| -> anyhow::Result<serde_json::Value> {
             let server = self.state.server(&a.server_id)?;
+            anyhow::ensure!(server.enabled, "SERVER_DISABLED: Server is disabled");
             anyhow::ensure!(
-                server.enabled && server.mcp_enabled,
-                "Server is unavailable to MCP"
+                server.mcp_enabled,
+                "PERMISSION_DENIED: Server is unavailable to MCP"
             );
             let policy = self.state.settings.lock().unwrap().clone();
             let command_policy = policy.effective_command_policy();
@@ -184,38 +186,27 @@ impl RemoteMcp {
             Ok(match a.topic {
                 ServerInfoTopic::Permissions => {
                     serde_json::json!({
-                        "server_id":server.id,
-                        "server_name":server.name,
                         "read_only":policy.remote_read_only,
                         "deletion_protected":policy.deletion_protection,
                         "capabilities":capabilities,
-                        "approval":{
-                            "tool":"exec_approved",
-                            "available":approval_available,
-                            "timeout_secs":policy.approval_timeout_secs,
-                        },
-                        "advanced_tools":{
-                            "terminal":policy.advanced_mcp_tools.terminal,
-                            "port_forward":policy.advanced_mcp_tools.port_forward,
-                        },
                     })
                 }
                 ServerInfoTopic::Transfers => {
-                    let upload =
-                        server.permits_mcp("upload_file") && server.permits_mcp("transfer");
+                    let upload = !policy.remote_read_only
+                        && server.permits_mcp("upload_file")
+                        && server.permits_mcp("transfer");
                     let download =
                         server.permits_mcp("download_file") && server.permits_mcp("transfer");
+                    let access = |allowed, limit, roots: &[String]| {
+                        if allowed {
+                            serde_json::json!({"allowed":true,"limit_mib":limit,"local_roots":roots})
+                        } else {
+                            serde_json::json!({"allowed":false})
+                        }
+                    };
                     serde_json::json!({
-                        "upload":{
-                            "allowed":upload,
-                            "limit_mib":policy.upload_limit_mib,
-                            "local_roots":if upload {policy.local_upload_roots} else {vec![]},
-                        },
-                        "download":{
-                            "allowed":download,
-                            "limit_mib":policy.download_limit_mib,
-                            "local_roots":if download {policy.local_download_roots} else {vec![]},
-                        },
+                        "upload":access(upload, policy.upload_limit_mib, &policy.local_upload_roots),
+                        "download":access(download, policy.download_limit_mib, &policy.local_download_roots),
                         "limits":{
                             "max_items":100,
                             "max_entries":1000,
@@ -224,14 +215,14 @@ impl RemoteMcp {
                     })
                 }
                 ServerInfoTopic::Commands => {
+                    let mut approved = serde_json::json!({"available": approval_available});
+                    if approval_available {
+                        approved["timeout_secs"] = serde_json::json!(policy.approval_timeout_secs);
+                    }
                     serde_json::json!({
                         "exec":{"available":exec_available},
-                        "exec_approved":{
-                            "available":approval_available,
-                            "timeout_secs":policy.approval_timeout_secs,
-                        },
-                        "approval_required":policy.approval_mode,
-                        "timeout_to_job":policy.exec_timeout_to_job,
+                        "exec_approved":approved,
+                        "timeout_to_job":exec_available && policy.exec_timeout_to_job && server.permits_mcp("job"),
                     })
                 }
             })
@@ -246,7 +237,7 @@ impl RemoteMcp {
         )
     }
     #[tool(
-        description = "Execute a normal command. Protected commands return APPROVAL_REQUIRED with the matching rules when approval mode is enabled; retry them with exec_approved using the same arguments. Check exit_code; on timeout a retained session returns job_id for job.read."
+        description = "Execute a command. Returns output or a nonzero exit code. APPROVAL_REQUIRED directs you to exec_approved. A retained command returns a job ID and cursors for job.read."
     )]
     async fn exec(
         &self,
@@ -277,7 +268,7 @@ impl RemoteMcp {
         self.call(&kind, op).await
     }
     #[tool(
-        description = "List, read or close retained commands. Continue reads using returned byte cursors; check status and exit_code."
+        description = "List, read or close retained commands. Read returns new output and byte cursors when further reads are needed."
     )]
     async fn job(
         &self,
@@ -329,7 +320,7 @@ impl RemoteMcp {
         )
     }
     #[tool(
-        description = "Manage transfers by transfer_id or group_id: list/read/pause/resume/cancel. Read supports version and wait_secs; resume also retries failed tasks."
+        description = "List, read, pause, resume or cancel transfers. Single-transfer reads support version and wait_secs. Resume also retries failed tasks."
     )]
     async fn transfer(
         &self,
@@ -339,18 +330,20 @@ impl RemoteMcp {
         self.call_with_progress("transfer", a, Some(ctx)).await
     }
     #[tool(
-        description = "Read UTF-8 text, at most 2000 lines/50 KiB. Continue at next_offset; metadata is in structuredContent."
+        description = "Read UTF-8 text, at most 2000 lines/50 KiB. Follow the offset in the continuation notice."
     )]
     async fn read_file(&self, Parameters(a): Parameters<ReadArgs>) -> CallToolResult {
         self.call("read_file", a).await
     }
     #[tool(
-        description = "List directory metadata with pagination. Continue at next_offset when has_more."
+        description = "List directory names, types and file sizes. Follow the offset in the continuation notice."
     )]
     async fn list_files(&self, Parameters(a): Parameters<ListArgs>) -> CallToolResult {
         self.call("list_files", a).await
     }
-    #[tool(description = "Read resolved path metadata via SFTP within the server file root.")]
+    #[tool(
+        description = "Read resolved path metadata via SFTP. Modification time is in Unix seconds."
+    )]
     async fn stat_file(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         self.call("stat_file", a).await
     }
@@ -424,7 +417,7 @@ impl RemoteMcp {
             ..Default::default()
         };
         match self.state.log(&server, "mcp", &op, &Ok(data.clone()), 0) {
-            Ok(()) => crate::mcp_response::success(kind, data),
+            Ok(()) => crate::mcp_response::success(&op, &data),
             Err(error) => crate::mcp_response::failure(
                 &op,
                 &crate::operation_error::with_stage(
@@ -487,7 +480,7 @@ impl ServerHandler for RemoteMcp {
                 } else {
                     error.message.to_string()
                 };
-                error.message = crate::mcp_response::short_line(&message).into();
+                error.message = crate::mcp_response::bounded(&message, 4096).into();
                 error.data = None;
                 error
             })
@@ -509,7 +502,7 @@ impl ServerHandler for RemoteMcp {
                 .build(),
         )
         .with_server_info(info)
-        .with_instructions("Use list_servers for IDs. Local paths belong to the app host. Ordinary commands run directly; a protected or statically unresolved command returns APPROVAL_REQUIRED and must be retried with exec_approved using identical arguments when approval mode is enabled, then approved by the desktop user once. Permissions, read-only mode and policy denials cannot be bypassed by approval. Upload and download accept an items array for single files, batches and recursive directories. Check exit_code/status, and inspect unknown outcomes before retrying.")
+        .with_instructions("Use list_servers for IDs. Local paths belong to the app host. Follow continuation notices for paginated results and output streams. Use exec_approved with identical arguments when approval is required. Inspect remote state before retrying an unknown outcome.")
     }
 }
 async fn authorize(

@@ -158,6 +158,31 @@ fn read_streams_and_enforces_scan_budget_without_partial_results() {
 }
 
 #[test]
+fn read_continues_at_an_unterminated_final_line_that_did_not_fit() {
+    let first = "x".repeat(MAX_BYTES - 1) + "\n";
+    let bytes = first.clone() + "last";
+    let page = read_page(Cursor::new(&bytes), 1, 2000, MAX_BYTES as u64 + 4).unwrap();
+    assert_eq!(page["content"], first);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["next_offset"], 2);
+    let last = read_page(Cursor::new(bytes), 2, 2000, MAX_BYTES as u64 + 4).unwrap();
+    assert_eq!(last["content"], "last");
+    assert_eq!(last["has_more"], false);
+}
+
+#[test]
+fn read_stops_without_a_cursor_when_the_next_line_cannot_be_read() {
+    let bytes = format!("prefix\n{}", "a".repeat(MAX_BYTES + 1));
+    for (budget, reason) in [(12, "scan_bytes"), (MAX_BYTES as u64 + 20, "long_line")] {
+        let page = read_page(Cursor::new(&bytes), 1, 2000, budget).unwrap();
+        assert_eq!(page["content"], "prefix\n");
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["truncated_by"], reason);
+        assert!(page["next_offset"].is_null());
+    }
+}
+
+#[test]
 fn read_rejects_binary_and_invalid_utf8() {
     for bytes in [vec![0, 1], vec![0xff]] {
         assert_eq!(

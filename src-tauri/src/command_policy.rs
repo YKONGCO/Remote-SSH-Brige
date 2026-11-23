@@ -1,5 +1,8 @@
-use crate::model::{CommandPolicy, RuntimeSettings, LEGACY_DIAGNOSTIC_COMMANDS};
+use crate::model::{
+    protected_rule_words, CommandPolicy, RuntimeSettings, LEGACY_DIAGNOSTIC_COMMANDS,
+};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
@@ -469,6 +472,7 @@ fn inspect_command(
     if words.is_empty() {
         return Ok(());
     }
+    let mut dynamic = vec![false; words.len()];
     let mut cursor = node.walk();
     for argument in node.children_by_field_name("argument", &mut cursor) {
         let raw = text(argument, source);
@@ -477,8 +481,9 @@ fn inspect_command(
             .map(|mut words| words.remove(0))
             .unwrap_or_else(|| raw.to_string());
         words.push(value);
+        dynamic.push(has_dynamic(argument));
     }
-    inspect_words(&words, policy, nesting, analysis)
+    inspect_words(&words, &dynamic, policy, nesting, analysis)
 }
 
 fn basename(name: &str) -> &str {
@@ -505,6 +510,7 @@ fn matches_rule(rule: &str, first: &str, name: &str) -> bool {
 
 fn inspect_words(
     words: &[String],
+    dynamic: &[bool],
     policy: &CommandPolicy,
     nesting: usize,
     analysis: &mut Analysis,
@@ -520,7 +526,7 @@ fn inspect_words(
     let args = &words[1..];
     analysis.commands.push(first.clone());
 
-    if first.chars().any(|c| "$`*?[]{}".contains(c)) {
+    if dynamic.first() == Some(&true) || first.chars().any(|c| "$`*?[]{}".contains(c)) {
         uncertain(
             analysis,
             first,
@@ -529,17 +535,44 @@ fn inspect_words(
         return Ok(());
     }
 
-    if policy
-        .protected_commands
-        .iter()
-        .any(|rule| matches_rule(rule, first, name))
-    {
-        analysis.matches.push(RuleMatch {
-            source: "user",
-            command: name.to_string(),
-            reason: format!("'{name}' is protected by a user rule"),
-            argument: None,
-        });
+    let mut possible_rule = None;
+    for rule in &policy.protected_commands {
+        let mut pattern = protected_rule_words(rule);
+        if !pattern
+            .next()
+            .is_some_and(|command| matches_rule(command, first, name))
+        {
+            continue;
+        }
+        let mut exact = true;
+        for (index, expected) in pattern.enumerate() {
+            if dynamic.get(index + 1) == Some(&true) {
+                possible_rule.get_or_insert(rule);
+                exact = false;
+                break;
+            }
+            if args.get(index).is_none_or(|actual| actual != expected) {
+                exact = false;
+                break;
+            }
+        }
+        if exact {
+            possible_rule = None;
+            analysis.matches.push(RuleMatch {
+                source: "user",
+                command: name.to_string(),
+                reason: format!("'{rule}' is protected by a user rule"),
+                argument: None,
+            });
+            break;
+        }
+    }
+    if let Some(rule) = possible_rule {
+        uncertain(
+            analysis,
+            name,
+            format!("Dynamic arguments could match protected rule '{rule}'"),
+        );
     }
 
     for rule in BUILTIN_RULES {
@@ -660,7 +693,7 @@ fn inspect_words(
         } else if name == "runuser" {
             match wrapper_inner(name, args) {
                 Some(inner) if !inner.is_empty() => {
-                    inspect_words(&inner, policy, nesting + 1, analysis)?
+                    inspect_wrapped(&inner, dynamic, policy, nesting, analysis)?
                 }
                 _ => uncertain(analysis, name, "runuser without a command starts a shell"),
             }
@@ -706,7 +739,7 @@ fn inspect_words(
             let inner = wrapper_inner(name, args);
             match inner {
                 Some(inner) if !inner.is_empty() => {
-                    inspect_words(&inner, policy, nesting + 1, analysis)?;
+                    inspect_wrapped(&inner, dynamic, policy, nesting, analysis)?;
                 }
                 Some(_) => {}
                 None if matches!(name, "sudo" | "doas") => uncertain(
@@ -790,19 +823,37 @@ fn is_wrapper(name: &str) -> bool {
     .contains(&name)
 }
 
-fn wrapper_inner(name: &str, args: &[String]) -> Option<Vec<String>> {
+fn inspect_wrapped(
+    inner: &Cow<'_, [String]>,
+    dynamic: &[bool],
+    policy: &CommandPolicy,
+    nesting: usize,
+    analysis: &mut Analysis,
+) -> Result<(), String> {
+    let dynamic = match inner {
+        Cow::Borrowed(words) if dynamic.len() >= words.len() => {
+            &dynamic[dynamic.len() - words.len()..]
+        }
+        _ => &[],
+    };
+    inspect_words(inner, dynamic, policy, nesting + 1, analysis)
+}
+
+fn wrapper_inner<'a>(name: &str, args: &'a [String]) -> Option<Cow<'a, [String]>> {
     if name == "env" {
         for (index, arg) in args.iter().enumerate() {
             if let Some(code) = arg
                 .strip_prefix("--split-string=")
                 .or_else(|| arg.strip_prefix("-S").filter(|code| !code.is_empty()))
             {
-                return Some(shlex::split(code).unwrap_or_else(|| vec![code.to_string()]));
+                return Some(Cow::Owned(
+                    shlex::split(code).unwrap_or_else(|| vec![code.to_string()]),
+                ));
             }
             if matches!(arg.as_str(), "-S" | "--split-string") {
-                return args
-                    .get(index + 1)
-                    .map(|code| shlex::split(code).unwrap_or_else(|| vec![code.clone()]));
+                return args.get(index + 1).map(|code| {
+                    Cow::Owned(shlex::split(code).unwrap_or_else(|| vec![code.clone()]))
+                });
             }
         }
     }
@@ -860,7 +911,7 @@ fn wrapper_inner(name: &str, args: &[String]) -> Option<Vec<String>> {
     if name == "timeout" {
         index += 1;
     }
-    (index < args.len()).then(|| args[index..].to_vec())
+    (index < args.len()).then(|| Cow::Borrowed(&args[index..]))
 }
 
 fn legacy_argument_violation(name: &str, words: &[String]) -> Option<String> {
@@ -1012,6 +1063,50 @@ mod tests {
             .matched_rules
             .iter()
             .any(|rule| rule.source == "builtin"));
+    }
+
+    #[test]
+    fn custom_rules_match_command_and_leading_argument_tokens() {
+        let policy = CommandPolicy {
+            protected_commands: vec!["docker rmi".into(), "/usr/bin/docker image rm".into()],
+            ..Default::default()
+        };
+        for (command, rule) in [
+            ("docker rmi image", "docker rmi"),
+            ("sudo -u root /usr/bin/docker 'rmi' image", "docker rmi"),
+            ("docker ps && docker rmi image", "docker rmi"),
+            ("bash -c 'docker rmi image'", "docker rmi"),
+            ("/usr/bin/docker image rm image", "/usr/bin/docker image rm"),
+        ] {
+            let result = classify(command, policy.clone());
+            assert_eq!(result.decision, Decision::RequireApproval, "{command}");
+            assert!(!result.uncertain, "{command}");
+            assert!(result
+                .matched_rules
+                .iter()
+                .any(|entry| { entry.source == "user" && entry.reason.contains(rule) }));
+        }
+        for command in [
+            "docker ps",
+            "docker rmi-preview",
+            "docker run example rmi",
+            "docker",
+            "docker image rm image",
+            "docker --context prod rmi image",
+            "docker ps \"$FILTER\"",
+            "printf 'docker rmi'",
+        ] {
+            assert_eq!(
+                classify(command, policy.clone()).decision,
+                Decision::Allow,
+                "{command}",
+            );
+        }
+        for command in ["docker \"$ACTION\" image", "sudo docker \"$ACTION\" image"] {
+            let result = classify(command, policy.clone());
+            assert_eq!(result.decision, Decision::RequireApproval, "{command}");
+            assert!(result.uncertain, "{command}");
+        }
     }
 
     #[test]

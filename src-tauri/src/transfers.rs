@@ -901,8 +901,28 @@ impl TransferManager {
                 || view.status == "paused"
                 || tokio::time::Instant::now() >= deadline
             {
-                authorize(&state.server(&op.server_id)?, op, source)?;
-                return Ok(serde_json::to_value(view)?);
+                let server = state.server(&op.server_id)?;
+                authorize(&server, op, source)?;
+                let mut result = serde_json::to_value(&view)?;
+                if source == "mcp"
+                    && matches!(view.status.as_str(), "paused" | "failed")
+                    && view
+                        .error
+                        .as_ref()
+                        .is_none_or(|error| error["code"] != "COMMIT_STATUS_UNKNOWN")
+                    && !h.worker_active.load(Ordering::Acquire)
+                    && (view.status == "paused" || !h.checkpoint.lock().unwrap().hashes.is_empty())
+                {
+                    let original = h.operation.lock().unwrap().clone();
+                    let settings = state.settings.lock().unwrap().clone();
+                    if authorize(&server, &original, source).is_ok()
+                        && crate::security::check(&settings, &original, source).is_ok()
+                        && h.validate_server(&server).is_ok()
+                    {
+                        result["resume_available"] = json!(true);
+                    }
+                }
+                return Ok(result);
             }
             let _ = tokio::time::timeout_at(deadline, notified).await;
         }
@@ -974,6 +994,7 @@ impl TransferManager {
                         Ok(()) => resumed += 1,
                         Err(error) => failed.push(json!({
                             "transfer_id":handle.snapshot().transfer_id,
+                            "remote_path":handle.snapshot().remote_path,
                             "error":crate::operation_error::error_response(&error, op),
                         })),
                     }

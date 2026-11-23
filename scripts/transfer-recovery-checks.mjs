@@ -12,8 +12,13 @@ export async function runRecoveryChecks({
   downloads,
   check,
   restart,
-  readCheckpoint,
+  readTask,
+  readSavedSnapshot,
 }) {
+  const groupTasks = async (groupId) =>
+    (await value("transfer", { action: "list" })).transfers.filter(
+      (task) => task.group_id === groupId,
+    );
   const bytes = Buffer.alloc(8 * 1024 * 1024 + 17, 0x73);
   const source = resolve(uploads, "recover.bin");
   await writeFile(source, bytes);
@@ -23,10 +28,11 @@ export async function runRecoveryChecks({
   });
   const uploaded = await wait(upload.transfer_id);
   assert.equal(uploaded.status, "completed", JSON.stringify(uploaded));
+  const uploadRecord = await readSavedSnapshot(upload.transfer_id, "completed");
   check(
     "Interrupted upload reconnects and reuses verified blocks",
-    uploaded.retry_count > 0 &&
-      uploaded.resumed_bytes >= 1024 * 1024 &&
+    uploadRecord.retry_count > 0 &&
+      uploadRecord.resumed_bytes >= 1024 * 1024 &&
       entries.get("/workspace/recover.bin").equals(bytes),
   );
 
@@ -62,13 +68,14 @@ export async function runRecoveryChecks({
       gate.disconnect();
       const downloaded = await wait(task.transfer_id);
       assert.equal(downloaded.status, "completed", JSON.stringify(downloaded));
+      const record = await readSavedSnapshot(task.transfer_id, "completed");
       const checksumMatches = (await readFile(destination)).equals(bytes);
       check(
         `Interrupted download reuses verified blocks and validates complete checksum (reply delay ${delay} ms)`,
-        downloaded.retry_count > 0 &&
-          downloaded.resumed_bytes >= 1024 * 1024 &&
+        record.retry_count > 0 &&
+          record.resumed_bytes >= 1024 * 1024 &&
           checksumMatches,
-        { ...downloaded, checksum_matches: checksumMatches },
+        { ...record, checksum_matches: checksumMatches },
       );
     } finally {
       fixture.transferReadGate = null;
@@ -92,8 +99,10 @@ export async function runRecoveryChecks({
   check(
     "Lost upload commit acknowledgement stops automatic replay",
     unknown.status === "failed" &&
-      unknown.error.code === "COMMIT_STATUS_UNKNOWN" &&
-      unknown.retry_count === 0,
+      unknown.error.startsWith("COMMIT_STATUS_UNKNOWN:") &&
+      !unknown.resume_available &&
+      (await readSavedSnapshot(uncertain.transfer_id, "failed")).retry_count ===
+        0,
   );
   const commits = fixture.commitCalls;
   await value("transfer", {
@@ -126,12 +135,10 @@ export async function runRecoveryChecks({
   await pauseGate.waitUntilBlocked();
   check(
     "Pause is acknowledged before the worker stops",
-    (
-      await value("transfer", {
-        action: "pause",
-        transfer_id: paused.transfer_id,
-      })
-    ).pause_requested,
+    (await value("transfer", {
+      action: "pause",
+      transfer_id: paused.transfer_id,
+    })) === "Pause requested",
   );
   fixture.transferReadGate = null;
   pauseGate.release();
@@ -151,7 +158,8 @@ export async function runRecoveryChecks({
   check(
     "Resume preserves file content and checkpoint progress",
     continued.status === "completed" &&
-      continued.resumed_bytes > 0 &&
+      (await readSavedSnapshot(paused.transfer_id, "completed")).resumed_bytes >
+        0 &&
       (await readFile(resolve(downloads, "paused.bin"))).equals(bytes),
   );
 
@@ -164,19 +172,13 @@ export async function runRecoveryChecks({
     recursive: true,
     skip_existing: true,
   });
-  assert.ok(
-    batch.tasks.every((t) => t.transfer_id),
-    JSON.stringify(batch),
-  );
+  const batchTasks = await groupTasks(batch.group_id);
   check(
-    "Batch response includes a parent aggregate and policy",
-    batch.group?.group_id === batch.group_id &&
-      batch.group.total === batch.tasks.length &&
-      batch.group.batch_policy !== undefined,
+    "Batch queues files and allows discovery of child task IDs",
+    batch.queued === batchTasks.length &&
+      batchTasks.every((task) => task.transfer_id),
   );
-  const results = await Promise.all(
-    batch.tasks.map((t) => wait(t.transfer_id)),
-  );
+  const results = await Promise.all(batchTasks.map((t) => wait(t.transfer_id)));
   check(
     "Recursive batch uploads files and empty directories through the queue",
     results.every((t) => t.status === "completed") &&
@@ -189,9 +191,10 @@ export async function runRecoveryChecks({
     group_id: batch.group_id,
   });
   check(
-    "Group read returns the aggregate and every child task",
-    groupRead.tasks.length === batch.tasks.length &&
-      groupRead.group.status === "completed",
+    "Group read reports completed count without child snapshots",
+    groupRead.completed === batch.queued &&
+      groupRead.status === "completed" &&
+      !Object.hasOwn(groupRead, "tasks"),
   );
   const groupPause = await value("transfer", {
     action: "pause",
@@ -207,9 +210,9 @@ export async function runRecoveryChecks({
   });
   check(
     "Group pause, resume and cancel route by group_id",
-    groupPause.paused === 0 &&
+    groupPause.pause_requested === 0 &&
       groupResume.resumed === 0 &&
-      groupCancel.cancelled === 0,
+      groupCancel.cancel_requested === 0,
   );
   const batchDownload = await value("download_file", {
     items: [
@@ -221,12 +224,10 @@ export async function runRecoveryChecks({
     recursive: true,
     skip_existing: true,
   });
-  assert.ok(
-    batchDownload.tasks.every((t) => t.transfer_id),
-    JSON.stringify(batchDownload),
-  );
+  const downloadTasks = await groupTasks(batchDownload.group_id);
+  assert.equal(downloadTasks.length, batchDownload.queued);
   const saved = await Promise.all(
-    batchDownload.tasks.map((t) => wait(t.transfer_id)),
+    downloadTasks.map((t) => wait(t.transfer_id)),
   );
   check(
     "Recursive download creates directories and verifies child files",
@@ -247,7 +248,9 @@ export async function runRecoveryChecks({
   });
   check(
     "Existing identical content is skipped after checksum verification",
-    (await wait(skip.transfer_id)).phase === "skipped",
+    (await wait(skip.transfer_id)).status === "completed" &&
+      (await readSavedSnapshot(skip.transfer_id, "completed")).phase ===
+        "skipped",
   );
 
   fixture.transferReadDelay = 50;
@@ -298,7 +301,7 @@ export async function runRecoveryChecks({
     (s) => s.transferred_bytes >= 4 * 1024 * 1024 || s.status === "failed",
   );
   const checkpointDeadline = Date.now() + 30000;
-  while (readCheckpoint(recovery.transfer_id) < 4) {
+  while ((readTask(recovery.transfer_id)?.checkpoint.hashes.length ?? 0) < 4) {
     assert.ok(
       Date.now() < checkpointDeadline,
       "The transfer did not persist four verified blocks before restart",
@@ -327,7 +330,9 @@ export async function runRecoveryChecks({
   check(
     "Restarted process resumes durable checkpoints with matching content",
     recovered.status === "completed" &&
-      recovered.resumed_bytes >= 4 * 1024 * 1024 &&
+      (await readSavedSnapshot(recovery.transfer_id, "completed"))
+        .resumed_bytes >=
+        4 * 1024 * 1024 &&
       (await readFile(resolve(downloads, "restart.bin"))).equals(bytes),
   );
 }

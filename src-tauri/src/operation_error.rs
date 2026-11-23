@@ -105,7 +105,10 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
         "PAYLOAD_TOO_LARGE",
         "TRANSFER_LIMIT",
         "NOT_FOUND",
+        "PARENT_NOT_FOUND",
         "PERMISSION_DENIED",
+        "TRANSFER_NOT_FOUND",
+        "TRANSFER_NOT_COMPLETED",
         "SERVER_DISABLED",
         "SSH_SESSION_BUSY",
         "SSH_CHANNEL_FAILED",
@@ -212,7 +215,7 @@ pub fn error_message(error: &anyhow::Error) -> String {
     "Operation failed".into()
 }
 
-pub(crate) fn native_message(code: &str) -> Option<&'static str> {
+fn native_message(code: &str) -> Option<&'static str> {
     Some(match code {
         "NOT_FOUND" => "Path not found",
         "PERMISSION_DENIED" => "File access denied",

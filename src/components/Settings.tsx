@@ -9,8 +9,8 @@ import {
   defaultAdvancedMcpTools,
   effectiveCommandPolicy,
   advancedShell,
-  validCommandRules,
-  parseCommandList,
+  validProtectedCommandRules,
+  parseProtectedCommandRules,
   MAX_COMMAND_RULES,
   RUNTIME_SETTINGS_CHANGED,
   type BuiltinRule,
@@ -491,7 +491,7 @@ export function Settings({
           </Row>
           <Row
             title="自定义受保护命令"
-            description="在程序内置规则之外增加需要人工审批的命令；不能覆盖或取消内置规则。"
+            description="可对整个命令或指定子命令增加人工审批。"
           >
             <Button
               variant="outline"
@@ -946,10 +946,11 @@ export function Settings({
             className="modal-layout"
             onSubmit={async (event) => {
               event.preventDefault();
-              const protected_commands = parseCommandList(protectedDraft);
-              if (!validCommandRules(protected_commands)) {
+              const protected_commands =
+                parseProtectedCommandRules(protectedDraft);
+              if (!validProtectedCommandRules(protected_commands)) {
                 setError(
-                  `自定义规则最多 ${MAX_COMMAND_RULES} 项；只填写命令名或绝对路径，不要参数、通配符或 Shell 语法。`,
+                  `最多 ${MAX_COMMAND_RULES} 条，每行填写命令名或绝对路径，可带固定参数。不支持通配符和 Shell 语法。`,
                 );
                 return;
               }
@@ -1011,7 +1012,7 @@ export function Settings({
                       自定义规则
                     </span>
                     <small>
-                      {parseCommandList(protectedDraft).length}
+                      {parseProtectedCommandRules(protectedDraft).length}
                       <em> / {MAX_COMMAND_RULES}</em>
                     </small>
                   </span>
@@ -1019,7 +1020,9 @@ export function Settings({
                     aria-label="自定义受保护命令"
                     className="mono"
                     rows={8}
-                    placeholder="每行一个命令名或绝对路径，如 curl、/opt/tools/deploy"
+                    placeholder={
+                      "每行一条，按命令开头匹配\ndocker rmi\ndocker compose down\n/opt/tools/deploy"
+                    }
                     value={protectedDraft}
                     disabled={saving}
                     onChange={(event) => setProtectedDraft(event.target.value)}

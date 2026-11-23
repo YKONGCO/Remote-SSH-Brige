@@ -13,9 +13,10 @@ import { api } from "../api";
 import {
   defaultRuntimeSettings,
   defaultCommandPolicy,
-  parseCommandList,
+  parseProtectedCommandRules,
   MAX_COMMAND_RULES,
   validCommandRules,
+  validProtectedCommandRules,
 } from "../runtime-settings";
 import appPackage from "../../package.json";
 
@@ -221,15 +222,17 @@ test("protected command dialog shows read-only builtin rules and saves custom ru
   const editor = screen.getByRole("textbox", {
     name: "自定义受保护命令",
   }) as HTMLTextAreaElement;
-  fireEvent.change(editor, { target: { value: "rm -rf /\ncurl" } });
+  fireEvent.change(editor, { target: { value: "docker && rmi\ncurl" } });
   fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
-  expect(screen.getByRole("alert").textContent).toContain("不要参数");
+  expect(screen.getByRole("alert").textContent).toContain("Shell 语法");
   expect(
     vi
       .mocked(api)
       .mock.calls.some(([command]) => command === "save_runtime_settings"),
   ).toBe(false);
-  fireEvent.change(editor, { target: { value: "curl\n/opt/deploy" } });
+  fireEvent.change(editor, {
+    target: { value: "curl\n/opt/deploy\ndocker rmi" },
+  });
   fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   const saved = vi
@@ -239,6 +242,7 @@ test("protected command dialog shows read-only builtin rules and saves custom ru
   expect(saved.command_policy?.protected_commands).toEqual([
     "curl",
     "/opt/deploy",
+    "docker rmi",
   ]);
   expect(saved.command_policy?.allow_pipes).toBe(true);
 });
@@ -318,11 +322,26 @@ test("command execution can be disabled without touching advanced shell permissi
   });
 });
 
-test("protected rule validation accepts names and absolute paths but rejects arguments", () => {
+test("protected rules accept literal argument prefixes and keep one rule per line", () => {
   expect(validCommandRules(["curl", "/opt/deploy", ":", "python3.14"])).toBe(
     true,
   );
   expect(validCommandRules(["rm -rf /"])).toBe(false);
+  expect(
+    validProtectedCommandRules([
+      "curl",
+      "/opt/deploy --target=prod",
+      "docker rmi",
+    ]),
+  ).toBe(true);
+  for (const rule of [
+    "docker && rmi",
+    "docker *",
+    "docker\nrmi",
+    "docker $action",
+  ]) {
+    expect(validProtectedCommandRules([rule])).toBe(false);
+  }
   expect(validCommandRules(["../escape"])).toBe(false);
   const maximum = Array.from(
     { length: MAX_COMMAND_RULES },
@@ -330,7 +349,9 @@ test("protected rule validation accepts names and absolute paths but rejects arg
   );
   expect(validCommandRules(maximum)).toBe(true);
   expect(validCommandRules([...maximum, "extra"])).toBe(false);
-  expect(parseCommandList("curl, wget；nc")).toEqual(["curl", "wget", "nc"]);
+  expect(
+    parseProtectedCommandRules(" curl\r\n docker\t rmi\n\ndocker rmi"),
+  ).toEqual(["curl", "docker rmi"]);
 });
 
 test("local transfer directories are edited in a dialog and cancel leaves grants unchanged", async () => {

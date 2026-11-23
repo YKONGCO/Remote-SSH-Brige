@@ -57,7 +57,7 @@ export async function runForwardChecks({ call, value, check, tools }) {
       "Forward listens on loopback with an automatically assigned port",
       tunnel.local_host === "127.0.0.1" &&
         tunnel.local_port > 0 &&
-        tunnel.status === "running",
+        Boolean(tunnel.tunnel_id),
     );
     check(
       "Forward appears in MCP list",
@@ -123,9 +123,8 @@ export async function runForwardChecks({ call, value, check, tools }) {
       tunnel_id: tunnel.tunnel_id,
     });
     check(
-      "Forward reports both traffic counters",
-      info.bytes_sent >= 2 * 1024 * 1024 &&
-        info.bytes_received >= info.bytes_sent,
+      "Forward read reports live status without internal traffic counters",
+      info.status === "running" && !Object.hasOwn(info, "bytes_sent"),
     );
     const active = connect(tunnel.local_port, "127.0.0.1");
     active.on("error", () => {});
@@ -154,12 +153,10 @@ export async function runForwardChecks({ call, value, check, tools }) {
     );
     check(
       "Closing an already closed forward is idempotent",
-      (
-        await value("port_forward", {
-          action: "close",
-          tunnel_id: tunnel.tunnel_id,
-        })
-      ).status === "closed",
+      (await value("port_forward", {
+        action: "close",
+        tunnel_id: tunnel.tunnel_id,
+      })) === "OK",
     );
     check(
       "Forward listing excludes closed tunnels but read retains final metadata",
