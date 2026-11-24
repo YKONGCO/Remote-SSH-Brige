@@ -11,6 +11,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, desktop } from "../api";
+import { observeRefresh } from "../refresh";
 import { formatBytes, type FileTransfer } from "../transfers";
 import { TransferFileCard } from "./TransferFileCard";
 import { Button } from "./ui/button";
@@ -154,6 +155,7 @@ export function TransferPanel({
         if (disposed) return;
         setError("");
         setItems(result.transfers);
+        let completed = false;
         for (const item of result.transfers) {
           const previous = known.get(item.transfer_id);
           if (previous && !terminal(previous) && terminal(item.status)) {
@@ -163,10 +165,11 @@ export function TransferPanel({
                 : item.error?.message || "文件传输已取消",
               item.status === "failed",
             );
-            if (item.status === "completed") callbacks.current.onComplete();
+            if (item.status === "completed") completed = true;
           }
           known.set(item.transfer_id, item.status);
         }
+        if (completed) callbacks.current.onComplete();
       } catch (e) {
         if (!disposed) setError(String(e));
       } finally {
@@ -174,10 +177,10 @@ export function TransferPanel({
       }
     };
     void poll();
-    const timer = setInterval(() => void poll(), 750);
+    const stop = observeRefresh(() => void poll(), 750);
     return () => {
       disposed = true;
-      clearInterval(timer);
+      stop();
     };
   }, [serverId]);
 

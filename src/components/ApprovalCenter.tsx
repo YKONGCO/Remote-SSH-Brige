@@ -205,7 +205,7 @@ export function ApprovalCenter({
                       onOpenSettings();
                     }}
                   >
-                    查看受保护命令
+                    打开安全设置
                   </Button>
                 )}
               </div>

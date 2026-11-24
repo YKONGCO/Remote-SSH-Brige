@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { LoaderCircle, Plus, Power, Search, Trash2 } from "lucide-react";
 import { api, desktop } from "../api";
 import type { Server } from "../types";
 import type { TunnelInfo } from "../tunnels";
-import { usePreferences } from "../preferences";
+import { useRefreshRequest } from "../refresh";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { SelectField } from "./SelectField";
@@ -21,14 +21,11 @@ function bytes(n: number) {
 }
 export function PortForwards({
   servers,
-  refreshKey = 0,
   notify,
 }: {
   servers: Server[];
-  refreshKey?: number;
   notify: (message: string, error?: boolean) => void;
 }) {
-  const preferences = usePreferences();
   const [items, setItems] = useState<TunnelInfo[]>([]);
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
@@ -57,47 +54,29 @@ export function PortForwards({
         .toLowerCase()
         .includes(search.toLowerCase()),
   );
-  const load = useCallback(async () => {
-    try {
-      const result = await api<{ tunnels: TunnelInfo[] }>("list_port_forwards");
-      setItems(result.tunnels);
-      setError("");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-  useEffect(() => {
-    let disposed = false,
-      inFlight = false;
-    const refresh = async () => {
-      if (inFlight) return;
-      inFlight = true;
+  const load = useRefreshRequest(
+    async (signal) => {
       try {
         const result = await api<{ tunnels: TunnelInfo[] }>(
           "list_port_forwards",
         );
-        if (!disposed) {
-          setItems(result.tunnels);
-          setError("");
-        }
+        if (signal.aborted) return;
+        setItems((previous) =>
+          JSON.stringify(previous) === JSON.stringify(result.tunnels)
+            ? previous
+            : result.tunnels,
+        );
+        setError("");
       } catch (e) {
-        if (!disposed) setError(String(e));
-      } finally {
-        inFlight = false;
+        if (!signal.aborted) setError(String(e));
       }
-    };
-    void refresh();
-    const refreshMs = hasClosing
+    },
+    hasClosing
       ? 500
-      : Number(preferences.refreshSeconds) * 1000;
-    const timer = refreshMs
-      ? setInterval(() => void refresh(), refreshMs)
-      : undefined;
-    return () => {
-      disposed = true;
-      clearInterval(timer);
-    };
-  }, [refreshKey, preferences.refreshSeconds, hasClosing]);
+      : items.some((item) => item.status === "running")
+        ? 5000
+        : 30000,
+  );
   async function open(e: FormEvent) {
     e.preventDefault();
     setBusy(true);

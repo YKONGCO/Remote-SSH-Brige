@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { Settings } from "../components/Settings";
 import { SelectField } from "../components/SelectField";
@@ -32,7 +33,19 @@ afterEach(() => {
 test("MCP auto-start is on by default, persists on toggle and rolls back a failed save", async () => {
   vi.mocked(api).mockResolvedValueOnce({ ...defaultRuntimeSettings });
   render(<Settings />);
-  const control = screen.getByRole("switch", { name: "自动启动 MCP 服务" });
+  const mcp = screen.getByRole("heading", { name: "MCP" });
+  const security = screen.getByRole("heading", { name: "安全" });
+  expect(
+    mcp.compareDocumentPosition(security) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  const control = within(mcp.closest("section")!).getByRole("switch", {
+    name: "自动启动 MCP 服务",
+  });
+  expect(
+    within(security.closest("section")!).getByRole("switch", {
+      name: "允许高危命令审批",
+    }),
+  ).toBeTruthy();
   expect(control.hasAttribute("disabled")).toBe(true);
   await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
   expect(control.getAttribute("aria-checked")).toBe("true");
@@ -66,8 +79,16 @@ test("settings footer shows the application version", async () => {
   expect(version.textContent).toBe(`v${appPackage.version}`);
 });
 
-test("settings render with the cached runtime instead of a loading pass", () => {
-  vi.mocked(api).mockResolvedValue({ ...defaultRuntimeSettings });
+test("settings render cached values immediately and ignore a load superseded by a save", async () => {
+  let finishLoad!: (settings: typeof defaultRuntimeSettings) => void;
+  vi.mocked(api)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishLoad = resolve;
+        }),
+    )
+    .mockImplementationOnce(async (_command, args) => args?.settings as never);
   render(
     <Settings
       initialRuntime={{
@@ -79,6 +100,12 @@ test("settings render with the cached runtime instead of a loading pass", () => 
   const control = screen.getByRole("switch", { name: "删除保护" });
   expect(control.hasAttribute("disabled")).toBe(false);
   expect(control.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(control);
+  await waitFor(() => expect(control.hasAttribute("disabled")).toBe(false));
+  await act(async () =>
+    finishLoad({ ...defaultRuntimeSettings, deletion_protection: false }),
+  );
+  expect(control.getAttribute("aria-checked")).toBe("true");
 });
 
 test("settings immediately show changes and roll back a failed save without remounting", async () => {
@@ -140,6 +167,10 @@ test("approval wait time persists for protected command approvals", async () => 
   vi.mocked(api).mockImplementation(
     async (_command, args) => args?.settings as never,
   );
+  const summary = screen.getByText("高级设置");
+  const details = summary.closest("details");
+  expect(details?.open).toBe(false);
+  details!.open = true;
   const timeout = screen.getByRole("combobox", { name: "审批等待时间" });
   expect(timeout.textContent).toContain("120 秒");
   fireEvent.keyDown(timeout, { key: "ArrowDown" });
@@ -159,6 +190,15 @@ test("one advanced shell toggle controls all shell capabilities and leaves advan
   vi.mocked(api).mockImplementation(
     async (_command, args) => args?.settings as never,
   );
+  const summary = screen.getByText("高级设置");
+  const details = summary.closest("details")!;
+  expect(details.open).toBe(false);
+  details.open = true;
+  expect(
+    screen.getByText(
+      "允许管道、重定向、组合命令及脚本。命中受保护规则时仍需审批。",
+    ),
+  ).toBeTruthy();
   const advanced = screen.getByRole("switch", {
     name: "允许 Shell 高级功能",
   });
@@ -181,6 +221,8 @@ test("one advanced shell toggle controls all shell capabilities and leaves advan
     terminal: false,
     port_forward: true,
   });
+  details.open = false;
+  expect(api).toHaveBeenCalledTimes(2);
   const terminal = screen.getByRole("switch", { name: "交互式终端" });
   expect(terminal.getAttribute("aria-checked")).toBe("false");
   fireEvent.click(terminal);
@@ -215,6 +257,8 @@ test("protected command dialog shows read-only builtin rules and saves custom ru
       } as never;
     return args?.settings as never;
   });
+  expect(screen.getAllByRole("button", { name: /受保护命令/ })).toHaveLength(1);
+  expect(screen.queryByText("旧版白名单限制")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "管理受保护命令" }));
   expect(await screen.findByText("内置规则（只读，始终启用）")).toBeTruthy();
   expect(await screen.findByText("rm")).toBeTruthy();
@@ -277,6 +321,7 @@ test("legacy whitelist restriction stays visible until explicitly cleared", asyn
     .mock.calls.find(([command]) => command === "save_runtime_settings")![1]!
     .settings as import("../runtime-settings").RuntimeSettings;
   expect(saved.command_policy?.legacy_whitelist).toBeNull();
+  expect(screen.queryByText("旧版白名单限制")).toBeNull();
   expect(saved.command_policy?.protected_commands).toEqual(["curl"]);
 });
 
@@ -287,7 +332,7 @@ test("approval mode can be disabled without changing command limits", async () =
   vi.mocked(api).mockImplementation(
     async (_command, args) => args?.settings as never,
   );
-  const approval = screen.getByRole("switch", { name: "审批模式" });
+  const approval = screen.getByRole("switch", { name: "允许高危命令审批" });
   expect(approval.getAttribute("aria-checked")).toBe("true");
   fireEvent.click(approval);
   await waitFor(() =>
@@ -308,6 +353,7 @@ test("command execution can be disabled without touching advanced shell permissi
   vi.mocked(api).mockImplementation(
     async (_command, args) => args?.settings as never,
   );
+  screen.getByText("高级设置").closest("details")!.open = true;
   fireEvent.click(screen.getByRole("switch", { name: "禁止命令执行" }));
   await act(async () => {});
   const saved = vi

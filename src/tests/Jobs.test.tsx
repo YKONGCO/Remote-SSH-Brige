@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, expect, test, vi } from "vitest";
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -20,6 +21,8 @@ beforeAll(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.resetAllMocks();
   localStorage.clear();
 });
@@ -46,18 +49,48 @@ const exited: JobInfo = {
   status: "exited",
   exit_code: 7,
 };
-function noPolling() {
-  localStorage.setItem(
-    "remote-desk.preferences.v1",
-    JSON.stringify({ refreshSeconds: "0" }),
-  );
-}
+
+test("polls running jobs only while visible and backs off when they exit", async () => {
+  vi.useFakeTimers();
+  const visibility = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  vi.mocked(api)
+    .mockResolvedValueOnce({ jobs: [running] })
+    .mockResolvedValueOnce({ jobs: [running] })
+    .mockResolvedValue({ jobs: [{ ...running, status: "exited" }] });
+  await act(async () => {
+    render(<Jobs notify={vi.fn()} />);
+  });
+  expect(api).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(running.command)).toBeTruthy();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(3000);
+  });
+  expect(api).toHaveBeenCalledTimes(2);
+
+  visibility.mockReturnValue(true);
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(10000);
+  });
+  expect(api).toHaveBeenCalledTimes(2);
+
+  visibility.mockReturnValue(false);
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(api).toHaveBeenCalledTimes(3);
+  expect(screen.queryByText(running.command)).toBeNull();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10000);
+  });
+  expect(api).toHaveBeenCalledTimes(3);
+});
 
 test("后台任务 list starts with running sessions and filters retained history by status and search", async () => {
-  noPolling();
   vi.mocked(api).mockResolvedValue({ jobs: [running, exited] });
   const user = userEvent.setup();
-  render(<Jobs refreshKey={0} notify={vi.fn()} />);
+  render(<Jobs notify={vi.fn()} />);
   await screen.findByText(running.command);
   expect(screen.queryByText(exited.command)).toBeNull();
   await user.click(screen.getByRole("tab", { name: "全部" }));
@@ -71,7 +104,6 @@ test("后台任务 list starts with running sessions and filters retained histor
 });
 
 test("后台任务 output continues from returned cursors and shows the final exit code", async () => {
-  noPolling();
   const user = userEvent.setup();
   const chunks = [
     {
@@ -105,7 +137,7 @@ test("后台任务 output continues from returned cursors and shows the final ex
       ...chunks.shift(),
     } as never;
   });
-  render(<Jobs refreshKey={0} notify={vi.fn()} />);
+  render(<Jobs notify={vi.fn()} />);
   await screen.findByText(running.command);
   await user.click(
     screen.getByRole("button", { name: "查看后台任务 job_running" }),
@@ -129,7 +161,6 @@ test("后台任务 output continues from returned cursors and shows the final ex
 });
 
 test("closing a 后台任务 requires confirmation and refreshes the list after closing", async () => {
-  noPolling();
   const user = userEvent.setup(),
     notify = vi.fn();
   let closed = false;
@@ -146,7 +177,7 @@ test("closing a 后台任务 requires confirmation and refreshes the list after 
     closed = true;
     return { status: "closed" } as never;
   });
-  render(<Jobs refreshKey={0} notify={notify} />);
+  render(<Jobs notify={notify} />);
   await screen.findByText(running.command);
   await user.click(
     screen.getByRole("button", { name: "关闭后台任务 job_running" }),
@@ -165,19 +196,17 @@ test("closing a 后台任务 requires confirmation and refreshes the list after 
 });
 
 test("failed 后台任务 loading can be retried", async () => {
-  noPolling();
   const user = userEvent.setup();
   vi.mocked(api)
     .mockRejectedValueOnce(new Error("读取失败"))
     .mockResolvedValue({ jobs: [running] });
-  render(<Jobs refreshKey={0} notify={vi.fn()} />);
+  render(<Jobs notify={vi.fn()} />);
   expect((await screen.findByRole("alert")).textContent).toContain("读取失败");
   await user.click(screen.getByRole("button", { name: "重试加载" }));
   await screen.findByText(running.command);
 });
 
 test("incomplete UTF-8 output waits for more bytes instead of spinning on the same cursor", async () => {
-  noPolling();
   const user = userEvent.setup();
   vi.mocked(api).mockImplementation(async (command) => {
     if (command === "list_jobs") return { jobs: [running] } as never;
@@ -195,7 +224,7 @@ test("incomplete UTF-8 output waits for more bytes instead of spinning on the sa
       stderr_has_more: false,
     } as never;
   });
-  render(<Jobs refreshKey={0} notify={vi.fn()} />);
+  render(<Jobs notify={vi.fn()} />);
   await screen.findByText(running.command);
   await user.click(
     screen.getByRole("button", { name: "查看后台任务 job_running" }),

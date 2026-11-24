@@ -106,7 +106,7 @@ test("approval entry with no requests links to protected command settings", asyn
   await user.click(screen.getByRole("button", { name: "命令审批" }));
   await screen.findByText("暂无待审批命令");
   expect(screen.queryByRole("button", { name: "批准本次执行" })).toBeNull();
-  await user.click(screen.getByRole("button", { name: "查看受保护命令" }));
+  await user.click(screen.getByRole("button", { name: "打开安全设置" }));
   expect(settings).toHaveBeenCalledOnce();
   expect(screen.queryByRole("dialog")).toBeNull();
 });

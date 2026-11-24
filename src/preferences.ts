@@ -3,7 +3,6 @@ import { useSyncExternalStore } from "react";
 export const defaults = {
   theme: "system",
   startPage: "servers",
-  refreshSeconds: "3",
   showHidden: true,
   terminalFontSize: "13",
   terminalTheme: "dark",
@@ -28,7 +27,6 @@ export function readPreferences(): Preferences {
         "mcp",
         "settings",
       ],
-      refreshSeconds: ["0", "3", "5", "10", "30"],
       terminalFontSize: ["12", "13", "14", "15", "16"],
       terminalTheme: ["dark", "light", "app"],
       terminalScrollback: ["1000", "5000", "10000", "20000"],

@@ -386,7 +386,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-test("automatically refreshes directory metadata without overwriting input or overlapping requests", async () => {
+test("refreshes directory metadata on return without polling, overwriting input or overlapping requests", async () => {
   vi.useFakeTimers();
   localStorage.setItem(
     "remote-desk.preferences.v1",
@@ -412,6 +412,14 @@ test("automatically refreshes directory metadata without overwriting input or ov
   fireEvent.change(screen.getByRole("textbox", { name: "远程目录" }), {
     target: { value: "/typing-a-new-path" },
   });
+  const visibility = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(60000);
+  });
+  expect(operate).toHaveBeenCalledTimes(1);
+  visibility.mockReturnValue(false);
   let finish!: (result: unknown) => void;
   vi.mocked(operate).mockReturnValueOnce(
     new Promise((resolve) => {
@@ -419,11 +427,13 @@ test("automatically refreshes directory metadata without overwriting input or ov
     }) as never,
   );
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(3000);
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
   });
   expect(operate).toHaveBeenCalledTimes(2);
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(6000);
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(60000);
   });
   expect(operate).toHaveBeenCalledTimes(2);
   await act(async () => {
@@ -446,11 +456,17 @@ test("automatically refreshes directory metadata without overwriting input or ov
     (screen.getByRole("textbox", { name: "远程目录" }) as HTMLInputElement)
       .value,
   ).toBe("/typing-a-new-path");
-  view!.unmount();
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(6000);
+    await vi.advanceTimersByTimeAsync(60000);
   });
   expect(operate).toHaveBeenCalledTimes(2);
+  view!.unmount();
+  await act(async () => {
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(60000);
+  });
+  expect(operate).toHaveBeenCalledTimes(2);
+  visibility.mockRestore();
 });
 
 test("native transfers pass only file-selection parameters and never file content", async () => {

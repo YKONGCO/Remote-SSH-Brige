@@ -430,14 +430,16 @@ test("audit tabs keep rows and totals while loading and ignore superseded result
     ).toBe(true);
 
     await user.click(screen.getByRole("tab", { name: "命令" }));
+    expect(pending.has("exec")).toBe(false);
+    await act(async () => pending.get("files")!(result("过期文件记录", 99)));
+    expect(screen.queryByText("过期文件记录")).toBeNull();
+    expect(screen.getByText("原有记录")).toBeTruthy();
     await act(async () => pending.get("exec")!(result("最新命令记录", 5)));
     expect(screen.getByText("最新命令记录")).toBeTruthy();
     expect(screen.queryByText("原有记录")).toBeNull();
     expect(scroller.scrollTop).toBe(0);
     expect(scroller.getAttribute("aria-busy")).toBe("false");
 
-    await act(async () => pending.get("files")!(result("过期文件记录", 99)));
-    expect(screen.queryByText("过期文件记录")).toBeNull();
     expect(screen.getByRole("status", { name: "记录条目数" }).textContent).toBe(
       "5 条",
     );
@@ -701,7 +703,7 @@ test("Radix preferences persist and enforce the upload limit", async () => {
     await user.click(screen.getByRole("option", { name: option }));
   }
   await user.click(screen.getByRole("button", { name: "设置" }));
-  expect(screen.getAllByRole("combobox")).toHaveLength(21);
+  expect(screen.queryByRole("combobox", { name: "状态刷新频率" })).toBeNull();
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("深色");
@@ -754,7 +756,14 @@ test("Radix preferences persist and enforce the upload limit", async () => {
   await choose("启动页面", "设置");
   await choose("终端字号", "16 px");
   await choose("终端配色", "跟随界面");
-  await choose("状态刷新频率", "仅手动刷新");
+  const key = "remote-desk.preferences.v1";
+  localStorage.setItem(
+    key,
+    JSON.stringify({
+      ...JSON.parse(localStorage.getItem(key)!),
+      refreshSeconds: "0",
+    }),
+  );
   view.unmount();
   render(<App />);
   await waitFor(() =>
@@ -784,15 +793,17 @@ test("Radix preferences persist and enforce the upload limit", async () => {
   expect(
     screen.getByRole("combobox", { name: "终端配色" }).textContent,
   ).toContain("跟随界面");
-  expect(
-    screen.getByRole("combobox", { name: "状态刷新频率" }).textContent,
-  ).toContain("仅手动刷新");
+  expect(screen.queryByRole("combobox", { name: "状态刷新频率" })).toBeNull();
   expect(document.documentElement.dataset.theme).toBe("dark");
   expect(
     screen
       .getByRole("switch", { name: "显示隐藏文件" })
       .getAttribute("aria-checked"),
   ).toBe("false");
+  await choose("终端字号", "15 px");
+  expect(JSON.parse(localStorage.getItem(key)!)).not.toHaveProperty(
+    "refreshSeconds",
+  );
   await user.click(screen.getByRole("button", { name: "恢复界面默认设置" }));
   expect(
     screen.getByRole("combobox", { name: "终端字号" }).textContent,

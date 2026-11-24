@@ -3055,6 +3055,17 @@
     font-weight: var(--weight-label);
     letter-spacing: 0;
   }
+  .settings-advanced > summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: fit-content;
+    cursor: pointer;
+    list-style: none;
+  }
+  .settings-advanced[open] > summary svg {
+    transform: rotate(90deg);
+  }
   .settings-card {
     padding: 0 18px;
     border-radius: 10px;

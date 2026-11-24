@@ -1,4 +1,5 @@
 import { usePreferences } from "../preferences";
+import { observeRefresh } from "../refresh";
 import { CompactTime } from "./CompactTime";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Input } from "./ui/input";
@@ -118,22 +119,27 @@ export function Files({
   const downloading = useRef(new Set<string>());
   const upload = useRef<HTMLInputElement>(null);
   const listingRequest = useRef(0);
-  const listingBusy = useRef(false);
+  const pendingListing = useRef<Promise<{
+    path: string;
+    entries: FileEntry[];
+  }> | null>(null);
   const load = async (p = path, quiet = false) => {
     if (!server) return;
-    if (quiet && listingBusy.current) return;
     const request = ++listingRequest.current;
-    listingBusy.current = true;
     if (!quiet) {
       setBusy(true);
       setError("");
     }
+    if (pendingListing.current) await pendingListing.current.catch(() => {});
+    if (request !== listingRequest.current) return;
+    const listing = operate<{ path: string; entries: FileEntry[] }>({
+      kind: "list_files",
+      server_id: server.id,
+      path: p,
+    });
+    pendingListing.current = listing;
     try {
-      const r = await operate<{ path: string; entries: FileEntry[] }>({
-        kind: "list_files",
-        server_id: server.id,
-        path: p,
-      });
+      const r = await listing;
       if (request !== listingRequest.current) return;
       setEntries(r.entries);
       setError("");
@@ -146,15 +152,12 @@ export function Files({
     } catch (e) {
       if (request === listingRequest.current) setError(String(e));
     } finally {
-      if (request === listingRequest.current) {
-        listingBusy.current = false;
-        setBusy(false);
-      }
+      if (pendingListing.current === listing) pendingListing.current = null;
+      if (request === listingRequest.current) setBusy(false);
     }
   };
   useEffect(() => {
     ++listingRequest.current;
-    listingBusy.current = false;
     setBusy(false);
     setEntries([]);
     ++previewRequest.current;
@@ -172,13 +175,11 @@ export function Files({
     if (server) void load(savedFilePath(server.id) || server.root || "/");
   }, [server?.id]);
   useEffect(() => {
-    if (!server?.enabled || preferences.refreshSeconds === "0") return;
-    const timer = setInterval(
-      () => void load(path, true),
-      Number(preferences.refreshSeconds) * 1000,
-    );
-    return () => clearInterval(timer);
-  }, [server?.id, server?.enabled, path, preferences.refreshSeconds]);
+    if (!server?.enabled || busy || saving) return;
+    return observeRefresh(() => {
+      if (!pendingListing.current) void load(path, true);
+    });
+  }, [server?.id, server?.enabled, path, busy, saving]);
   useEffect(
     () => () => {
       ++listingRequest.current;

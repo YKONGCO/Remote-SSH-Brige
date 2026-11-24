@@ -7,6 +7,7 @@ import {
 } from "./runtime-settings";
 import { ApprovalCenter } from "./components/ApprovalCenter";
 import { readPreferences, usePreferences } from "./preferences";
+import { observeRefresh, useRefreshRequest } from "./refresh";
 import { CompactTime } from "./components/CompactTime";
 import { AuditDetails } from "./components/AuditDetails";
 import { AuditTimeFilter } from "./components/AuditTimeFilter";
@@ -185,28 +186,49 @@ export default function App() {
     (message: string, error = false) => setToast({ message, error }),
     [],
   );
-  const refresh = useCallback(async () => {
-    try {
-      setData(await api<Snapshot>("snapshot"));
-      setLoadError("");
-    } catch (e) {
-      setLoadError(String(e));
-    }
-  }, []);
+  const refresh = useRefreshRequest(
+    async (signal) => {
+      try {
+        const snapshot = await api<Snapshot>("snapshot");
+        if (signal.aborted) return;
+        setData((current) =>
+          JSON.stringify(current) === JSON.stringify(snapshot)
+            ? current
+            : snapshot,
+        );
+        setLoadError("");
+      } catch (e) {
+        if (!signal.aborted) setLoadError(String(e));
+      }
+    },
+    page === "mcp" ||
+      page === "terminals" ||
+      data.terminals.some((session) => session.alive)
+      ? 10000
+      : data.mcp.running
+        ? 30000
+        : undefined,
+  );
+  useEffect(() => {
+    window.addEventListener(RUNTIME_SETTINGS_CHANGED, refresh);
+    return () => window.removeEventListener(RUNTIME_SETTINGS_CHANGED, refresh);
+  }, [refresh]);
   useEffect(() => {
     if (data.mcp.error) notify(data.mcp.error, true);
   }, [data.mcp.error, notify]);
   useEffect(() => {
     let active = true;
+    let latestRequest = 0;
     const load = async () => {
+      const request = ++latestRequest;
       try {
         const settings = await api<RuntimeSettings>("runtime_settings");
-        if (!active) return;
+        if (!active || request !== latestRequest) return;
         setRuntimeSettings(settings);
         setMcpHost(settings.mcp_host);
         setPort(settings.mcp_port);
       } catch (error) {
-        if (active) notify(String(error), true);
+        if (active && request === latestRequest) notify(String(error), true);
       }
     };
     void load();
@@ -217,15 +239,6 @@ export default function App() {
       window.removeEventListener(RUNTIME_SETTINGS_CHANGED, reload);
     };
   }, [notify]);
-  useEffect(() => {
-    void refresh();
-    if (preferences.refreshSeconds === "0") return;
-    const timer = setInterval(
-      () => void refresh(),
-      Number(preferences.refreshSeconds) * 1000,
-    );
-    return () => clearInterval(timer);
-  }, [refresh, preferences.refreshSeconds]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(null), 5000);
@@ -273,6 +286,7 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [confirmAuditDelete, setConfirmAuditDelete] = useState(false);
   const auditScroll = useRef<HTMLDivElement>(null);
+  const auditRequest = useRef<Promise<AuditPage> | null>(null);
   useEffect(() => {
     const timer = setTimeout(
       () =>
@@ -295,16 +309,22 @@ export default function App() {
       inFlight = true;
       if (!loaded) setAuditLoading(true);
       setAuditError("");
+      await auditRequest.current?.catch(() => {});
+      if (!active) return;
+      const request = api<AuditPage>("audit_page", { query: auditQuery });
+      auditRequest.current = request;
       try {
-        const result = await api<AuditPage>("audit_page", {
-          query: auditQuery,
-        });
+        const result = await request;
         if (active) {
           if (!loaded && auditQuery.offset === 0 && auditScroll.current) {
             auditScroll.current.scrollTop = 0;
           }
           setAuditPage((previous) => {
-            if (auditQuery.offset === 0) return result;
+            if (auditQuery.offset === 0) {
+              return JSON.stringify(previous) === JSON.stringify(result)
+                ? previous
+                : result;
+            }
             const existingIds = new Set(
               previous.entries.map((entry) => entry.id),
             );
@@ -320,24 +340,22 @@ export default function App() {
       } catch (error) {
         if (active) setAuditError(String(error));
       } finally {
+        if (auditRequest.current === request) auditRequest.current = null;
         inFlight = false;
         loaded = true;
         if (active) setAuditLoading(false);
       }
     };
     void load();
-    const timer =
-      preferences.refreshSeconds === "0" || auditQuery.offset > 0
-        ? undefined
-        : setInterval(
-            () => void load(),
-            Number(preferences.refreshSeconds) * 1000,
-          );
+    const stop =
+      auditQuery.offset === 0
+        ? observeRefresh(() => void load(), 15000)
+        : undefined;
     return () => {
       active = false;
-      clearInterval(timer);
+      stop?.();
     };
-  }, [page, auditQuery, preferences.refreshSeconds]);
+  }, [page, auditQuery]);
   const filteredAudits = auditPage.entries;
   const auditItemKey = useCallback(
     (index: number) => filteredAudits[index].id,
@@ -533,6 +551,7 @@ export default function App() {
               className={page === id ? "nav-item active" : "nav-item"}
               onClick={() => {
                 setPage(id);
+                if (id === "terminals" && page !== id) void refresh();
               }}
             >
               <Icon size={17} />
@@ -550,7 +569,13 @@ export default function App() {
           {runtimeSettings?.approval_mode !== false && (
             <ApprovalCenter
               enabled
-              onResolved={() => void refresh()}
+              onResolved={() => {
+                void refresh();
+                if (page === "audit")
+                  setAuditQuery((query) =>
+                    query.offset === 0 ? { ...query } : query,
+                  );
+              }}
               onOpenSettings={() => {
                 setPage("settings");
                 requestAnimationFrame(() =>
@@ -566,7 +591,10 @@ export default function App() {
             aria-label="MCP 服务"
             aria-current={page === "mcp" ? "page" : undefined}
             className={"nav-item " + (page === "mcp" ? "active" : "")}
-            onClick={() => setPage("mcp")}
+            onClick={() => {
+              setPage("mcp");
+              if (page !== "mcp") void refresh();
+            }}
           >
             <Plug size={17} />
             <span>MCP 服务</span>

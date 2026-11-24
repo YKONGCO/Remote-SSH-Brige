@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Eye, Search, X, RefreshCw } from "lucide-react";
 import { api } from "../api";
-import { usePreferences } from "../preferences";
+import { useRefreshRequest } from "../refresh";
 import {
   type JobInfo,
   type JobOutput,
@@ -40,57 +40,40 @@ function duration(ms: number) {
 }
 
 export function Jobs({
-  refreshKey = 0,
   notify,
 }: {
-  refreshKey?: number;
   notify: (message: string, error?: boolean) => void;
 }) {
-  const preferences = usePreferences();
   const [items, setItems] = useState<JobInfo[]>([]);
   const [status, setStatus] = useState("running");
   const [search, setSearch] = useState("");
   const [server, setServer] = useState("all");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [revision, setRevision] = useState(0);
   const [selected, setSelected] = useState<JobInfo | null>(null);
   const [closing, setClosing] = useState<JobInfo | null>(null);
   const [closeError, setCloseError] = useState("");
   const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    let disposed = false,
-      inFlight = false;
-    setLoading(true);
-    const load = async () => {
-      if (inFlight) return;
-      inFlight = true;
+  const refresh = useRefreshRequest(
+    async (signal) => {
       try {
         const result = await api<{ jobs: JobInfo[] }>("list_jobs");
-        if (!disposed) {
-          setItems(result.jobs);
+        if (!signal.aborted) {
+          setItems((previous) =>
+            JSON.stringify(previous) === JSON.stringify(result.jobs)
+              ? previous
+              : result.jobs,
+          );
           setError("");
         }
       } catch (e) {
-        if (!disposed) setError(String(e));
+        if (!signal.aborted) setError(String(e));
       } finally {
-        inFlight = false;
-        if (!disposed) setLoading(false);
+        if (!signal.aborted) setLoading(false);
       }
-    };
-    void load();
-    const timer =
-      preferences.refreshSeconds === "0"
-        ? undefined
-        : setInterval(
-            () => void load(),
-            Number(preferences.refreshSeconds) * 1000,
-          );
-    return () => {
-      disposed = true;
-      clearInterval(timer);
-    };
-  }, [refreshKey, revision, preferences.refreshSeconds]);
+    },
+    items.some((item) => item.status === "running") ? 3000 : 30000,
+  );
   const servers = new Map(
     items.map((item) => [item.server_id, item.server_name || item.server_id]),
   );
@@ -282,7 +265,10 @@ export function Jobs({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setRevision((v) => v + 1)}
+                onClick={() => {
+                  setLoading(true);
+                  void refresh();
+                }}
               >
                 重试加载
               </Button>
@@ -332,11 +318,11 @@ export function Jobs({
                   action: "close",
                 });
                 setClosing(null);
-                setRevision((v) => v + 1);
+                void refresh();
                 notify("后台任务会话已关闭");
               } catch (e) {
                 setCloseError(String(e));
-                setRevision((v) => v + 1);
+                void refresh();
               } finally {
                 setBusy(false);
               }
@@ -413,6 +399,8 @@ function JobDetails({
   const [retry, setRetry] = useState(0);
   useEffect(() => {
     let disposed = false;
+    let reading = false;
+    let more = true;
     let timer: ReturnType<typeof setTimeout>;
     let out = 0,
       err = 0;
@@ -427,6 +415,8 @@ function JobDetails({
       truncated: false,
     });
     const read = async () => {
+      if (disposed || reading || !more) return;
+      reading = true;
       try {
         const result = await api<JobOutput>("job", {
           serverId: job.server_id,
@@ -458,11 +448,11 @@ function JobDetails({
           };
         });
         setLoading(false);
-        if (
+        more =
           result.stdout_has_more ||
           result.stderr_has_more ||
-          result.status === "running"
-        )
+          result.status === "running";
+        if (more && !document.hidden)
           timer = setTimeout(
             () => void read(),
             advanced && (result.stdout_has_more || result.stderr_has_more)
@@ -470,16 +460,25 @@ function JobDetails({
               : 1000,
           );
       } catch (e) {
+        more = false;
         if (!disposed) {
           setError(String(e));
           setLoading(false);
         }
+      } finally {
+        reading = false;
       }
     };
+    const wake = () => {
+      clearTimeout(timer);
+      if (!document.hidden) void read();
+    };
     void read();
+    document.addEventListener("visibilitychange", wake);
     return () => {
       disposed = true;
       clearTimeout(timer);
+      document.removeEventListener("visibilitychange", wake);
     };
   }, [job.job_id, job.server_id, retry]);
   return (

@@ -47,12 +47,8 @@ const item: TunnelInfo = {
   error: null,
 };
 function setup(servers = [server]) {
-  localStorage.setItem(
-    "remote-desk.preferences.v1",
-    JSON.stringify({ refreshSeconds: "0" }),
-  );
   const notify = vi.fn();
-  render(<PortForwards servers={servers} refreshKey={0} notify={notify} />);
+  render(<PortForwards servers={servers} notify={notify} />);
   return { user: userEvent.setup(), notify };
 }
 test("shows MCP-created mappings, traffic and close status", async () => {

@@ -22,13 +22,14 @@ import {
   ShieldBan,
   FolderOpen,
   ShieldAlert,
+  ChevronRight,
 } from "lucide-react";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { SelectField } from "./SelectField";
 import { TransferLimitField } from "./TransferLimitField";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import appPackage from "../../package.json";
 import {
   defaults,
@@ -68,6 +69,7 @@ export function Settings({
   );
   const [saving, setSaving] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const loadRequest = useRef(0);
   const [listsOpen, setListsOpen] = useState(false);
   const [rootsEditor, setRootsEditor] = useState<
     "local_upload_roots" | "local_download_roots" | null
@@ -139,8 +141,10 @@ export function Settings({
     });
   }
   async function loadRuntime() {
+    const request = ++loadRequest.current;
     try {
       const settings = await api<RuntimeSettings>("runtime_settings");
+      if (request !== loadRequest.current) return;
       setRuntime((current) =>
         current && JSON.stringify(current) === JSON.stringify(settings)
           ? current
@@ -149,18 +153,23 @@ export function Settings({
       setLoadFailed(false);
       setError("");
     } catch (e) {
+      if (request !== loadRequest.current) return;
       setError(String(e));
       setLoadFailed(true);
     }
   }
   useEffect(() => {
     void loadRuntime();
+    return () => {
+      ++loadRequest.current;
+    };
   }, []);
   async function updateRuntime<K extends keyof RuntimeSettings>(
     name: K,
     value: RuntimeSettings[K],
   ) {
     if (!runtime || saving) return false;
+    ++loadRequest.current;
     const previous = runtime;
     const next = {
       ...runtime,
@@ -174,6 +183,7 @@ export function Settings({
         settings: next,
       });
       setRuntime(saved);
+      setLoadFailed(false);
       window.dispatchEvent(new Event(RUNTIME_SETTINGS_CHANGED));
       setError("");
       return true;
@@ -291,7 +301,8 @@ export function Settings({
       | "deletion_protection"
       | "remote_read_only"
       | "mcp_auto_start"
-      | "approval_mode",
+      | "approval_mode"
+      | "exec_timeout_to_job",
     label: string,
   ) {
     return (
@@ -403,24 +414,6 @@ export function Settings({
               <option value="exit">直接退出</option>
             </SelectField>
           </Row>
-          <Row
-            title="自动启动 MCP 服务"
-            description="下次打开应用时按上次成功启动的地址和端口启动服务，并更新已接入客户端的配置（自动备份）。"
-          >
-            {runtimeToggle("mcp_auto_start", "自动启动 MCP 服务")}
-          </Row>
-          <Row
-            title="状态刷新频率"
-            description="列表自动刷新间隔，不影响终端输出。"
-          >
-            {select("refreshSeconds", "状态刷新频率", [
-              ["3", "每 3 秒"],
-              ["5", "每 5 秒"],
-              ["10", "每 10 秒"],
-              ["30", "每 30 秒"],
-              ["0", "仅手动刷新"],
-            ])}
-          </Row>
           <Row title="主题外观" description="浅色、深色或跟随系统。">
             {select("theme", "主题外观", [
               ["light", "浅色"],
@@ -430,30 +423,70 @@ export function Settings({
           </Row>
         </div>
       </section>
+      <section className="settings-section">
+        <h2 className="settings-group-title">MCP</h2>
+        <div className="settings-card">
+          <Row
+            title="自动启动 MCP 服务"
+            description="打开应用时使用上次成功启动的地址和端口。"
+          >
+            {runtimeToggle("mcp_auto_start", "自动启动 MCP 服务")}
+          </Row>
+          <Row
+            title="交互式终端"
+            description="允许 Agent 在已授权的服务器上使用交互式 Shell，不经过 Exec 命令保护。"
+          >
+            {advancedToggle("terminal", "交互式终端")}
+          </Row>
+          <Row
+            title="端口转发"
+            description="允许 Agent 在已授权的服务器上创建和管理 SSH 端口转发。"
+          >
+            {advancedToggle("port_forward", "端口转发")}
+          </Row>
+          <Row
+            title="默认命令超时"
+            description="MCP 命令的默认时限，可按次调整。"
+          >
+            {runtimeSelect(
+              "command_timeout_secs",
+              "默认命令超时",
+              [10, 30, 60, 120, 300],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="命令超时后保留为后台任务"
+            description="超时后继续运行，需服务器授权后台任务。"
+          >
+            {runtimeToggle("exec_timeout_to_job", "命令超时后保留为后台任务")}
+          </Row>
+        </div>
+      </section>
       <section className="settings-section" id="security-settings">
-        <h2 className="settings-group-title">安全控制</h2>
+        <h2 className="settings-group-title">安全</h2>
         <div className="settings-card">
           <Row
             title="只读保护"
-            description="禁止文件修改、命令和终端交互，允许查看与下载。"
+            description="禁止远端文件修改及命令执行，仅允许受支持的读取操作。"
           >
             {runtimeToggle("remote_read_only", "只读保护")}
           </Row>
           <Row
             title="删除保护"
-            description="禁止桌面和 MCP 文件删除，不限制 Shell 和终端。"
+            description="禁止通过文件管理功能删除远端文件，不限制 Shell 命令。"
           >
             {runtimeToggle("deletion_protection", "删除保护")}
           </Row>
           <Row
-            title="审批模式"
-            description="关闭后不再注册 exec_approved，侧边栏审批入口隐藏；受保护命令将直接拒绝。"
+            title="允许高危命令审批"
+            description="开启后，Agent 可通过 exec_approved 申请执行受保护命令。关闭后直接拒绝。"
           >
-            {runtimeToggle("approval_mode", "审批模式")}
+            {runtimeToggle("approval_mode", "允许高危命令审批")}
           </Row>
           <Row
             title="受保护命令"
-            description="内置高危规则始终启用且不可关闭。命中后普通 exec 不执行，需通过 exec_approved 由你单次批准。"
+            description="内置规则始终生效，可额外添加需要审批的命令。"
           >
             <Button
               variant="outline"
@@ -462,51 +495,13 @@ export function Settings({
               onClick={() => void openRules()}
             >
               <ShieldAlert size={14} />
-              查看受保护命令
-            </Button>
-          </Row>
-          {runtime?.approval_mode !== false && (
-            <Row
-              title="审批等待时间"
-              description="高风险命令的审批超时后自动拒绝。修改仅影响新请求。"
-            >
-              {runtimeSelect(
-                "approval_timeout_secs",
-                "审批等待时间",
-                [1, 5, 10, 15, 30, 60, 120],
-                "秒",
-              )}
-            </Row>
-          )}
-        </div>
-      </section>
-      <section className="settings-section">
-        <h2 className="settings-group-title">命令与 Shell 权限</h2>
-        <div className="settings-card">
-          <Row
-            title="禁止命令执行"
-            description="基础安全限制，审批不能解除；开启后 exec 和 exec_approved 都不可用。"
-          >
-            {commandToggle("exec_disabled", "禁止命令执行")}
-          </Row>
-          <Row
-            title="自定义受保护命令"
-            description="可对整个命令或指定子命令增加人工审批。"
-          >
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!runtime || saving}
-              onClick={() => void openRules()}
-            >
-              <ShieldBan size={14} />
               管理受保护命令
             </Button>
           </Row>
           {policy?.legacy_whitelist ? (
             <Row
               title="旧版白名单限制"
-              description={`检测到升级前保留的 ${policy.legacy_whitelist.length} 条白名单：名单外的命令仍需要审批，不会静默放开。`}
+              description={`已保留 ${policy.legacy_whitelist.length} 条旧规则。切换后，名单外的命令按新版规则判断。`}
             >
               <Button
                 variant="outline"
@@ -522,100 +517,10 @@ export function Settings({
               </Button>
             </Row>
           ) : null}
-          <Row
-            title="允许 Shell 高级功能"
-            description="允许管道、重定向、组合命令与脚本；脚本和解释器内容仍按不确定处理并要求审批。"
-          >
-            {commandToggle("allow_advanced_shell", "允许 Shell 高级功能")}
-          </Row>
         </div>
       </section>
       <section className="settings-section">
-        <h2 className="settings-group-title">MCP 高级工具</h2>
-        <div className="settings-card">
-          <Row
-            title="端口转发"
-            description="开放 port_forward，让 Agent 创建和关闭指向服务器回环地址的本地 TCP 转发。"
-          >
-            {advancedToggle("port_forward", "端口转发")}
-          </Row>
-          <Row
-            title="交互式终端"
-            description="高风险：启用后 Agent 可直接向远程 Shell 输入，不经过受保护命令审批。仅对已单独授权的服务器生效。"
-          >
-            {advancedToggle("terminal", "交互式终端")}
-          </Row>
-        </div>
-      </section>
-      <section className="settings-section">
-        <h2 className="settings-group-title">连接与命令</h2>
-        <div className="settings-card">
-          <Row title="连接超时" description="建立服务器连接的最长等待时间。">
-            {runtimeSelect(
-              "connect_timeout_secs",
-              "连接超时",
-              [3, 8, 15, 30, 60, 120],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="握手超时"
-            description="等待 SSH 握手与服务器横幅的最长时间。"
-          >
-            {runtimeSelect(
-              "handshake_timeout_secs",
-              "握手超时",
-              [5, 15, 30, 60, 120],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="读写超时"
-            description="普通 SSH 操作的单次等待上限，文件传输使用下方独立设置。"
-          >
-            {runtimeSelect(
-              "io_timeout_secs",
-              "读写超时",
-              [5, 15, 30, 60, 120, 300],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="默认命令超时"
-            description="MCP 命令的默认时限，单次可覆盖，最长 300 秒。"
-          >
-            {runtimeSelect(
-              "command_timeout_secs",
-              "默认命令超时",
-              [10, 30, 60, 120, 300],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="命令超时后保留为后台任务"
-            description="超时后继续运行，需服务器授权后台任务。"
-          >
-            <button
-              type="button"
-              className="setting-switch"
-              role="switch"
-              aria-label="命令超时后保留为后台任务"
-              aria-checked={runtime?.exec_timeout_to_job ?? false}
-              disabled={!runtime || saving}
-              onClick={() =>
-                void updateRuntime(
-                  "exec_timeout_to_job",
-                  !runtime?.exec_timeout_to_job,
-                )
-              }
-            >
-              <span />
-            </button>
-          </Row>
-        </div>
-      </section>
-      <section className="settings-section">
-        <h2 className="settings-group-title">远程文件</h2>
+        <h2 className="settings-group-title">文件传输</h2>
         <div className="settings-card">
           <Row title="同时传输任务数" description="其余任务自动排队。">
             {transferSelect(
@@ -636,45 +541,12 @@ export function Settings({
               "个",
             )}
           </Row>
-          <Row
-            title="自动重试次数"
-            description="网络中断后退避重试；权限或文件变化错误会停止。"
-          >
+          <Row title="自动重试次数" description="可重试的传输失败会自动重试。">
             {transferSelect(
               "max_retries",
               "自动重试次数",
               [0, 1, 3, 5, 10],
               "次",
-            )}
-          </Row>
-          <Row title="传输 I/O 超时" description="单次读写等待时间。">
-            {transferSelect(
-              "io_timeout_secs",
-              "传输 I/O 超时",
-              [5, 15, 30, 60, 120, 300],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="传输无进度超时"
-            description="持续有进展的大文件传输不受总耗时限制。"
-          >
-            {transferSelect(
-              "idle_timeout_secs",
-              "传输无进度超时",
-              [15, 30, 60, 120, 300, 600],
-              "秒",
-            )}
-          </Row>
-          <Row
-            title="默认传输限速"
-            description="每个任务的默认速度上限，0 表示不限。"
-          >
-            {transferSelect(
-              "bandwidth_kib",
-              "默认传输限速",
-              [0, 128, 512, 1024, 4096, 16384],
-              "KiB/s",
             )}
           </Row>
           <Row title="显示隐藏文件" description="显示 .ssh 等以点开头的文件。">
@@ -776,10 +648,7 @@ export function Settings({
           <Row title="光标闪烁" description="输入光标的闪烁效果。">
             {toggle("cursorBlink", "光标闪烁")}
           </Row>
-          <Row
-            title="回滚行数"
-            description="界面保留的历史行数，不影响后端输出缓存。"
-          >
+          <Row title="回滚行数" description="终端界面保留的历史行数。">
             {select(
               "terminalScrollback",
               "回滚行数",
@@ -787,6 +656,91 @@ export function Settings({
                 String(n),
                 `${n.toLocaleString()} 行`,
               ]),
+            )}
+          </Row>
+        </div>
+      </section>
+      <details className="settings-section settings-advanced">
+        <summary className="settings-group-title">
+          <ChevronRight size={16} aria-hidden="true" />
+          高级设置
+        </summary>
+        <div className="settings-card">
+          <Row
+            title="禁止命令执行"
+            description="禁用所有服务器的 MCP 命令执行，包括审批执行。"
+          >
+            {commandToggle("exec_disabled", "禁止命令执行")}
+          </Row>
+          <Row
+            title="允许 Shell 高级功能"
+            description="允许管道、重定向、组合命令及脚本。命中受保护规则时仍需审批。"
+          >
+            {commandToggle("allow_advanced_shell", "允许 Shell 高级功能")}
+          </Row>
+          <Row
+            title="审批等待时间"
+            description="超时后自动拒绝。修改仅影响新请求。"
+          >
+            {runtimeSelect(
+              "approval_timeout_secs",
+              "审批等待时间",
+              [1, 5, 10, 15, 30, 60, 120],
+              "秒",
+            )}
+          </Row>
+          <Row title="连接超时" description="建立服务器连接的最长等待时间。">
+            {runtimeSelect(
+              "connect_timeout_secs",
+              "连接超时",
+              [3, 8, 15, 30, 60, 120],
+              "秒",
+            )}
+          </Row>
+          <Row title="握手超时" description="等待 SSH 握手完成的最长时间。">
+            {runtimeSelect(
+              "handshake_timeout_secs",
+              "握手超时",
+              [5, 15, 30, 60, 120],
+              "秒",
+            )}
+          </Row>
+          <Row title="读写超时" description="普通 SSH 操作的单次等待上限。">
+            {runtimeSelect(
+              "io_timeout_secs",
+              "读写超时",
+              [5, 15, 30, 60, 120, 300],
+              "秒",
+            )}
+          </Row>
+          <Row title="传输 I/O 超时" description="单次读写等待时间。">
+            {transferSelect(
+              "io_timeout_secs",
+              "传输 I/O 超时",
+              [5, 15, 30, 60, 120, 300],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="传输无进度超时"
+            description="传输无进展时的最长等待时间。"
+          >
+            {transferSelect(
+              "idle_timeout_secs",
+              "传输无进度超时",
+              [15, 30, 60, 120, 300, 600],
+              "秒",
+            )}
+          </Row>
+          <Row
+            title="默认传输限速"
+            description="单个任务的默认速度上限，0 表示不限。"
+          >
+            {transferSelect(
+              "bandwidth_kib",
+              "默认传输限速",
+              [0, 128, 512, 1024, 4096, 16384],
+              "KiB/s",
             )}
           </Row>
           <Row
@@ -801,7 +755,7 @@ export function Settings({
             )}
           </Row>
         </div>
-      </section>
+      </details>
       {rootsEditor && (
         <ModalFrame
           className="settings-editor-dialog directory-roots-modal"
