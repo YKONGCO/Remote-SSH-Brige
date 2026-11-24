@@ -211,6 +211,7 @@ pub fn builtin_rules() -> &'static [BuiltinRule] {
 struct Analysis {
     commands: Vec<String>,
     matches: Vec<RuleMatch>,
+    unresolved: Vec<RuleMatch>,
 }
 
 pub fn assess(command: &str, settings: &RuntimeSettings) -> Assessment {
@@ -237,16 +238,8 @@ fn analyze(source: &str, policy: &CommandPolicy) -> Result<Analysis, String> {
 }
 
 fn decide(mut analysis: Analysis) -> Assessment {
-    let mut seen = BTreeSet::new();
-    analysis.matches.retain(|rule| {
-        seen.insert((
-            rule.source,
-            rule.command.clone(),
-            rule.argument.clone(),
-            rule.reason.clone(),
-        ))
-    });
-    if analysis.matches.is_empty() {
+    let uncertain = !analysis.unresolved.is_empty();
+    if analysis.matches.is_empty() && !uncertain {
         return Assessment {
             decision: Decision::Allow,
             reason: None,
@@ -265,34 +258,41 @@ fn decide(mut analysis: Analysis) -> Assessment {
         "unknown"
     };
 
-    analysis.matches.sort_by_key(|rule| match rule.source {
+    let mut findings = analysis.matches;
+    findings.append(&mut analysis.unresolved);
+    let mut seen = BTreeSet::new();
+    findings.retain(|rule| {
+        seen.insert((
+            rule.source,
+            rule.command.clone(),
+            rule.argument.clone(),
+            rule.reason.clone(),
+        ))
+    });
+    findings.sort_by_key(|rule| match rule.source {
         "builtin" => 0,
-        "legacy_whitelist" => 1,
-        "analysis" => 2,
+        "user" => 1,
+        "legacy_whitelist" => 2,
         _ => 3,
     });
-    let uncertain = analysis
-        .matches
-        .iter()
-        .any(|rule| rule.source == "analysis");
-    let total = analysis.matches.len();
-    let first = analysis.matches[0].reason.clone();
+    let total = findings.len();
+    let first = findings[0].reason.clone();
     let reason = if total > 1 {
         format!(
-            "{first} (and {} more rule match{})",
+            "{first} (and {} more finding{})",
             total - 1,
-            if total == 2 { "" } else { "es" }
+            if total == 2 { "" } else { "s" }
         )
     } else {
         first
     };
 
-    analysis.matches.truncate(16);
+    findings.truncate(16);
     Assessment {
         decision: Decision::RequireApproval,
         reason: Some(reason),
         risk: Some(risk),
-        matched_rules: analysis.matches,
+        matched_rules: findings,
         next_action: Some("exec_approved"),
         uncertain,
         commands: analysis.commands,
@@ -447,22 +447,16 @@ fn inspect_command(
     analysis: &mut Analysis,
 ) -> Result<(), String> {
     let Some(name) = node.child_by_field_name("name") else {
-        analysis.matches.push(RuleMatch {
-            source: "analysis",
-            command: "<unknown>".into(),
-            reason: "Cannot determine the command name; dynamic execution requires approval".into(),
-            argument: None,
-        });
+        uncertain(analysis, "<unknown>", "Cannot determine the command name");
         return Ok(());
     };
     if has_dynamic(name) {
         let raw: String = text(name, source).chars().take(200).collect();
-        analysis.matches.push(RuleMatch {
-            source: "analysis",
-            command: raw.clone(),
-            reason: "Dynamic command names cannot be statically verified".into(),
-            argument: None,
-        });
+        uncertain(
+            analysis,
+            &raw,
+            "Dynamic command names cannot be statically verified",
+        );
         analysis.commands.push(raw);
         return Ok(());
     }
@@ -576,24 +570,25 @@ fn inspect_words(
     }
 
     for rule in BUILTIN_RULES {
-        let matches = if rule.arguments.is_empty() {
-            rule.command == name
-        } else {
-            rule.command == name
-                && args
-                    .iter()
-                    .any(|arg| rule.arguments.iter().any(|required| arg == required))
-        };
-        if matches {
+        if rule.command != name {
+            continue;
+        }
+        let matched = args.iter().enumerate().find(|(index, arg)| {
+            dynamic.get(index + 1) != Some(&true) && rule.arguments.contains(&arg.as_str())
+        });
+        if rule.arguments.is_empty() || matched.is_some() {
             analysis.matches.push(RuleMatch {
                 source: "builtin",
                 command: name.to_string(),
                 reason: rule.reason.into(),
-                argument: args
-                    .iter()
-                    .find(|arg| rule.arguments.iter().any(|required| *arg == *required))
-                    .cloned(),
+                argument: matched.map(|(_, arg)| arg.clone()),
             });
+        } else if dynamic.iter().skip(1).any(|argument| *argument) {
+            uncertain(
+                analysis,
+                name,
+                format!("Dynamic arguments could match a built-in rule for '{name}'"),
+            );
         }
     }
     if name.starts_with("mkfs.") {
@@ -654,11 +649,18 @@ fn inspect_words(
 
     if !policy.allow_scripts {
         require(
-            !(interpreter || script_file || custom_path),
+            !(interpreter || script_file || custom_path || (shell && !version_only(args))),
             "Scripts, interpreters and custom executable paths are not allowed",
         )?;
     } else if shell {
-        inspect_shell(name, args, policy, nesting, analysis)?;
+        inspect_shell(
+            name,
+            args,
+            dynamic.get(1..).unwrap_or_default(),
+            policy,
+            nesting,
+            analysis,
+        )?;
     } else if name == "eval" {
         let code = args.join(" ");
         if code.contains(['$', '`', '\\']) {
@@ -670,12 +672,6 @@ fn inspect_words(
         } else {
             parse_source(&code, policy, nesting + 1, analysis)?;
         }
-    } else if name == "source" || name == "." {
-        uncertain(
-            analysis,
-            name,
-            "Sourced script contents cannot be statically verified",
-        );
     } else if matches!(name, "su" | "runuser") {
         if let Some(index) = args
             .iter()
@@ -689,7 +685,15 @@ fn inspect_words(
                 );
                 return Ok(());
             };
-            parse_source(code, policy, nesting + 1, analysis)?;
+            if dynamic.get(index + 2) == Some(&true) {
+                uncertain(
+                    analysis,
+                    name,
+                    format!("{name} -c receives dynamic command text"),
+                );
+            } else {
+                parse_source(code, policy, nesting + 1, analysis)?;
+            }
         } else if name == "runuser" {
             match wrapper_inner(name, args) {
                 Some(inner) if !inner.is_empty() => {
@@ -704,20 +708,6 @@ fn inspect_words(
                 "su starts a login shell that cannot be statically verified",
             );
         }
-    } else if interpreter {
-        if !version_only(args) {
-            uncertain(
-                analysis,
-                name,
-                format!("'{name}' executes code or a script that cannot be statically verified"),
-            );
-        }
-    } else if script_file || custom_path {
-        uncertain(
-            analysis,
-            name,
-            "Custom executables and scripts cannot be statically verified",
-        );
     }
 
     if is_wrapper(name) {
@@ -757,45 +747,58 @@ fn inspect_words(
 fn inspect_shell(
     name: &str,
     args: &[String],
+    dynamic: &[bool],
     policy: &CommandPolicy,
     nesting: usize,
     analysis: &mut Analysis,
 ) -> Result<(), String> {
-    if let Some(index) = args
-        .iter()
-        .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
-    {
-        let Some(code) = args.get(index + 1) else {
-            uncertain(
-                analysis,
-                name,
-                "Shell -c has no script content that can be statically verified",
-            );
-            return Ok(());
-        };
-        parse_source(code, policy, nesting + 1, analysis)?;
+    if version_only(args) {
         return Ok(());
     }
-    if args.iter().any(|arg| !arg.starts_with('-')) {
-        uncertain(
-            analysis,
-            name,
-            "Shell script contents cannot be statically verified",
-        );
-    } else if args.is_empty() || args.iter().any(|arg| arg == "-s" || arg == "--stdin") {
-        uncertain(
-            analysis,
-            name,
-            "An interactive shell or stdin script cannot be statically verified",
-        );
-    } else if version_only(args) {
-    } else {
-        uncertain(
-            analysis,
-            name,
-            "Shell startup modes cannot be statically verified",
-        );
+    let mut words = args.iter().enumerate();
+    let mut stdin = false;
+    while let Some((index, arg)) = words.next() {
+        if dynamic.get(index) == Some(&true) {
+            break;
+        }
+        match arg.as_str() {
+            "--" => {
+                if !stdin && words.next().is_some() {
+                    return Ok(());
+                }
+                break;
+            }
+            "-" => break,
+            "-o" | "-O" | "+o" | "+O" | "--rcfile" | "--init-file" => {
+                words.next();
+            }
+            arg if arg == "--command"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')) =>
+            {
+                if let Some((index, code)) = words.next() {
+                    if dynamic.get(index) != Some(&true) {
+                        return parse_source(code, policy, nesting + 1, analysis);
+                    }
+                }
+                break;
+            }
+            arg if !arg.starts_with(['-', '+']) => {
+                if !stdin {
+                    return Ok(());
+                }
+                break;
+            }
+            arg => {
+                stdin |= arg == "--stdin"
+                    || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('s'));
+            }
+        }
     }
+    uncertain(
+        analysis,
+        name,
+        "Cannot determine the commands supplied to the shell",
+    );
     Ok(())
 }
 
@@ -807,7 +810,7 @@ fn version_only(args: &[String]) -> bool {
 }
 
 fn uncertain(analysis: &mut Analysis, command: &str, reason: impl Into<String>) {
-    analysis.matches.push(RuleMatch {
+    analysis.unresolved.push(RuleMatch {
         source: "analysis",
         command: command.to_string(),
         reason: reason.into(),
@@ -1110,32 +1113,85 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_and_opaque_execution_is_uncertain_not_silently_allowed() {
+    fn ordinary_opaque_scripts_are_allowed_without_an_approval_finding() {
+        for command in [
+            "python3 -u script.py",
+            "python3 -c 'print(1)'",
+            "node -e 'console.log(1)'",
+            "ruby script.rb",
+            "sed -n '1p' input.txt",
+            "./deploy.sh",
+            "/opt/tools/report",
+            "source ./profile.sh",
+            "bash script.sh -c",
+            "sudo python3 -u script.py",
+            "python3 --version",
+        ] {
+            let result = classify(command, CommandPolicy::default());
+            assert_eq!(result.decision, Decision::Allow, "{command}: {result:?}");
+            assert!(!result.uncertain, "{command}");
+            assert!(result.matched_rules.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_rules_win_for_scripts_and_nested_commands() {
+        let policy = CommandPolicy {
+            protected_commands: vec!["python3 -c".into(), "/opt/tools/report".into()],
+            ..Default::default()
+        };
+        for command in [
+            "python3 -c 'print(1)'",
+            "/opt/tools/report",
+            "bash -o pipefail -c 'python3 -c \"print(1)\"'",
+            "sudo -u root /opt/tools/report",
+            "eval 'python3 -c \"print(1)\"'",
+        ] {
+            let result = classify(command, policy.clone());
+            assert_eq!(result.decision, Decision::RequireApproval, "{command}");
+            assert_eq!(result.risk, Some("protected"), "{command}");
+            assert_eq!(result.next_action, Some("exec_approved"));
+            assert!(!result.uncertain, "{command}");
+        }
+        assert_eq!(
+            classify("python3 -u script.py", policy).decision,
+            Decision::Allow
+        );
+
+        let result = classify("python3 script.py && rm tmp.txt", CommandPolicy::default());
+        assert_eq!(result.decision, Decision::RequireApproval);
+        assert_eq!(result.risk, Some("high"));
+        assert_eq!(result.matched_rules[0].source, "builtin");
+        assert!(!result.uncertain);
+    }
+
+    #[test]
+    fn dynamic_commands_and_potential_rule_matches_still_require_approval() {
+        let policy = CommandPolicy {
+            protected_commands: vec!["docker rmi".into()],
+            ..Default::default()
+        };
         for command in [
             "$CMD",
             "sh -c \"$CMD\"",
+            "bash -c \"echo $ARGS\"",
+            "bash -s arg",
             "sudo \"$CMD\"",
             "sudo -u root",
             "su -",
             "runuser -u root",
-            "python script.py",
-            "node -e 'console.log(1)'",
-            "sed -n '1p' /etc/passwd",
-            "./deploy.sh",
-            "source /etc/profile",
+            "docker \"$ACTION\" image",
+            "systemctl \"$ACTION\"",
         ] {
-            let result = classify(command, CommandPolicy::default());
+            let result = classify(command, policy.clone());
             assert_eq!(
                 result.decision,
                 Decision::RequireApproval,
                 "{command}: {result:?}"
             );
             assert!(result.uncertain, "{command}: {result:?}");
+            assert_eq!(result.risk, Some("unknown"), "{command}");
         }
-        assert_eq!(
-            classify("python --version", CommandPolicy::default()).decision,
-            Decision::Allow
-        );
     }
 
     #[test]
@@ -1149,10 +1205,19 @@ mod tests {
             allow_scripts: false,
             ..Default::default()
         };
-        assert_eq!(
-            classify("python script.py", scripts_off.clone()).decision,
-            Decision::Deny
-        );
+        for command in [
+            "python script.py",
+            "./deploy.sh",
+            "/opt/tools/report",
+            "bash script.sh",
+            "bash -c 'pwd'",
+        ] {
+            assert_eq!(
+                classify(command, scripts_off.clone()).decision,
+                Decision::Deny,
+                "{command}"
+            );
+        }
         assert_eq!(classify("FOO=1 ls", scripts_off).decision, Decision::Deny);
         let compound_off = CommandPolicy {
             allow_compound: false,

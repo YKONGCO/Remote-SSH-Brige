@@ -33,6 +33,10 @@ fn ordinary_commands_run_without_an_allowlist() {
         "mkdir -p /tmp/work",
         "docker compose ps",
         "python --version",
+        "python3 -u script.py",
+        "node -e 'console.log(1)'",
+        "./deploy.sh",
+        "source ./profile.sh",
         "bash -c 'ls -la'",
         "echo $(date +%s)",
     ] {
@@ -80,16 +84,16 @@ fn builtin_protection_requires_approval_and_user_rules_only_add_protection() {
 }
 
 #[test]
-fn dynamic_and_opaque_execution_is_never_silently_safe() {
-    let policy = CommandPolicy::default();
+fn dynamic_execution_and_possible_rule_matches_require_approval() {
+    let policy = CommandPolicy {
+        protected_commands: vec!["docker rmi".into()],
+        ..Default::default()
+    };
     for command in [
         "$CMD",
         "sh -c \"$CMD\"",
-        "python script.py",
-        "node -e 'console.log(1)'",
-        "sed -n '1p' /etc/passwd",
-        "./deploy.sh",
-        "source /etc/profile",
+        "docker \"$ACTION\"",
+        "systemctl \"$ACTION\"",
     ] {
         let assessment = assess(command, &settings_with(policy.clone()));
         assert_eq!(assessment.decision, Decision::RequireApproval, "{command}");
