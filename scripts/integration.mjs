@@ -980,9 +980,12 @@ try {
   check(
     "Real SSH exec captures stdout, stderr and nonzero exit",
     exec.exit_code === 7 &&
-      exec.output.startsWith("Exit 7\n") &&
-      exec.output.includes("stdout ✓") &&
-      exec.output.includes("stderr ✓"),
+      exec.output.startsWith("stdout:\n") &&
+      exec.output.includes("SSH stdout ✓") &&
+      exec.output.includes("stderr:\n") &&
+      exec.output.includes("SSH stderr ✓") &&
+      exec.notices.some((notice) => notice.includes("Exited 7")),
+    exec,
   );
   for (const command of [
     "ls -la /workspace",
@@ -1478,9 +1481,10 @@ try {
     check(
       "Final nonzero exit code remains available without repeated execution",
       final.exit_code === 9 &&
-        final.output === "Exit 9" &&
+        [final.output, ...final.notices].join("\n").includes("Exited 9") &&
         final.stdout_cursor === undefined &&
         executionCounts.get("fixture:job-incremental") === 1,
+      final,
     );
     check(
       "Original exec progress stops at handoff",
