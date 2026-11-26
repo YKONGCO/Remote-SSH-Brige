@@ -32,7 +32,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "RWRyiXwdvlAcO7kX1u2D+bHAf6t7b8632FxVtn0xhi7tTj0AqLlVHNP/",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCMUM1MEJFMUQ3Qzg5NzIKUldSeWlYd2R2bEFjTzdrWDF1MkQrYkhBZjZ0N2I4NjMyRnhWdG4weGhpN3RUajBBcUxsVkhOUC8K",
       "endpoints": [
         "https://github.com/YKONGCO/Remote-SSH-Brige/releases/latest/download/latest.json"
       ]

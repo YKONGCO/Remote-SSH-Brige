@@ -13,20 +13,18 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   windows:
     name: Windows x64
     runs-on: windows-2022
     timeout-minutes: 60
-    permissions:
-      contents: write
+    outputs:
+      signed: ${{ steps.signing.outputs.enabled }}
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     defaults:
       run:
         shell: pwsh
@@ -44,6 +42,7 @@ jobs:
           cache: npm
 
       - name: Set up Rust MSVC
+        id: rust
         run: |
           rustup update stable --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -52,6 +51,8 @@ jobs:
           rustup component add rustfmt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           perl --version
+          $toolchain = (rustc -vV | Select-String '^release:').ToString().Split(':', 2)[1].Trim()
+          "version=$toolchain" >> $env:GITHUB_OUTPUT
 
       - name: Cache Rust dependencies and build output
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -60,12 +61,23 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: windows-msvc-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
+            !src-tauri/target/**/bundle
+          key: windows-msvc-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            windows-msvc-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
+            windows-msvc-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
 
       - name: Install JavaScript dependencies
         run: npm ci
+
+      - name: Validate updater signing configuration
+        id: signing
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name != 'pull_request' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        run: |
+          node scripts/check-updater-signing.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "enabled=$($env:TAURI_SIGNING_PRIVATE_KEY -ne '' -and $null -ne $env:TAURI_SIGNING_PRIVATE_KEY)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
@@ -86,14 +98,19 @@ jobs:
         run: npm run test:e2e
 
       - name: Build signed desktop installer with updater artifacts
-        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run desktop:build -- --ci --bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked
 
       - name: Build unsigned desktop installer
-        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        if: steps.signing.outputs.enabled != 'true'
         run: npm run desktop:build -- --ci --bundles nsis -- --locked
 
       - name: Prepare downloadable packages
+        env:
+          UPDATER_SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
@@ -104,24 +121,25 @@ jobs:
           $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer.' }
           Copy-Item -LiteralPath $installers[0].FullName -Destination $output
-          $updater = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.nsis.zip' -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($updater) {
-            Copy-Item -LiteralPath $updater.FullName -Destination $output
-            $signaturePath = "$($updater.FullName).sig"
-            if (Test-Path $signaturePath) {
-              Copy-Item -LiteralPath $signaturePath -Destination $output
-              $signature = (Get-Content $signaturePath -Raw).Trim()
-              $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$($updater.Name)"
-              @{
-                version = $version
-                notes = ''
-                pub_date = (Get-Date).ToUniversalTime().ToString('o')
-                platforms = @{
-                  'windows-x86_64' = @{ signature = $signature; url = $url }
-                }
-              } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'latest.json') -Encoding utf8
+          if ($env:UPDATER_SIGNED -eq 'true') {
+            $signaturePath = "$($installers[0].FullName).sig"
+            Copy-Item -LiteralPath $signaturePath -Destination $output
+            $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+            if (-not $signature) { throw 'Updater signature is empty.' }
+            $tag = "v$version"
+            if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne $tag) {
+              throw "Release tag must match package version: $tag"
             }
+            $filename = [Uri]::EscapeDataString($installers[0].Name)
+            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$filename"
+            @{
+              version = $version
+              notes = ''
+              pub_date = (Get-Date).ToUniversalTime().ToString('o')
+              platforms = @{
+                'windows-x86_64' = @{ signature = $signature; url = $url }
+              }
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'latest.json') -Encoding utf8
           }
           Copy-Item -LiteralPath 'src-tauri/target/release/remote-ssh-brige.exe', 'LICENSE' -Destination $portable
           @(
@@ -162,22 +180,6 @@ jobs:
           compression-level: 0
           retention-days: 14
 
-      - name: Publish signed Windows update assets
-        if: startsWith(github.ref, 'refs/tags/') && env.TAURI_SIGNING_PRIVATE_KEY != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view $env:GITHUB_REF_NAME *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $env:GITHUB_REF_NAME --title $env:GITHUB_REF_NAME --generate-notes
-          }
-          gh release upload $env:GITHUB_REF_NAME `
-            .artifacts/packages/*.exe `
-            .artifacts/packages/*.zip `
-            .artifacts/packages/*.sig `
-            .artifacts/packages/latest.json `
-            --clobber
-
       - name: Upload protocol test reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -215,6 +217,7 @@ jobs:
           cache: npm
 
       - name: Set up Rust and macOS build tools
+        id: rust
         env:
           EXPECTED_TARGET: aarch64-apple-darwin
         run: |
@@ -225,6 +228,7 @@ jobs:
           xcode-select -p
           clang --version
           perl --version
+          echo "version=$(rustc -vV | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
 
       - name: Restore Rust dependencies and build output
         id: rust-cache
@@ -234,9 +238,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: macos-15-arm64-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
+            !src-tauri/target/**/bundle
+          key: macos-15-arm64-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            macos-15-arm64-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
+            macos-15-arm64-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}-
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -345,13 +350,14 @@ jobs:
           retention-days: 14
 
       - name: Save Rust build cache
-        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        if: steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
+            !src-tauri/target/**/bundle
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
       - name: Remove temporary test keychain
@@ -361,3 +367,31 @@ jobs:
           if [ -f "$test_keychain" ]; then
             security delete-keychain "$test_keychain"
           fi
+
+  release:
+    name: Publish signed Windows update
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/') && needs.windows.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Windows packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: remote-ssh-brige-windows-x64-${{ github.run_number }}
+          path: packages
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -s packages/latest.json
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" packages/* --clobber
