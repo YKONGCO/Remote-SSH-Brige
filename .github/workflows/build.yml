@@ -120,18 +120,18 @@ jobs:
 
           $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer.' }
-          Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          $installerName = "remote-ssh-brige-$version-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path $output $installerName)
           if ($env:UPDATER_SIGNED -eq 'true') {
             $signaturePath = "$($installers[0].FullName).sig"
-            Copy-Item -LiteralPath $signaturePath -Destination $output
+            Copy-Item -LiteralPath $signaturePath -Destination (Join-Path $output "$installerName.sig")
             $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
             if (-not $signature) { throw 'Updater signature is empty.' }
             $tag = "v$version"
             if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne $tag) {
               throw "Release tag must match package version: $tag"
             }
-            $filename = [Uri]::EscapeDataString($installers[0].Name)
-            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$filename"
+            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$installerName"
             @{
               version = $version
               notes = ''
@@ -369,7 +369,7 @@ jobs:
           fi
 
   release:
-    name: Publish signed Windows update
+    name: Publish desktop release
     needs: [windows, macos]
     if: startsWith(github.ref, 'refs/tags/') && needs.windows.outputs.signed == 'true'
     runs-on: ubuntu-latest
@@ -383,6 +383,12 @@ jobs:
           name: remote-ssh-brige-windows-x64-${{ github.run_number }}
           path: packages
 
+      - name: Download verified macOS packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: remote-ssh-brige-macos-arm64-${{ github.run_number }}
+          path: macos-packages
+
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -391,7 +397,14 @@ jobs:
         run: |
           set -euo pipefail
           test -s packages/latest.json
+          cp macos-packages/*.dmg macos-packages/*.zip macos-packages/LICENSE packages/
+          (
+            cd packages
+            sha256sum -- *.exe *.sig *.zip *.dmg latest.json LICENSE > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
           if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes --draft
           fi
           gh release upload "$RELEASE_TAG" packages/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
