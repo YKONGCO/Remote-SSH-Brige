@@ -184,15 +184,15 @@ impl TerminalHandle {
     }
     fn finish(&self, state: TerminalState, error: Option<String>) -> TerminalState {
         let mut buffer = self.buffer.lock().unwrap();
-        buffer.state = if buffer.state == TerminalState::Closing || self.closed.load(Ordering::Acquire)
-        {
-            match state {
-                TerminalState::Failed | TerminalState::Disconnected => TerminalState::Closed,
-                other => other,
-            }
-        } else {
-            state
-        };
+        buffer.state =
+            if buffer.state == TerminalState::Closing || self.closed.load(Ordering::Acquire) {
+                match state {
+                    TerminalState::Failed | TerminalState::Disconnected => TerminalState::Closed,
+                    other => other,
+                }
+            } else {
+                state
+            };
         buffer.error = if matches!(
             buffer.state,
             TerminalState::Failed | TerminalState::Disconnected
@@ -215,11 +215,7 @@ impl TerminalHandle {
             let value = buffer.read(cursor)?;
             let empty = value["stdout"].as_str().is_some_and(|text| text.is_empty());
             let now = Instant::now();
-            if !empty
-                || !buffer.state.alive()
-                || wait.is_zero()
-                || now >= deadline
-            {
+            if !empty || !buffer.state.alive() || wait.is_zero() || now >= deadline {
                 return Ok(value);
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -280,16 +276,16 @@ fn append(buffer: &Arc<Mutex<Buffer>>, wake: &Arc<Condvar>, bytes: &[u8]) {
     drop(b);
     wake.notify_all();
 }
-pub fn operate(state: &Arc<AppState>, server: &Server, op: &Operation, source: &str) -> Result<Value> {
+pub fn operate(
+    state: &Arc<AppState>,
+    server: &Server,
+    op: &Operation,
+    source: &str,
+) -> Result<Value> {
     if op.kind == "terminal_open" {
         return open(state, server, op, source);
     }
-    let handle = state
-        .terminals
-        .lock()
-        .unwrap()
-        .get(&op.session_id)
-        .cloned();
+    let handle = state.terminals.lock().unwrap().get(&op.session_id).cloned();
     let Some(handle) = handle else {
         if op.kind == "terminal_close" {
             return Ok(json!({"closed":true,"state":TerminalState::Closed}));
@@ -326,10 +322,7 @@ pub fn operate(state: &Arc<AppState>, server: &Server, op: &Operation, source: &
         "terminal_resize" => {
             handle
                 .input
-                .try_send(Input::Resize(
-                    op.cols.clamp(20, 500),
-                    op.rows.clamp(5, 200),
-                ))
+                .try_send(Input::Resize(op.cols.clamp(20, 500), op.rows.clamp(5, 200)))
                 .context("Terminal session is closing")?;
             handle.notify_input();
             Ok(json!({"resized":true}))
@@ -457,7 +450,11 @@ fn run_worker(
     let lease = state
         .upgrade()
         .context("Application state is no longer available")
-        .and_then(|state| state.sessions.acquire_terminal(&server, &settings, &cancelled));
+        .and_then(|state| {
+            state
+                .sessions
+                .acquire_terminal(&server, &settings, &cancelled)
+        });
     timings.pool_acquire_ms = acquire_start.elapsed().as_millis() as u64;
     let mut lease = match lease {
         Ok(lease) => lease,
@@ -602,8 +599,7 @@ fn run_worker(
                     Ok(0) => break,
                     Ok(n) => {
                         if timings.first_output_ms.is_none() {
-                            timings.first_output_ms =
-                                Some(started.elapsed().as_millis() as u64);
+                            timings.first_output_ms = Some(started.elapsed().as_millis() as u64);
                         }
                         append(&buffer, &wake, &data[..n]);
                         budget = budget.saturating_sub(n);
@@ -646,10 +642,7 @@ fn run_worker(
     };
     lease.release(false);
     let final_state = handle.finish(outcome, error);
-    eprintln!(
-        "terminal {id} {final_state:?} timing={}",
-        timings.json()
-    );
+    eprintln!("terminal {id} {final_state:?} timing={}", timings.json());
     cleanup_closed(&state, &id, was_cancelled);
 }
 fn cleanup_closed(state: &Weak<AppState>, id: &str, user_closed: bool) {
@@ -781,7 +774,9 @@ mod tests {
         b.bytes.push_back(0xad);
         b.total += 1;
         assert_eq!(b.read(1).unwrap()["stdout"], "中");
-        let invalid = buffer(&[0xff, 0xe4], TerminalState::Closed).read(0).unwrap();
+        let invalid = buffer(&[0xff, 0xe4], TerminalState::Closed)
+            .read(0)
+            .unwrap();
         assert_eq!(invalid["stdout"], "��");
         assert_eq!(invalid["cursor"], 2);
         assert_eq!(invalid["has_more"], false);

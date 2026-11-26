@@ -288,8 +288,8 @@ pub(crate) fn connect_with_stats(
 ) -> Result<(Session, ConnectionStats)> {
     let mut stats = ConnectionStats::default();
     let slot_start = Instant::now();
-    let _slot = connect_slot(server)
-        .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
+    let _slot =
+        connect_slot(server).map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
     stats.slot_wait_ms = slot_start.elapsed().as_millis() as u64;
     let (session, handshake) = handshake_timed(server, settings)
         .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;

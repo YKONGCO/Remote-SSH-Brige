@@ -277,11 +277,7 @@ impl AppState {
             server.id = uuid::Uuid::new_v4().to_string();
         }
         let mut config = self.config.lock().unwrap();
-        let previous = config
-            .servers
-            .iter()
-            .find(|s| s.id == server.id)
-            .cloned();
+        let previous = config.servers.iter().find(|s| s.id == server.id).cloned();
         let identity_changed = config
             .servers
             .iter()
