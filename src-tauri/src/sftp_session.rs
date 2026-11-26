@@ -208,22 +208,7 @@ impl SftpSessionManager {
                     pool.changed.notify_all();
                 }
                 Step::Connect => {
-                    let result = {
-                        let _slot = crate::ssh::connect_slot(server);
-                        let _slot = match _slot {
-                            Ok(slot) => slot,
-                            Err(error) => {
-                                let mut state = pool.state.lock().unwrap();
-                                state.connecting = state.connecting.saturating_sub(1);
-                                state.counters.failed += 1;
-                                state.last_error =
-                                    Some(crate::operation_error::error_message(&error));
-                                pool.changed.notify_all();
-                                return Err(error);
-                            }
-                        };
-                        crate::ssh::connect_with_settings(server, settings)
-                    };
+                    let result = crate::ssh::connect_with_settings(server, settings);
                     let mut state = pool.state.lock().unwrap();
                     state.connecting = state.connecting.saturating_sub(1);
                     match result {

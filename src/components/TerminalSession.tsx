@@ -5,18 +5,31 @@ import "@xterm/xterm/css/xterm.css";
 import { operate, desktop } from "../api";
 import { usePreferences } from "../preferences";
 import { terminalTheme } from "../terminal-theme";
-import type { Session } from "../types";
+import type { Session, TerminalState } from "../types";
 import { Button } from "./ui/button";
 
-export type TerminalState =
-  "connecting" | "connected" | "retrying" | "ended" | "error";
-const labels: Record<TerminalState, string> = {
-  connecting: "正在同步…",
-  connected: "已连接",
-  retrying: "正在重试…",
-  ended: "连接已结束",
+type SyncState = TerminalState | "retrying" | "error";
+const labels: Record<SyncState, string> = {
+  connecting: "正在连接…",
+  running: "已连接",
+  closing: "正在关闭…",
+  closed: "连接已结束",
+  disconnected: "连接已断开",
+  failed: "连接失败",
+  retrying: "正在重试读取…",
   error: "读取失败",
 };
+const lifecycleStates: TerminalState[] = [
+  "connecting",
+  "running",
+  "closing",
+  "closed",
+  "disconnected",
+  "failed",
+];
+function isLifecycle(state: SyncState): state is TerminalState {
+  return lifecycleStates.includes(state as TerminalState);
+}
 
 export function TerminalSession({
   session,
@@ -24,9 +37,8 @@ export function TerminalSession({
   focusRequest,
   enabled,
   appearance,
-  refresh,
   notify,
-  onStateChange,
+  onState,
   onNew,
 }: {
   session: Session;
@@ -34,15 +46,17 @@ export function TerminalSession({
   focusRequest?: number;
   enabled: boolean;
   appearance: string;
-  refresh: () => Promise<void>;
   notify: (message: string, error?: boolean) => void;
-  onStateChange: (id: string, state: TerminalState) => void;
+  onState: (id: string, state: TerminalState, error?: string) => void;
   onNew: () => void;
 }) {
   const preferences = usePreferences();
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<XTerminal | null>(null);
   const remoteAlive = useRef(true);
+  const lifecycle = useRef<TerminalState>(
+    session.state ?? (session.alive ? "running" : "closed"),
+  );
   const lastFocusRequest = useRef(focusRequest ?? 0);
   const controls = useRef<{
     wake: () => void;
@@ -53,16 +67,17 @@ export function TerminalSession({
     active,
     enabled,
     session,
-    refresh,
     notify,
-    onStateChange,
+    onState,
   });
-  latest.current = { active, enabled, session, refresh, notify, onStateChange };
-  const [state, setState] = useState<TerminalState>("connecting");
-  const [error, setError] = useState("");
+  latest.current = { active, enabled, session, notify, onState };
+  const [state, setState] = useState<SyncState>(lifecycle.current);
+  const [error, setError] = useState(session.error ?? "");
 
   useEffect(() => {
     if (!host.current) return;
+    const startedAt = performance.now();
+    const initStart = performance.now();
     const term = new XTerminal({
       fontSize: Number(preferences.terminalFontSize),
       fontWeight: appearance === "dark" ? 360 : 400,
@@ -76,34 +91,50 @@ export function TerminalSession({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current);
+    const frontendInitMs = performance.now() - initStart;
     terminal.current = term;
     remoteAlive.current = true;
     let disposed = false,
       reading = false,
       writing = false,
-      ended = false;
+      ended = false,
+      readyLogged = false;
     let failures = 0,
       cursor = 0,
       pending = "",
       pendingBytes = 0,
       lastSize = "";
-    let currentState: TerminalState = "connecting";
+    let currentState: SyncState = lifecycle.current;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let inputTimer: ReturnType<typeof setTimeout> | undefined;
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     const encoder = new TextEncoder();
-    const update = (next: TerminalState, message = "") => {
-      if (disposed) return;
-      currentState = next;
+    const syncStdin = () => {
       term.options.disableStdin =
-        next !== "connected" ||
+        currentState !== "running" ||
+        lifecycle.current !== "running" ||
         !latest.current.active ||
         !latest.current.enabled ||
         !latest.current.session.alive ||
         !remoteAlive.current;
+    };
+    const update = (next: SyncState, message = "") => {
+      if (disposed) return;
+      currentState = next;
+      if (isLifecycle(next) && lifecycle.current !== next) {
+        lifecycle.current = next;
+        latest.current.onState(session.id, next, message || undefined);
+      }
       setState(next);
       setError(message);
-      latest.current.onStateChange(session.id, next);
+      syncStdin();
+      if (next === "running" && !readyLogged) {
+        readyLogged = true;
+        if (desktop)
+          console.debug(
+            `terminal ${session.id} frontend_init_ms=${frontendInitMs.toFixed(1)} interactive_ready_ms=${(performance.now() - startedAt).toFixed(1)}`,
+          );
+      }
     };
     const schedule = (delay?: number) => {
       clearTimeout(pollTimer);
@@ -117,12 +148,15 @@ export function TerminalSession({
     const poll = async () => {
       if (reading || disposed || ended) return;
       reading = true;
+      let continueImmediately = false;
       try {
         const result = await operate<{
           stdout: string;
           has_more?: boolean;
           cursor: number;
           alive: boolean;
+          state?: TerminalState;
+          error?: string;
           truncated: boolean;
         }>({
           kind: "terminal_read",
@@ -134,37 +168,49 @@ export function TerminalSession({
         failures = 0;
         remoteAlive.current = result.alive;
         if (result.truncated) term.write("\r\n[较早输出已被缓冲区清理]\r\n");
-        if (result.stdout) {
-          await new Promise<void>((resolve) =>
-            term.write(result.stdout, resolve),
-          );
-          if (disposed) return;
-        }
+        const previous = cursor;
+        if (result.stdout) term.write(result.stdout);
         cursor = result.cursor;
-        if (!result.alive && !result.has_more) {
+        continueImmediately = !!result.has_more && cursor > previous;
+        const next =
+          result.state ??
+          (result.alive ? ("running" as const) : ("closed" as const));
+        const terminal =
+          next === "closed" || next === "disconnected" || next === "failed";
+        if (!terminal) {
+          update(next);
+        } else if (result.has_more) {
+          syncStdin();
+        } else {
           ended = true;
           pending = "";
           pendingBytes = 0;
-          term.write("\r\n[终端连接已结束]\r\n");
-          update("ended");
-          void latest.current.refresh();
-        } else {
-          update("connected");
+          term.write(
+            next === "failed" || next === "disconnected"
+              ? `\r\n[${result.error || labels[next]}]\r\n`
+              : "\r\n[终端连接已结束]\r\n",
+          );
+          update(next, result.error);
         }
       } catch (e) {
         if (disposed) return;
         failures++;
         update(failures < 3 ? "retrying" : "error", String(e));
-        if (failures === 3) void latest.current.refresh();
       } finally {
         reading = false;
-        schedule(failures ? Math.min(3000, failures * 750) : undefined);
+        schedule(
+          failures
+            ? Math.min(3000, failures * 750)
+            : continueImmediately
+              ? 0
+              : undefined,
+        );
       }
     };
     const flush = async () => {
       if (writing || disposed || ended || !pending) return;
       if (
-        currentState !== "connected" ||
+        lifecycle.current !== "running" ||
         !latest.current.enabled ||
         !latest.current.session.alive ||
         !remoteAlive.current
@@ -188,6 +234,7 @@ export function TerminalSession({
           session_id: session.id,
           content,
         });
+        wake();
       } catch (e) {
         pending = "";
         pendingBytes = 0;
@@ -205,7 +252,7 @@ export function TerminalSession({
     const input = term.onData((content) => {
       if (
         !latest.current.active ||
-        currentState !== "connected" ||
+        lifecycle.current !== "running" ||
         !latest.current.enabled ||
         !latest.current.session.alive ||
         !remoteAlive.current
@@ -242,9 +289,10 @@ export function TerminalSession({
         fit.fit();
         if (!atBottom) term.scrollToLine(scroll);
         const size = `${term.cols}x${term.rows}`;
+        const connecting = lifecycle.current === "connecting";
         if (
           desktop &&
-          currentState === "connected" &&
+          (lifecycle.current === "running" || connecting) &&
           latest.current.session.alive &&
           latest.current.enabled &&
           size !== lastSize
@@ -272,7 +320,7 @@ export function TerminalSession({
       retry: () => {
         if (!ended) {
           failures = 0;
-          update("connecting");
+          update("retrying");
           wake();
         }
       },
@@ -281,7 +329,7 @@ export function TerminalSession({
     observer.observe(host.current);
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("resize", refit);
-    update("connecting");
+    update(lifecycle.current);
     void poll();
     refit();
     return () => {
@@ -320,11 +368,11 @@ export function TerminalSession({
   useEffect(() => {
     if (terminal.current)
       terminal.current.options.disableStdin =
+        state !== "running" ||
         !active ||
         !enabled ||
         !session.alive ||
-        !remoteAlive.current ||
-        state !== "connected";
+        !remoteAlive.current;
   }, [active, enabled, session.alive, state]);
   useEffect(() => {
     if (active) {
@@ -335,7 +383,7 @@ export function TerminalSession({
     }
   }, [active, session.alive]);
   useEffect(() => {
-    if (active && state === "connected") controls.current?.fit();
+    if (active && state === "running") controls.current?.fit();
   }, [active, state]);
   useEffect(() => {
     if (focusRequest === undefined) return;
@@ -358,7 +406,7 @@ export function TerminalSession({
       <div className="terminal-host" ref={host} />
       <div className="terminal-session-status" role="status">
         <span
-          className={`status-dot ${state === "connected" ? "green" : "gray"}`}
+          className={`status-dot ${state === "running" ? "green" : "gray"}`}
         />
         <span>{labels[state]}</span>
         {error && (
@@ -375,7 +423,10 @@ export function TerminalSession({
             重试读取
           </Button>
         )}
-        {(state === "ended" || state === "error") && (
+        {(state === "closed" ||
+          state === "disconnected" ||
+          state === "failed" ||
+          state === "error") && (
           <Button size="sm" variant="ghost" disabled={!enabled} onClick={onNew}>
             新建连接
           </Button>

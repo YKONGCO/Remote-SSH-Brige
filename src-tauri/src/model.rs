@@ -688,6 +688,23 @@ pub struct FileEdit {
 
     pub new_text: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    Connecting,
+    Running,
+    Closing,
+    Closed,
+    Disconnected,
+    Failed,
+}
+
+impl TerminalState {
+    pub fn alive(self) -> bool {
+        matches!(self, Self::Connecting | Self::Running)
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct TerminalInfo {
     pub id: String,
@@ -695,8 +712,9 @@ pub struct TerminalInfo {
     pub name: String,
     pub created_at: String,
     pub alive: bool,
-    #[serde(default)]
-    pub state: String,
+    pub state: TerminalState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 #[derive(Clone, Serialize, Default)]
 pub struct McpStatus {

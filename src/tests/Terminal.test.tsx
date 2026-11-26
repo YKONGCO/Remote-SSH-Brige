@@ -103,7 +103,25 @@ function props() {
     servers: [a, b],
     sessions,
     onServerChange: vi.fn(),
-    refresh: vi.fn().mockResolvedValue(undefined),
+    onCreate: vi.fn(async (serverId: string) => {
+      const result = await operate<{ session_id: string }>({
+        kind: "terminal_open",
+        server_id: serverId,
+        cols: 100,
+        rows: 28,
+      });
+      return result.session_id;
+    }),
+    creatingServers: new Set<string>(),
+    closingIds: new Set<string>(),
+    onClose: vi.fn(async (session: Session) => {
+      await operate({
+        kind: "terminal_close",
+        server_id: session.server_id,
+        session_id: session.id,
+      });
+    }),
+    onTerminalState: vi.fn(),
     notify: vi.fn(),
   };
 }
@@ -331,7 +349,6 @@ test("remote EOF preserves final output, stops polling and blocks further input"
   expect(screen.getByText("连接已结束")).toBeTruthy();
   expect(terminal.options.disableStdin).toBe(true);
   expect(terminal.write.mock.calls[0][0]).toBe("final output");
-  expect(typeof terminal.write.mock.calls[0][1]).toBe("function");
   act(() => {
     terminal.listener?.("do-not-send\r");
   });
@@ -446,14 +463,10 @@ test("open request reuses the active live terminal and focuses it", async () => 
   expect(consumed).toHaveBeenCalledTimes(1);
 });
 
-test("rapid open requests share one terminal creation", async () => {
+test("open requests delegate creation to the app and render app-provided sessions", async () => {
   vi.useFakeTimers();
-  let finish!: (value: unknown) => void;
-  const pending = new Promise<unknown>((resolve) => {
-    finish = resolve;
-  });
   vi.mocked(operate).mockImplementation(async (op) => {
-    if (op.kind === "terminal_open") return pending as never;
+    if (op.kind !== "terminal_read") return {} as never;
     return { stdout: "", cursor: 0, alive: true, truncated: false } as never;
   });
   const input = { ...props(), sessions: [] as Session[] };
@@ -479,14 +492,7 @@ test("rapid open requests share one terminal creation", async () => {
     );
     await Promise.resolve();
   });
-  expect(
-    vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "terminal_open"),
-  ).toHaveLength(1);
-  await act(async () => {
-    finish({ session_id: "a3" });
-    await Promise.resolve();
-    await Promise.resolve();
-  });
+  expect(input.onCreate).toHaveBeenCalledTimes(2);
   await act(async () => {
     view.rerender(
       <Terminals
@@ -497,6 +503,7 @@ test("rapid open requests share one terminal creation", async () => {
             server_id: "a",
             name: "A third",
             alive: true,
+            state: "connecting",
             created_at: "2026-11-01T00:00:00Z",
           },
         ]}
@@ -505,5 +512,5 @@ test("rapid open requests share one terminal creation", async () => {
     await vi.advanceTimersByTimeAsync(10);
   });
   expect(screen.getByRole("tab", { name: "终端 1" })).toBeTruthy();
-  expect(input.refresh).toHaveBeenCalled();
+  expect(consumed).toHaveBeenCalledTimes(2);
 });

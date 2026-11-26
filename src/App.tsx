@@ -72,6 +72,9 @@ import type {
   AuditPage,
   LoginPathUpdate,
   TerminalOpenRequest,
+  TerminalOpenResult,
+  Session,
+  TerminalState,
 } from "./types";
 import { ServerModal } from "./components/ServerModal";
 import { mcpPermissionSummary } from "./mcp-permissions";
@@ -210,13 +213,34 @@ export default function App() {
       null,
     ),
     [mcpBusy, setMcpBusy] = useState(false),
-    [loadError, setLoadError] = useState("");
+    [loadError, setLoadError] = useState(""),
+    [terminals, setTerminals] = useState<Session[]>([]),
+    [creatingServers, setCreatingServers] = useState<Set<string>>(
+      () => new Set(),
+    ),
+    [closingIds, setClosingIds] = useState<Set<string>>(() => new Set());
+  const terminalsRef = useRef<Session[]>([]);
+  const terminalRevision = useRef(0);
+  const terminalRequestId = useRef(0);
+  const creatingTerminals = useRef(new Map<string, Promise<string | null>>());
   const notify = useCallback(
     (message: string, error = false) => setToast({ message, error }),
     [],
   );
+  const updateTerminals = useCallback(
+    (update: (current: Session[]) => Session[]) => {
+      const current = terminalsRef.current;
+      const next = update(current);
+      if (next === current) return;
+      terminalsRef.current = next;
+      terminalRevision.current += 1;
+      setTerminals(next);
+    },
+    [],
+  );
   const refresh = useRefreshRequest(
     async (signal) => {
+      const revision = terminalRevision.current;
       try {
         const snapshot = await api<Snapshot>("snapshot");
         if (signal.aborted) return;
@@ -225,6 +249,10 @@ export default function App() {
             ? current
             : snapshot,
         );
+        if (revision === terminalRevision.current) {
+          terminalsRef.current = snapshot.terminals;
+          setTerminals(snapshot.terminals);
+        }
         setLoadError("");
       } catch (e) {
         if (!signal.aborted) setLoadError(String(e));
@@ -232,16 +260,107 @@ export default function App() {
     },
     page === "mcp" ||
       page === "terminals" ||
-      data.terminals.some((session) => session.alive)
+      terminals.some((session) => session.alive)
       ? 10000
       : data.mcp.running
         ? 30000
         : undefined,
   );
+  const openTerminal = useCallback(
+    (serverId: string): Promise<string | null> => {
+      const inflight = creatingTerminals.current.get(serverId);
+      if (inflight) return inflight;
+      setCreatingServers((previous) => new Set(previous).add(serverId));
+      const promise = (async () => {
+        try {
+          const result = await operate<TerminalOpenResult>({
+            kind: "terminal_open",
+            server_id: serverId,
+            cols: 100,
+            rows: 28,
+          });
+          if (result.terminal) {
+            const terminal = result.terminal;
+            updateTerminals((current) => [
+              ...current.filter((session) => session.id !== terminal.id),
+              terminal,
+            ]);
+          }
+          return result.session_id;
+        } catch (e) {
+          notify(String(e), true);
+          return null;
+        } finally {
+          creatingTerminals.current.delete(serverId);
+          setCreatingServers((previous) => {
+            if (!previous.has(serverId)) return previous;
+            const next = new Set(previous);
+            next.delete(serverId);
+            return next;
+          });
+        }
+      })();
+      creatingTerminals.current.set(serverId, promise);
+      return promise;
+    },
+    [notify, updateTerminals],
+  );
+  const closeTerminal = useCallback(
+    async (session: Session) => {
+      setClosingIds((previous) => new Set(previous).add(session.id));
+      try {
+        await operate({
+          kind: "terminal_close",
+          server_id: session.server_id,
+          session_id: session.id,
+        });
+        updateTerminals((current) =>
+          current.filter((item) => item.id !== session.id),
+        );
+      } finally {
+        setClosingIds((previous) => {
+          if (!previous.has(session.id)) return previous;
+          const next = new Set(previous);
+          next.delete(session.id);
+          return next;
+        });
+      }
+    },
+    [updateTerminals],
+  );
+  const reportTerminalState = useCallback(
+    (id: string, state: TerminalState, error?: string) => {
+      updateTerminals((current) => {
+        const index = current.findIndex((session) => session.id === id);
+        if (index < 0) return current;
+        const session = current[index];
+        const alive = state === "connecting" || state === "running";
+        if (
+          session.state === state &&
+          session.alive === alive &&
+          (session.error ?? "") === (error ?? "")
+        )
+          return current;
+        const next = [...current];
+        next[index] = { ...session, state, alive, error };
+        return next;
+      });
+    },
+    [updateTerminals],
+  );
   useEffect(() => {
     window.addEventListener(RUNTIME_SETTINGS_CHANGED, refresh);
     return () => window.removeEventListener(RUNTIME_SETTINGS_CHANGED, refresh);
   }, [refresh]);
+  useEffect(() => {
+    const preload = () => void import("./components/Terminal");
+    if ("requestIdleCallback" in window) {
+      const id = window.requestIdleCallback(preload, { timeout: 5000 });
+      return () => window.cancelIdleCallback(id);
+    }
+    const timer = setTimeout(preload, 3000);
+    return () => clearTimeout(timer);
+  }, []);
   useEffect(() => {
     if (data.mcp.error) notify(data.mcp.error, true);
   }, [data.mcp.error, notify]);
@@ -512,14 +631,12 @@ export default function App() {
     setSelectedId(s.id);
     setPage("terminals");
     setMenu("");
-    setTerminalRequest((previous) => ({
+    terminalRequestId.current += 1;
+    setTerminalRequest({
       serverId: s.id,
-      requestId: (previous?.requestId ?? 0) + 1,
-    }));
+      requestId: terminalRequestId.current,
+    });
   };
-  useEffect(() => {
-    if (page !== "terminals") setTerminalRequest(null);
-  }, [page]);
   const toggleMcp = async () => {
     setMcpBusy(true);
     try {
@@ -592,7 +709,6 @@ export default function App() {
               aria-current={page === id ? "page" : undefined}
               className={page === id ? "nav-item active" : "nav-item"}
               onClick={() => {
-                if (id === "terminals") setTerminalRequest(null);
                 setPage(id);
                 if (id === "terminals" && page !== id) void refresh();
               }}
@@ -602,7 +718,7 @@ export default function App() {
               {id === "servers" && (
                 <span className="nav-count">{data.servers.length}</span>
               )}
-              {id === "terminals" && data.terminals.some((s) => s.alive) && (
+              {id === "terminals" && terminals.some((s) => s.alive) && (
                 <span className="status-dot green" />
               )}
             </button>
@@ -926,10 +1042,14 @@ export default function App() {
                 servers={data.servers}
                 onServerChange={setSelectedId}
                 server={selected}
-                sessions={data.terminals}
+                sessions={terminals}
                 openRequest={terminalRequest}
                 onOpenRequestConsumed={() => setTerminalRequest(null)}
-                refresh={refresh}
+                onCreate={openTerminal}
+                creatingServers={creatingServers}
+                closingIds={closingIds}
+                onClose={closeTerminal}
+                onTerminalState={reportTerminalState}
                 notify={notify}
               />
             </Suspense>

@@ -24,7 +24,6 @@ pub struct AppState {
     pub approvals: crate::security::ApprovalQueue,
     pub audit: Mutex<Vec<Audit>>,
     pub terminals: Mutex<HashMap<String, Arc<TerminalHandle>>>,
-    pub terminal_open_lock: Mutex<()>,
     pub file_mutation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub mcp: Mutex<McpStatus>,
     pub mcp_active: AtomicUsize,
@@ -63,7 +62,6 @@ impl AppState {
             approvals: crate::security::ApprovalQueue::default(),
             audit: Mutex::new(audit),
             terminals: Mutex::new(HashMap::new()),
-            terminal_open_lock: Mutex::new(()),
             file_mutation_locks: Mutex::new(HashMap::new()),
             mcp: Mutex::new(McpStatus::default()),
             mcp_active: AtomicUsize::new(0),
@@ -279,6 +277,11 @@ impl AppState {
             server.id = uuid::Uuid::new_v4().to_string();
         }
         let mut config = self.config.lock().unwrap();
+        let previous = config
+            .servers
+            .iter()
+            .find(|s| s.id == server.id)
+            .cloned();
         let identity_changed = config
             .servers
             .iter()
@@ -334,6 +337,12 @@ impl AppState {
         self.sessions.remove(&server.id);
         self.sftp_sessions.remove(&server.id);
         *config = next;
+        if previous.is_some_and(|old| {
+            crate::ssh::connection_signature(&old) != crate::ssh::connection_signature(&server)
+                || (old.allow_terminal && !server.allow_terminal)
+        }) {
+            crate::terminal::close_server(&self.terminals, &server.id);
+        }
         Ok(server)
     }
     pub fn sync_login_path(&self, id: &str) -> Result<Server> {
@@ -385,6 +394,7 @@ impl AppState {
         self.sftp_sessions.remove(id);
         self.tunnels.stop_server(id);
         *config = next;
+        crate::terminal::remove_server(&self.terminals, id);
         match keyring::Entry::new("dev.remotedesk.ssh", id)?.delete_credential() {
             Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.into()),

@@ -57,13 +57,20 @@ export interface Audit {
     input?: { data: Record<string, unknown>; truncated: boolean } | null;
   } | null;
 }
+export type TerminalState =
+  "connecting" | "running" | "closing" | "closed" | "disconnected" | "failed";
 export interface Session {
   id: string;
   server_id: string;
   name: string;
   created_at: string;
   alive: boolean;
-  state?: "opening" | "running" | "closing" | "closed" | "disconnected";
+  state?: TerminalState;
+  error?: string;
+}
+export interface TerminalOpenResult {
+  session_id: string;
+  terminal?: Session;
 }
 export interface TerminalOpenRequest {
   serverId: string;

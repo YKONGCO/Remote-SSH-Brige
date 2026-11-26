@@ -1,4 +1,5 @@
 use crate::model::{RuntimeSettings, Server};
+use crate::ssh::ConnectionStats;
 use anyhow::Result;
 use serde_json::{json, Value};
 use ssh2::Session;
@@ -41,7 +42,9 @@ struct PoolState {
     idle: Vec<IdleSession>,
     foreground: usize,
     jobs: usize,
+    terminals: usize,
     connecting: usize,
+    terminal_connecting: usize,
     last_error: Option<String>,
     counters: Counters,
 }
@@ -55,6 +58,7 @@ struct Pool {
 enum LeaseRole {
     Foreground,
     Job,
+    Terminal,
 }
 
 struct LeaseCore {
@@ -62,6 +66,7 @@ struct LeaseCore {
     signature: String,
     role: Mutex<LeaseRole>,
     reused: bool,
+    stats: ConnectionStats,
 }
 
 #[derive(Clone)]
@@ -89,6 +94,10 @@ impl SessionHandle {
     pub fn reused(&self) -> bool {
         self.core.reused
     }
+
+    pub fn stats(&self) -> ConnectionStats {
+        self.core.stats
+    }
 }
 
 pub struct SessionLease {
@@ -114,6 +123,10 @@ impl SessionLease {
         self.core.reused
     }
 
+    pub fn stats(&self) -> ConnectionStats {
+        self.core.stats
+    }
+
     pub fn release(mut self, healthy: bool) {
         self.release_inner(healthy);
     }
@@ -133,8 +146,13 @@ impl SessionLease {
         match role {
             LeaseRole::Foreground => state.foreground = state.foreground.saturating_sub(1),
             LeaseRole::Job => state.jobs = state.jobs.saturating_sub(1),
+            LeaseRole::Terminal => state.terminals = state.terminals.saturating_sub(1),
         }
-        if healthy && session.authenticated() && state.idle.len() < MAX_IDLE {
+        if healthy
+            && role != LeaseRole::Terminal
+            && session.authenticated()
+            && state.idle.len() < MAX_IDLE
+        {
             session.set_blocking(true);
             state.idle.push(IdleSession {
                 session,
@@ -213,7 +231,14 @@ impl SessionManager {
                     if healthy {
                         state.counters.reused += 1;
                         drop(state);
-                        return Ok(Self::lease(pool.clone(), signature.clone(), session, true));
+                        return Ok(Self::lease(
+                            pool.clone(),
+                            signature.clone(),
+                            session,
+                            true,
+                            LeaseRole::Foreground,
+                            ConnectionStats::default(),
+                        ));
                     }
                     state.foreground = state.foreground.saturating_sub(1);
                     state.counters.discarded += 1;
@@ -230,11 +255,11 @@ impl SessionManager {
                     continue;
                 }
                 Step::Connect => {
-                    let result = connect_with_retry(server, settings);
+                    let result = connect_with_retry(server, settings, &|| false);
                     let mut state = pool.state.lock().unwrap();
                     state.connecting = state.connecting.saturating_sub(1);
                     match result {
-                        Ok(session) => {
+                        Ok((session, stats)) => {
                             state.foreground += 1;
                             state.counters.created += 1;
                             pool.changed.notify_all();
@@ -244,6 +269,8 @@ impl SessionManager {
                                 signature.clone(),
                                 session,
                                 false,
+                                LeaseRole::Foreground,
+                                stats,
                             ));
                         }
                         Err(error) => {
@@ -281,13 +308,150 @@ impl SessionManager {
         }
     }
 
-    fn lease(pool: Arc<Pool>, signature: String, session: Session, reused: bool) -> SessionLease {
+    pub fn acquire_terminal(
+        &self,
+        server: &Server,
+        settings: &RuntimeSettings,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SessionLease> {
+        let signature = crate::ssh::connection_signature(server);
+        let pool = self.pool(&server.id);
+        let deadline = Instant::now() + ACQUIRE_TIMEOUT;
+        let limit = settings.max_terminals.max(1);
+        let mut channel_failures = 0;
+        loop {
+            if cancelled() {
+                return Err(terminal_cancelled());
+            }
+            enum Step {
+                Reuse(Session),
+                Connect,
+                Wait,
+            }
+            let step = {
+                let mut state = pool.state.lock().unwrap();
+                Self::prune_idle(&mut state, &signature);
+                if state.terminals + state.terminal_connecting >= limit {
+                    Step::Wait
+                } else if let Some(idle) = state.idle.pop() {
+                    state.terminals += 1;
+                    Step::Reuse(idle.session)
+                } else {
+                    state.terminal_connecting += 1;
+                    Step::Connect
+                }
+            };
+            match step {
+                Step::Reuse(session) => {
+                    let healthy = session.channel_session().is_ok();
+                    let mut state = pool.state.lock().unwrap();
+                    if healthy {
+                        state.counters.reused += 1;
+                        drop(state);
+                        return Ok(Self::lease(
+                            pool.clone(),
+                            signature.clone(),
+                            session,
+                            true,
+                            LeaseRole::Terminal,
+                            ConnectionStats::default(),
+                        ));
+                    }
+                    state.terminals = state.terminals.saturating_sub(1);
+                    state.counters.discarded += 1;
+                    state.last_error = Some("Idle SSH session could not open a channel".into());
+                    pool.changed.notify_all();
+                    drop(state);
+                    channel_failures += 1;
+                    if channel_failures > 2 || Instant::now() >= deadline {
+                        return Err(crate::operation_error::error(
+                            "SSH_CHANNEL_FAILED",
+                            "No healthy SSH session could be reused",
+                        ));
+                    }
+                }
+                Step::Connect => {
+                    let result = connect_with_retry(server, settings, cancelled);
+                    let mut state = pool.state.lock().unwrap();
+                    state.terminal_connecting = state.terminal_connecting.saturating_sub(1);
+                    match result {
+                        Ok((session, stats)) => {
+                            if cancelled() {
+                                state.counters.discarded += 1;
+                                pool.changed.notify_all();
+                                drop(state);
+                                drop(session);
+                                return Err(terminal_cancelled());
+                            }
+                            state.terminals += 1;
+                            state.counters.created += 1;
+                            pool.changed.notify_all();
+                            drop(state);
+                            return Ok(Self::lease(
+                                pool.clone(),
+                                signature.clone(),
+                                session,
+                                false,
+                                LeaseRole::Terminal,
+                                stats,
+                            ));
+                        }
+                        Err(error) => {
+                            state.counters.failed += 1;
+                            state.last_error = Some(crate::operation_error::error_message(&error));
+                            pool.changed.notify_all();
+                            return Err(if cancelled() {
+                                terminal_cancelled()
+                            } else {
+                                error
+                            });
+                        }
+                    }
+                }
+                Step::Wait => {
+                    if cancelled() {
+                        return Err(terminal_cancelled());
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        let mut state = pool.state.lock().unwrap();
+                        state.counters.timed_out += 1;
+                        if state.terminals + state.terminal_connecting >= limit {
+                            return Err(crate::operation_error::error(
+                                "TERMINAL_LIMIT",
+                                "Terminal connection limit reached; close an unused session",
+                            ));
+                        }
+                        return Err(crate::operation_error::error(
+                            "SSH_SESSION_BUSY",
+                            "No SSH session became available for the terminal",
+                        ));
+                    }
+                    let state = pool.state.lock().unwrap();
+                    let _ = pool
+                        .changed
+                        .wait_timeout(state, remaining.min(Duration::from_millis(250)))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    fn lease(
+        pool: Arc<Pool>,
+        signature: String,
+        session: Session,
+        reused: bool,
+        role: LeaseRole,
+        stats: ConnectionStats,
+    ) -> SessionLease {
         SessionLease {
             core: Arc::new(LeaseCore {
                 pool,
                 signature,
-                role: Mutex::new(LeaseRole::Foreground),
+                role: Mutex::new(role),
                 reused,
+                stats,
             }),
             session: Some(session),
             released: false,
@@ -323,7 +487,8 @@ impl SessionManager {
         let pools = self.pools.lock().unwrap();
         let Some(pool) = pools.get(server_id) else {
             return json!({
-                "idle": 0, "foreground": 0, "jobs": 0, "connecting": 0,
+                "idle": 0, "foreground": 0, "jobs": 0, "terminals": 0,
+                "connecting": 0, "terminal_connecting": 0,
                 "created": 0, "reused": 0, "failed": 0, "discarded": 0, "timed_out": 0,
                 "last_error": null,
                 "limits": {
@@ -340,7 +505,9 @@ impl SessionManager {
             "idle": state.idle.len(),
             "foreground": state.foreground,
             "jobs": state.jobs,
+            "terminals": state.terminals,
             "connecting": state.connecting,
+            "terminal_connecting": state.terminal_connecting,
             "created": state.counters.created,
             "reused": state.counters.reused,
             "failed": state.counters.failed,
@@ -358,13 +525,22 @@ impl SessionManager {
     }
 }
 
-fn connect_with_retry(server: &Server, settings: &RuntimeSettings) -> Result<Session> {
+fn connect_with_retry(
+    server: &Server,
+    settings: &RuntimeSettings,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Session, ConnectionStats)> {
     let mut attempt = 0u32;
     loop {
-        let _slot = crate::ssh::connect_slot(server)?;
-        match crate::ssh::connect_with_settings(server, settings) {
+        if cancelled() {
+            return Err(terminal_cancelled());
+        }
+        match crate::ssh::connect_with_stats(server, settings) {
             Ok(session) => return Ok(session),
             Err(error) => {
+                if cancelled() {
+                    return Err(terminal_cancelled());
+                }
                 if attempt >= 2 || !crate::operation_error::retryable(&error) {
                     return Err(error.context("Cannot establish SSH session"));
                 }
@@ -378,6 +554,10 @@ fn connect_with_retry(server: &Server, settings: &RuntimeSettings) -> Result<Ses
             }
         }
     }
+}
+
+fn terminal_cancelled() -> anyhow::Error {
+    crate::operation_error::error("TERMINAL_CANCELLED", "Terminal creation was cancelled")
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ import type {
   AuditQuery,
   AuditDeleteRange,
   LoginPathUpdate,
+  Session,
 } from "./types";
 import { chooseBrowserSave } from "./save-file";
 import { newServer } from "./types";
@@ -636,14 +637,16 @@ export async function operate<T = Record<string, unknown>>(
       break;
     case "terminal_open": {
       const id = crypto.randomUUID();
-      demo.terminals.push({
+      const terminal: Session = {
         id,
         server_id: server.id,
         name: server.name + " · 终端",
         created_at: new Date().toISOString(),
         alive: true,
-      });
-      result = { session_id: id };
+        state: "running",
+      };
+      demo.terminals.push(terminal);
+      result = { session_id: id, terminal };
       break;
     }
     case "terminal_read":
@@ -653,6 +656,9 @@ export async function operate<T = Record<string, unknown>>(
           : "\r\nRemote SSH Brige - browser preview\r\nPermission-controlled SSH access for AI agents over MCP.\r\nUse the desktop app for a real SSH shell.\r\n\r\n$ ",
         cursor: 1,
         alive: true,
+        state: "running",
+        truncated: false,
+        has_more: false,
       };
       break;
     case "terminal_write":
@@ -660,6 +666,7 @@ export async function operate<T = Record<string, unknown>>(
       break;
     case "terminal_close":
       demo.terminals = demo.terminals.filter((s) => s.id !== op.session_id);
+      result = { closed: true, state: "closed" };
       break;
     default:
       throw new Error("操作不受支持");

@@ -3,7 +3,7 @@ import { usePreferences } from "../preferences";
 import { SelectField } from "./SelectField";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Plus,
   TerminalSquare,
@@ -11,9 +11,20 @@ import {
   Maximize2,
   Server as ServerIcon,
 } from "lucide-react";
-import type { Server, Session, TerminalOpenRequest } from "../types";
-import { operate } from "../api";
-import { TerminalSession, type TerminalState } from "./TerminalSession";
+import type {
+  Server,
+  Session,
+  TerminalOpenRequest,
+  TerminalState,
+} from "../types";
+import { TerminalSession } from "./TerminalSession";
+
+function stateOf(session: Session): TerminalState {
+  return session.state ?? (session.alive ? "running" : "closed");
+}
+function liveState(state: TerminalState): boolean {
+  return state === "connecting" || state === "running";
+}
 
 export function Terminals({
   server,
@@ -22,7 +33,11 @@ export function Terminals({
   sessions,
   openRequest,
   onOpenRequestConsumed,
-  refresh,
+  onCreate,
+  creatingServers,
+  closingIds,
+  onClose,
+  onTerminalState,
   notify,
   headerHost,
 }: {
@@ -33,7 +48,11 @@ export function Terminals({
   sessions: Session[];
   openRequest?: TerminalOpenRequest | null;
   onOpenRequestConsumed?: () => void;
-  refresh: () => Promise<void>;
+  onCreate: (serverId: string) => Promise<string | null>;
+  creatingServers: Set<string>;
+  closingIds: Set<string>;
+  onClose: (session: Session) => Promise<void>;
+  onTerminalState: (id: string, state: TerminalState, error?: string) => void;
   notify: (message: string, error?: boolean) => void;
 }) {
   const preferences = usePreferences();
@@ -43,15 +62,9 @@ export function Terminals({
     {},
   );
   const [visited, setVisited] = useState<Set<string>>(() => new Set());
-  const [states, setStates] = useState<Record<string, TerminalState>>({});
-  const [creatingServers, setCreatingServers] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [focusRequest, setFocusRequest] = useState(0);
   const [closing, setClosing] = useState<Session | null>(null);
   const [closingId, setClosingId] = useState("");
-  const creating = useRef(new Map<string, Promise<string | null>>());
-  const recent = useRef(new Map<string, { id: string; at: number }>());
   const handledRequest = useRef(0);
   const serverIdRef = useRef(server?.id);
   serverIdRef.current = server?.id;
@@ -59,14 +72,9 @@ export function Terminals({
   const list = sessions.filter((s) => !server || s.server_id === server.id);
   const selected =
     list.find((s) => s.id === activeByServer[server?.id || ""]) ||
-    list.find((s) => s.alive) ||
+    list.find((s) => liveState(stateOf(s))) ||
     list[0];
-  const callbacks = useRef({ refresh, notify });
-  callbacks.current = { refresh, notify };
   const busy = server ? creatingServers.has(server.id) : false;
-  useEffect(() => {
-    void callbacks.current.refresh();
-  }, []);
   useEffect(() => {
     if (selected)
       setVisited((previous) =>
@@ -90,58 +98,17 @@ export function Terminals({
     });
     return () => observer.disconnect();
   }, [preferences.terminalTheme, preferences.theme]);
-  const onStateChange = useCallback((id: string, state: TerminalState) => {
-    setStates((previous) =>
-      previous[id] === state ? previous : { ...previous, [id]: state },
-    );
-  }, []);
   const select = (session: Session) =>
     setActiveByServer((previous) => ({
       ...previous,
       [session.server_id]: session.id,
     }));
-  const createSession = (target: Server): Promise<string | null> => {
-    const inflight = creating.current.get(target.id);
-    if (inflight) return inflight;
-    setCreatingServers((previous) => new Set(previous).add(target.id));
-    const promise = (async () => {
-      try {
-        const result = await operate<{ session_id: string }>({
-          kind: "terminal_open",
-          server_id: target.id,
-          cols: 100,
-          rows: 28,
-        });
-        recent.current.set(target.id, {
-          id: result.session_id,
-          at: Date.now(),
-        });
-        return result.session_id;
-      } catch (e) {
-        callbacks.current.notify(String(e), true);
-        return null;
-      } finally {
-        creating.current.delete(target.id);
-        setCreatingServers((previous) => {
-          const next = new Set(previous);
-          next.delete(target.id);
-          return next;
-        });
-      }
-    })();
-    creating.current.set(target.id, promise);
-    return promise;
-  };
-  const activateSession = async (
-    targetId: string,
-    sessionId: string,
-    refreshList: boolean,
-  ) => {
+  const createSession = (target: Server) => onCreate(target.id);
+  const activateSession = (targetId: string, sessionId: string) => {
     setActiveByServer((previous) => ({
       ...previous,
       [targetId]: sessionId,
     }));
-    if (refreshList) await callbacks.current.refresh();
     if (serverIdRef.current === targetId)
       setFocusRequest((previous) => previous + 1);
   };
@@ -150,45 +117,32 @@ export function Terminals({
     const usable = (session: Session) =>
       session.server_id === target.id &&
       session.alive &&
-      states[session.id] !== "ended" &&
-      states[session.id] !== "error";
-    const available =
-      sessions.find(
-        (session) =>
-          session.id === activeByServer[target.id] && usable(session),
-      ) || sessions.find(usable);
-    if (available) {
-      await activateSession(target.id, available.id, false);
+      liveState(stateOf(session));
+    const available = list.filter(usable);
+    const active = available.find(
+      (session) => session.id === activeByServer[target.id],
+    );
+    const running =
+      (active && stateOf(active) === "running" ? active : undefined) ||
+      available.find((session) => stateOf(session) === "running");
+    const connecting =
+      (active && stateOf(active) === "connecting" ? active : undefined) ||
+      available.find((session) => stateOf(session) === "connecting");
+    const chosen = running || connecting;
+    if (chosen) {
+      activateSession(target.id, chosen.id);
       return;
     }
-    const recentEntry = recent.current.get(target.id);
-    if (recentEntry && Date.now() - recentEntry.at < 3000) {
-      const known = sessions.find((session) => session.id === recentEntry.id);
-      if (!known) {
-        await activateSession(target.id, recentEntry.id, true);
-        return;
-      }
-      if (
-        known.alive &&
-        states[known.id] !== "ended" &&
-        states[known.id] !== "error"
-      ) {
-        await activateSession(target.id, known.id, false);
-        return;
-      }
-      recent.current.delete(target.id);
-    }
     const sessionId = await createSession(target);
-    if (sessionId) await activateSession(target.id, sessionId, true);
+    if (sessionId) activateSession(target.id, sessionId);
   };
   const open = async () => {
     if (!server?.enabled) return;
     try {
-      const target = server;
-      const sessionId = await createSession(target);
-      if (sessionId) await activateSession(target.id, sessionId, true);
+      const sessionId = await createSession(server);
+      if (sessionId) activateSession(server.id, sessionId);
     } catch (e) {
-      callbacks.current.notify(String(e), true);
+      notify(String(e), true);
     }
   };
   useEffect(() => {
@@ -196,20 +150,14 @@ export function Terminals({
     if (handledRequest.current === openRequest.requestId) return;
     handledRequest.current = openRequest.requestId;
     onOpenRequestConsumed?.();
-    void openForServer(server).catch((e) =>
-      callbacks.current.notify(String(e), true),
-    );
+    void openForServer(server).catch((e) => notify(String(e), true));
   }, [openRequest?.requestId, server?.id]);
   const close = async (session: Session) => {
     if (removing.current) return;
     removing.current = true;
     setClosingId(session.id);
     try {
-      await operate({
-        kind: "terminal_close",
-        server_id: session.server_id,
-        session_id: session.id,
-      });
+      await onClose(session);
       const siblings = sessions.filter(
         (s) => s.server_id === session.server_id,
       );
@@ -222,7 +170,6 @@ export function Terminals({
           : previous,
       );
       setClosing(null);
-      await refresh();
     } catch (e) {
       notify(String(e), true);
     } finally {
@@ -231,7 +178,7 @@ export function Terminals({
     }
   };
   const requestClose = (session: Session) => {
-    if (!session.alive || states[session.id] === "ended") void close(session);
+    if (!session.alive || !liveState(stateOf(session))) void close(session);
     else setClosing(session);
   };
   const toolbar = (
@@ -305,7 +252,15 @@ export function Terminals({
                       aria-controls={`terminal-output-${session.id}`}
                       id={"terminal-tab-" + session.id}
                       className="terminal-tab"
-                      title={`${session.name} · ${!session.alive || states[session.id] === "ended" ? "已结束" : states[session.id] === "error" ? "读取失败" : "运行中"}`}
+                      title={`${session.name} · ${
+                        stateOf(session) === "connecting"
+                          ? "正在连接"
+                          : stateOf(session) === "closing"
+                            ? "正在关闭"
+                            : stateOf(session) === "running"
+                              ? "运行中"
+                              : "已结束"
+                      }`}
                       tabIndex={session.id === selected?.id ? 0 : -1}
                       onClick={() => select(session)}
                       onKeyDown={(event) => {
@@ -332,8 +287,7 @@ export function Terminals({
                       <span
                         className={
                           "status-dot " +
-                          (session.alive &&
-                          !["ended", "error"].includes(states[session.id])
+                          (session.alive && liveState(stateOf(session))
                             ? "green"
                             : "gray")
                         }
@@ -341,13 +295,13 @@ export function Terminals({
                     </button>
                     <button
                       className="terminal-tab-close"
-                      aria-label={`${session.alive && states[session.id] !== "ended" ? "关闭" : "移除"}终端 ${index + 1}`}
+                      aria-label={`${session.alive && liveState(stateOf(session)) ? "关闭" : "移除"}终端 ${index + 1}`}
                       title={
-                        session.alive && states[session.id] !== "ended"
+                        session.alive && liveState(stateOf(session))
                           ? "关闭终端"
                           : "移除已结束会话"
                       }
-                      disabled={!!closingId}
+                      disabled={!!closingId || closingIds.has(session.id)}
                       onClick={() => requestClose(session)}
                     >
                       <X size={12} />
@@ -391,9 +345,8 @@ export function Terminals({
                     ?.enabled ?? false
                 }
                 appearance={appearance}
-                refresh={refresh}
                 notify={notify}
-                onStateChange={onStateChange}
+                onState={onTerminalState}
                 onNew={() => void open()}
               />
             ))}

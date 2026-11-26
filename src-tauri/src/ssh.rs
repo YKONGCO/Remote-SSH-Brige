@@ -174,21 +174,73 @@ mod login_path_tests {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct ConnectionStats {
+    pub slot_wait_ms: u64,
+    pub dns_resolve_ms: u64,
+    pub tcp_connect_ms: u64,
+    pub handshake_ms: u64,
+    pub authentication_ms: u64,
+}
+
+#[derive(Default)]
+struct HandshakeStats {
+    dns_resolve_ms: u64,
+    tcp_connect_ms: u64,
+    handshake_ms: u64,
+}
+
+fn millis(timeout: Duration) -> u32 {
+    timeout.as_millis().min(u32::MAX as u128) as u32
+}
+
 pub fn handshake(server: &Server) -> Result<Session> {
     handshake_with_settings(server, &RuntimeSettings::default())
 }
 pub fn handshake_with_settings(server: &Server, settings: &RuntimeSettings) -> Result<Session> {
+    let _slot = connect_slot(server)?;
+    let (session, _) = handshake_timed(server, settings)
+        .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
+    Ok(session)
+}
+
+fn handshake_timed(
+    server: &Server,
+    settings: &RuntimeSettings,
+) -> Result<(Session, HandshakeStats)> {
+    let mut stats = HandshakeStats::default();
+    let resolve_start = Instant::now();
     let addresses = (server.host.as_str(), server.port)
         .to_socket_addrs()
         .context("Cannot resolve SSH server address")?;
+    stats.dns_resolve_ms = resolve_start.elapsed().as_millis() as u64;
+    let deadline = Instant::now()
+        + Duration::from_secs(
+            settings
+                .connect_timeout_secs
+                .saturating_add(settings.handshake_timeout_secs)
+                .saturating_add(5),
+        );
+    let connect_start = Instant::now();
     let mut connection = None;
     let mut failures = Vec::new();
     for addr in addresses {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(settings.connect_timeout_secs)) {
-            Ok(tcp) => { connection = Some(tcp); break; }
-            Err(e) => failures.push(json!({"address":addr.to_string(),"reason":e.to_string(),"os_code":e.raw_os_error()})),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let timeout = Duration::from_secs(settings.connect_timeout_secs).min(remaining);
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => {
+                connection = Some(tcp);
+                break;
+            }
+            Err(e) => failures.push(
+                json!({"address":addr.to_string(),"reason":e.to_string(),"os_code":e.raw_os_error()}),
+            ),
         }
     }
+    stats.tcp_connect_ms = connect_start.elapsed().as_millis() as u64;
     let tcp = connection.ok_or_else(|| {
         crate::operation_error::error_with_details(
             "SSH_CONNECT_FAILED",
@@ -197,17 +249,23 @@ pub fn handshake_with_settings(server: &Server, settings: &RuntimeSettings) -> R
         )
     })?;
     tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(Some(Duration::from_secs(settings.handshake_timeout_secs)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(settings.handshake_timeout_secs)))?;
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(settings.handshake_timeout_secs))
+        .max(Duration::from_millis(100));
+    tcp.set_read_timeout(Some(remaining))?;
+    tcp.set_write_timeout(Some(remaining))?;
     let socket = tcp.try_clone()?;
     let mut session = Session::new()?;
     session.set_tcp_stream(tcp);
-    session.set_timeout((settings.handshake_timeout_secs * 1000) as u32);
+    session.set_timeout(millis(remaining));
+    let handshake_start = Instant::now();
     session.handshake()?;
+    stats.handshake_ms = handshake_start.elapsed().as_millis() as u64;
     socket.set_read_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
     socket.set_write_timeout(Some(Duration::from_secs(settings.io_timeout_secs)))?;
     session.set_timeout((settings.io_timeout_secs * 1000) as u32);
-    Ok(session)
+    Ok((session, stats))
 }
 pub fn fingerprint(session: &Session) -> Result<String> {
     let (key, _) = session
@@ -222,8 +280,22 @@ pub fn connect(server: &Server) -> Result<Session> {
     connect_with_settings(server, &RuntimeSettings::default())
 }
 pub fn connect_with_settings(server: &Server, settings: &RuntimeSettings) -> Result<Session> {
-    let session = handshake_with_settings(server, settings)
+    connect_with_stats(server, settings).map(|(session, _)| session)
+}
+pub(crate) fn connect_with_stats(
+    server: &Server,
+    settings: &RuntimeSettings,
+) -> Result<(Session, ConnectionStats)> {
+    let mut stats = ConnectionStats::default();
+    let slot_start = Instant::now();
+    let _slot = connect_slot(server)
         .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
+    stats.slot_wait_ms = slot_start.elapsed().as_millis() as u64;
+    let (session, handshake) = handshake_timed(server, settings)
+        .map_err(|e| crate::operation_error::with_stage(e, "connection"))?;
+    stats.dns_resolve_ms = handshake.dns_resolve_ms;
+    stats.tcp_connect_ms = handshake.tcp_connect_ms;
+    stats.handshake_ms = handshake.handshake_ms;
     let actual = fingerprint(&session)?;
     if server.fingerprint.is_empty() {
         return Err(crate::operation_error::error_with_details(
@@ -239,6 +311,7 @@ pub fn connect_with_settings(server: &Server, settings: &RuntimeSettings) -> Res
             json!({"actual_fingerprint":actual,"expected_fingerprint":server.fingerprint}),
         ));
     }
+    let auth_start = Instant::now();
     match server.auth.as_str() {
         "password" => {
             let password = keyring::Entry::new("dev.remotedesk.ssh", &server.id)?
@@ -263,10 +336,11 @@ pub fn connect_with_settings(server: &Server, settings: &RuntimeSettings) -> Res
         "agent" => session.userauth_agent(&server.username)?,
         _ => bail!("Unsupported SSH authentication method"),
     }
+    stats.authentication_ms = auth_start.elapsed().as_millis() as u64;
     if !session.authenticated() {
         bail!("SSH authentication failed")
     }
-    Ok(session)
+    Ok((session, stats))
 }
 pub(crate) fn remote_path(
     sftp: &Sftp,
