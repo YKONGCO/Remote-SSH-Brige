@@ -67,9 +67,11 @@ import type {
   Server,
   Snapshot,
   Audit,
+  AuditOutcome,
   AuditQuery,
   AuditPage,
   LoginPathUpdate,
+  TerminalOpenRequest,
 } from "./types";
 import { ServerModal } from "./components/ServerModal";
 import { mcpPermissionSummary } from "./mcp-permissions";
@@ -125,8 +127,33 @@ function serverIcon(s: Server) {
         ? Cloud
         : Box;
 }
-function auditSucceeded(entry: Audit) {
-  return entry.kind !== "security_reject" && entry.success;
+const auditOutcomeMeta: Record<
+  AuditOutcome,
+  { label: string; className: string; dot: string }
+> = {
+  success: { label: "成功", className: "success", dot: "green" },
+  running: { label: "运行中", className: "running", dot: "blue" },
+  nonzero_exit: { label: "非零退出", className: "warning", dot: "orange" },
+  action_required: { label: "需要处理", className: "neutral", dot: "gray" },
+  rejected: { label: "已拒绝", className: "neutral", dot: "gray" },
+  cancelled: { label: "已取消", className: "neutral", dot: "gray" },
+  partial: { label: "部分完成", className: "warning", dot: "orange" },
+  unknown: { label: "结果未知", className: "warning", dot: "orange" },
+  failed: { label: "失败", className: "failed", dot: "red" },
+};
+function auditOutcome(entry: Audit): AuditOutcome {
+  if (entry.outcome) return entry.outcome;
+  if (entry.kind === "security_reject") return "rejected";
+  return entry.success ? "success" : "failed";
+}
+function auditOutcomeMetaFor(entry: Audit) {
+  if (entry.kind === "security_approve") {
+    return auditOutcomeMeta.success;
+  }
+  if (entry.kind === "security_reject") {
+    return auditOutcomeMeta.rejected;
+  }
+  return auditOutcomeMeta[auditOutcome(entry)];
 }
 export default function App() {
   const preferences = usePreferences();
@@ -161,6 +188,8 @@ export default function App() {
     [group, setGroup] = useState("全部服务器"),
     [selectedId, setSelectedId] = useState(""),
     [fileServerId, setFileServerId] = useState(""),
+    [terminalRequest, setTerminalRequest] =
+      useState<TerminalOpenRequest | null>(null),
     [modal, setModal] = useState<Server | null>(null),
     [menu, setMenu] = useState(""),
     [toast, setToast] = useState<{ message: string; error: boolean } | null>(
@@ -478,6 +507,19 @@ export default function App() {
     setPage(p);
     setMenu("");
   };
+  const openServerTerminal = (s: Server) => {
+    if (!s.enabled) return;
+    setSelectedId(s.id);
+    setPage("terminals");
+    setMenu("");
+    setTerminalRequest((previous) => ({
+      serverId: s.id,
+      requestId: (previous?.requestId ?? 0) + 1,
+    }));
+  };
+  useEffect(() => {
+    if (page !== "terminals") setTerminalRequest(null);
+  }, [page]);
   const toggleMcp = async () => {
     setMcpBusy(true);
     try {
@@ -550,6 +592,7 @@ export default function App() {
               aria-current={page === id ? "page" : undefined}
               className={page === id ? "nav-item active" : "nav-item"}
               onClick={() => {
+                if (id === "terminals") setTerminalRequest(null);
                 setPage(id);
                 if (id === "terminals" && page !== id) void refresh();
               }}
@@ -773,7 +816,7 @@ export default function App() {
                           disabled={!s.enabled}
                           title="打开终端"
                           aria-label={"打开终端 " + s.name}
-                          onClick={() => visit(s, "terminals")}
+                          onClick={() => openServerTerminal(s)}
                         >
                           <TerminalSquare size={16} />
                         </Button>
@@ -884,6 +927,8 @@ export default function App() {
                 onServerChange={setSelectedId}
                 server={selected}
                 sessions={data.terminals}
+                openRequest={terminalRequest}
+                onOpenRequestConsumed={() => setTerminalRequest(null)}
                 refresh={refresh}
                 notify={notify}
               />
@@ -1044,6 +1089,9 @@ export default function App() {
                                 <span>
                                   {a.source === "mcp" ? "MCP" : "手动操作"}
                                 </span>
+                                {a.kind === "job" && a.summary && (
+                                  <span>{a.summary}</span>
+                                )}
                               </div>
                             </td>
                             <td className="audit-col-server">
@@ -1064,22 +1112,15 @@ export default function App() {
                               <span
                                 className={
                                   "audit-status " +
-                                  (auditSucceeded(a) ? "success" : "failed")
+                                  auditOutcomeMetaFor(a).className
                                 }
                               >
                                 <span
                                   className={
-                                    "status-dot " +
-                                    (auditSucceeded(a) ? "green" : "red")
+                                    "status-dot " + auditOutcomeMetaFor(a).dot
                                   }
                                 />
-                                {a.kind === "security_approve"
-                                  ? "已批准"
-                                  : a.kind === "security_reject"
-                                    ? "已拒绝"
-                                    : a.success
-                                      ? "成功"
-                                      : "失败"}
+                                {auditOutcomeMetaFor(a).label}
                               </span>
                               <span className="audit-inline-duration">
                                 {a.duration_ms} 毫秒

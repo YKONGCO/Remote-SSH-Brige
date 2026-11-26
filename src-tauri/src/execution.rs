@@ -203,7 +203,7 @@ pub fn execute(
             data.close = true;
             job.changed.notify_all();
             drop(data);
-            let mut value = job.snapshot(0, 0, crate::jobs::CAPACITY)?;
+            let mut value = job.snapshot(0, 0, crate::jobs::CAPACITY * 2)?;
             if value["status"] == "exited" {
                 value.as_object_mut().unwrap().remove("job_id");
                 value["command_sent"] = json!(true);
@@ -242,7 +242,7 @@ pub fn execute(
             };
             if let Some((code, reason)) = failure {
                 let close_confirmed = job.close();
-                let mut value = job.snapshot(0, 0, crate::jobs::CAPACITY)?;
+                let mut value = job.snapshot(0, 0, crate::jobs::CAPACITY * 2)?;
                 value["close_confirmed"] = json!(close_confirmed);
                 value["command_sent"] = json!(true);
                 value["outcome_unknown"] = json!(true);
@@ -250,15 +250,23 @@ pub fn execute(
             }
 
             handoff.promote_to_job();
-            let value = job.snapshot(0, 0, crate::jobs::CAPACITY)?;
-
-            state.log(
-                &state.server(&op.server_id)?,
+            let status = job.data.lock().unwrap().status;
+            let value = json!({
+                "job_id": job.id,
+                "server_id": server.id,
+                "status": status,
+                "command_sent": true,
+                "outcome_unknown": false,
+            });
+            if let Err(error) = state.log(
+                server,
                 source,
                 op,
                 &Ok(value.clone()),
                 timeout.as_millis() as u64,
-            )?;
+            ) {
+                eprintln!("Job handoff audit failed for {}: {error:#}", job.id);
+            }
             job.changed.notify_all();
             return Ok(value);
         }
@@ -276,12 +284,13 @@ fn audit_final(state: Weak<AppState>, server: &Server, op: &Operation, source: &
         op.job_action = "finish".into();
         op.job_id = job.id.clone();
         let result = job.snapshot(0, 0, 16384);
-        if let Err(error) = state.log(
+        if let Err(error) = state.log_event(
             server,
             source,
             &op,
             &result,
             job.started.elapsed().as_millis() as u64,
+            crate::model::AuditEventKind::JobFinished,
         ) {
             eprintln!("Job final audit failed: {error:#}");
         }

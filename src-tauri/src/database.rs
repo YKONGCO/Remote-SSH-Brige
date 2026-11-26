@@ -5,8 +5,7 @@ use std::{fs, path::Path, time::Duration};
 
 pub const DATABASE_FILE: &str = "remote-desk.sqlite3";
 const SERVER_COLUMNS: &str = "id,name,host,port,username,auth,key_path,fingerprint,group_name,color,enabled,allow_exec,allow_write,allow_terminal,root,mcp_enabled,mcp_permissions_json,login_path,login_path_synced_at";
-const AUDIT_COLUMNS: &str =
-    "id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json";
+const AUDIT_COLUMNS: &str = "id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json,outcome,event_kind,reason_code,related_id";
 
 pub struct Database {
     connection: Connection,
@@ -53,7 +52,9 @@ impl AuditDeleteRange {
 
 const AUDIT_FILTER: &str = "source='mcp' AND sequence <= ?1 AND
     (?2 IN ('', 'all') OR (?2='mcp' AND source='mcp')
-    OR (?2='error' AND (success=0 OR kind='security_reject'))
+    OR (?2 IN ('failed','error') AND outcome='failed')
+    OR (?2='nonzero' AND outcome='nonzero_exit')
+    OR (?2='security' AND (kind LIKE 'security_%' OR outcome IN ('action_required','rejected')))
     OR (?2='exec' AND kind IN ('exec','job'))
     OR (?2='files' AND kind IN ('list_files','read_file','preview_file','write_file','edit_file','remove_path','mkdir','remove','rename','upload','download','upload_file','download_file','transfer')))
     AND (?3='' OR instr(lower(server_name || ' ' || detail || ' ' || kind), lower(?3)) > 0)
@@ -188,10 +189,10 @@ impl Database {
         let mut connection = Connection::open(database_path).context("无法打开 SQLite 数据库")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 5 {
+        if version > 6 {
             bail!("数据库版本较新，请使用新版应用打开")
         }
-        if !matches!(version, 0 | 2 | 3 | 4 | 5) {
+        if !matches!(version, 0 | 2 | 3 | 4 | 5 | 6) {
             bail!("不再支持此数据库版本，请先使用旧版应用升级至 SQLite 版本 2")
         }
         if version == 0 {
@@ -214,8 +215,25 @@ impl Database {
         if version == 2 {
             transaction.execute_batch("ALTER TABLE servers ADD COLUMN login_path TEXT; ALTER TABLE servers ADD COLUMN login_path_synced_at TEXT;")?;
         }
+        let migrated_audits = if version != 0 && version < 6 {
+            add_audit_outcome_columns(&transaction)?
+        } else {
+            false
+        };
         transaction.execute_batch(include_str!("schema.sql"))?;
-        transaction.pragma_update(None, "user_version", 5)?;
+        if migrated_audits {
+            transaction.execute_batch(
+                "UPDATE audit_entries SET outcome = CASE
+                     WHEN success = 1 THEN 'success'
+                     WHEN kind = 'security_reject' THEN 'rejected'
+                     WHEN kind = 'exec' AND json_valid(response_json)
+                          AND coalesce(json_extract(response_json, '$.exit_code'), json_extract(response_json, '$.data.exit_code')) IS NOT NULL
+                          AND coalesce(json_extract(response_json, '$.exit_code'), json_extract(response_json, '$.data.exit_code')) != 0 THEN 'nonzero_exit'
+                     ELSE 'unknown'
+                 END;",
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit().context("SQLite 初始化提交失败")?;
         Ok(Self { connection })
     }
@@ -318,6 +336,39 @@ impl Database {
             .context("操作记录不存在")
     }
 }
+fn add_audit_outcome_columns(connection: &Connection) -> Result<bool> {
+    let table_exists: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='audit_entries'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(false);
+    }
+    let existing: Vec<String> = {
+        let mut statement = connection.prepare("PRAGMA table_info(audit_entries)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns
+    };
+    let mut added = false;
+    for (name, definition) in [
+        ("outcome", "TEXT NOT NULL DEFAULT 'success'"),
+        ("event_kind", "TEXT NOT NULL DEFAULT 'tool_call'"),
+        ("reason_code", "TEXT"),
+        ("related_id", "TEXT"),
+    ] {
+        if !existing.iter().any(|column| column == name) {
+            connection.execute_batch(&format!(
+                "ALTER TABLE audit_entries ADD COLUMN {name} {definition};"
+            ))?;
+            added = true;
+        }
+    }
+    Ok(added)
+}
+
 fn server_row(row: &Row<'_>) -> rusqlite::Result<Server> {
     let permissions: Option<String> = row.get(16)?;
     let mcp_permissions = permissions
@@ -371,6 +422,8 @@ fn audit_row(row: &Row<'_>) -> rusqlite::Result<Audit> {
             })
         })
         .transpose()?;
+    let outcome: String = row.get(11)?;
+    let event_kind: String = row.get(12)?;
     Ok(Audit {
         id: row.get(0)?,
         time: row.get(1)?,
@@ -382,6 +435,10 @@ fn audit_row(row: &Row<'_>) -> rusqlite::Result<Audit> {
         success: row.get(7)?,
         duration_ms: row.get::<_, i64>(8)? as u64,
         summary: row.get(9)?,
+        outcome: crate::model::AuditOutcome::from_db(&outcome),
+        event_kind: crate::model::AuditEventKind::from_db(&event_kind),
+        reason_code: row.get(13)?,
+        related_id: row.get(14)?,
         response,
     })
 }
@@ -404,9 +461,9 @@ fn save_server(connection: &Connection, s: &Server) -> Result<()> {
 fn insert_audit(connection: &Connection, a: &Audit) -> Result<()> {
     let duration_ms = i64::try_from(a.duration_ms).context("操作耗时超出数据库整数范围")?;
     let response = a.response.as_ref().map(serde_json::to_string).transpose()?;
-    connection.execute("INSERT INTO audit_entries(id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-        ON CONFLICT(id) DO UPDATE SET time=excluded.time,server_id=excluded.server_id,server_name=excluded.server_name,source=excluded.source,kind=excluded.kind,detail=excluded.detail,success=excluded.success,duration_ms=excluded.duration_ms,summary=excluded.summary,response_json=excluded.response_json",
-        params![a.id,a.time,a.server_id,a.server_name,a.source,a.kind,a.detail,a.success,duration_ms,a.summary,response])?;
+    connection.execute("INSERT INTO audit_entries(id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json,outcome,event_kind,reason_code,related_id)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+        ON CONFLICT(id) DO UPDATE SET time=excluded.time,server_id=excluded.server_id,server_name=excluded.server_name,source=excluded.source,kind=excluded.kind,detail=excluded.detail,success=excluded.success,duration_ms=excluded.duration_ms,summary=excluded.summary,response_json=excluded.response_json,outcome=excluded.outcome,event_kind=excluded.event_kind,reason_code=excluded.reason_code,related_id=excluded.related_id",
+        params![a.id,a.time,a.server_id,a.server_name,a.source,a.kind,a.detail,a.success,duration_ms,a.summary,response,a.outcome.as_str(),a.event_kind.as_str(),a.reason_code,a.related_id])?;
     Ok(())
 }

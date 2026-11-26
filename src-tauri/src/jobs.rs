@@ -11,6 +11,7 @@ use std::{
 };
 
 pub(crate) const CAPACITY: usize = 4 * 1024 * 1024;
+pub(crate) const READ_BUDGET: usize = 32 * 1024;
 const RETENTION: Duration = Duration::from_secs(30 * 60);
 pub type Progress = Option<tokio::sync::mpsc::Sender<Value>>;
 
@@ -27,8 +28,11 @@ impl Buffer {
         self.bytes.drain(..excess);
         self.bytes.extend(bytes);
     }
+    fn start(&self) -> u64 {
+        self.end - self.bytes.len() as u64
+    }
     fn read(&self, cursor: u64, limit: usize, finished: bool) -> (String, u64, bool) {
-        let start = self.end - self.bytes.len() as u64;
+        let start = self.start();
         let offset = cursor.max(start).min(self.end);
         let mut bytes: Vec<u8> = self
             .bytes
@@ -127,13 +131,29 @@ impl Job {
             out <= d.stdout.end && err <= d.stderr.end,
             "INVALID_ARGUMENT: cursor exceeds received output"
         );
-        let (stdout, next_out, out_truncated) = d.stdout.read(out, limit, d.status != "running");
-        let (stderr, next_err, err_truncated) = d.stderr.read(err, limit, d.status != "running");
+        let finished = d.status != "running";
+        let out_start = d.stdout.start();
+        let err_start = d.stderr.start();
+        let (mut stdout, mut next_out, out_truncated) = d.stdout.read(out, limit / 2, finished);
+        let out_consumed = next_out.saturating_sub(out.max(out_start)) as usize;
+        let err_budget = limit.saturating_sub(out_consumed);
+        let (stderr, next_err, err_truncated) = d.stderr.read(err, err_budget, finished);
+        let err_consumed = next_err.saturating_sub(err.max(err_start)) as usize;
+        let leftover = err_budget.saturating_sub(err_consumed);
+        if leftover > 0 && next_out < d.stdout.end {
+            let (extra, extra_next, _) = d.stdout.read(next_out, leftover, finished);
+            stdout.push_str(&extra);
+            next_out = extra_next;
+        }
+        let out_lost = out_start.saturating_sub(out);
+        let err_lost = err_start.saturating_sub(err);
         Ok(
-            json!({"job_id":self.id,"server_id":self.server_id,"created_at":self.created_at,"status":d.status,"exit_code":d.exit_code,"error":d.error,
+            json!({"job_id":self.id,"server_id":self.server_id,"created_at":self.created_at,"status":d.status,"exit_code":d.exit_code,"error":d.error,"closing":d.close,
             "stdout":stdout,"stderr":stderr,"next_stdout_cursor":next_out,"next_stderr_cursor":next_err,
-            "stdout_start_cursor":d.stdout.end - d.stdout.bytes.len() as u64,"stderr_start_cursor":d.stderr.end - d.stderr.bytes.len() as u64,
+            "stdout_advanced":next_out != out,"stderr_advanced":next_err != err,
+            "stdout_start_cursor":out_start,"stderr_start_cursor":err_start,
             "stdout_end_cursor":d.stdout.end,"stderr_end_cursor":d.stderr.end,
+            "stdout_lost_bytes":out_lost,"stderr_lost_bytes":err_lost,
             "stdout_truncated":out_truncated,"stderr_truncated":err_truncated,"truncated":out_truncated || err_truncated,
             "stdout_has_more":next_out < d.stdout.end,"stderr_has_more":next_err < d.stderr.end,
             "connection":*self.connection.lock().unwrap()}),
@@ -220,7 +240,7 @@ impl JobManager {
         Self::prune(&mut self.jobs.lock().unwrap());
     }
     pub fn operate(&self, op: &Operation, progress: &Progress) -> Result<Value> {
-        self.operate_with_limit(op, progress, CAPACITY)
+        self.operate_with_limit(op, progress, READ_BUDGET)
     }
     pub fn operate_desktop(&self, op: &Operation) -> Result<Value> {
         anyhow::ensure!(
@@ -249,19 +269,22 @@ impl JobManager {
         }
         let job = self.get(&op.server_id, &op.job_id)?;
         if op.job_action == "close" {
-            if !job.close() {
+            let status = if job.close() {
+                job.data.lock().unwrap().status
+            } else {
                 return Err(error_with_details(
                     "JOB_CLOSE_PENDING",
-                    "Close requested but not confirmed; check job.read",
-                    job.snapshot(0, 0, CAPACITY)?,
+                    "Close not yet confirmed.\nUse job.read to check the final state.",
+                    json!({"job_id":job.id,"status":"running","close_pending":true}),
                 ));
-            }
-            return job.snapshot(0, 0, limit);
+            };
+            return Ok(json!({"job_id":job.id,"status":status,"closed":true}));
         }
         let deadline = Instant::now() + Duration::from_secs(op.wait_secs);
         loop {
             let value = job.snapshot(op.stdout_cursor, op.stderr_cursor, limit)?;
             if value["status"] != "running"
+                || value["closing"] == true
                 || value["next_stdout_cursor"] != op.stdout_cursor
                 || value["next_stderr_cursor"] != op.stderr_cursor
                 || Instant::now() >= deadline
@@ -359,7 +382,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(closed["status"], "exited");
-        assert_eq!(closed["exit_code"], 7);
+        assert_eq!(closed["closed"], true);
+        assert!(closed.get("stdout").is_none());
     }
 
     #[test]
@@ -407,6 +431,156 @@ mod tests {
         manager.prune_expired();
         assert!(manager.get("server", &jobs[0].id).is_err());
         assert!(JobManager::default().get("server", &jobs[1].id).is_err());
+    }
+
+    #[test]
+    fn mcp_reads_share_the_budget_without_starving_either_stream() {
+        let manager = JobManager::default();
+        let job = Arc::new(Job::new("server"));
+        {
+            let mut data = job.data.lock().unwrap();
+            data.stdout.append(&vec![b'o'; READ_BUDGET]);
+            data.stderr.append(&vec![b'e'; READ_BUDGET]);
+        }
+        manager.retain(&job).unwrap();
+        let value = manager
+            .operate(
+                &Operation {
+                    server_id: "server".into(),
+                    job_id: job.id.clone(),
+                    job_action: "read".into(),
+                    ..Default::default()
+                },
+                &None,
+            )
+            .unwrap();
+        let stdout = value["stdout"].as_str().unwrap().len();
+        let stderr = value["stderr"].as_str().unwrap().len();
+        assert_eq!(stdout + stderr, READ_BUDGET);
+        assert!(stdout > 0 && stderr > 0);
+        assert_eq!(value["next_stdout_cursor"], stdout as u64);
+        assert_eq!(value["next_stderr_cursor"], stderr as u64);
+        assert_eq!(value["stdout_has_more"], true);
+        assert_eq!(value["stderr_has_more"], true);
+    }
+
+    #[test]
+    fn mcp_reads_page_through_large_output_without_duplicates() {
+        let manager = JobManager::default();
+        let job = Arc::new(Job::new("server"));
+        let expected: String = "0123456789".repeat(10_000);
+        job.data.lock().unwrap().stdout.append(expected.as_bytes());
+        manager.retain(&job).unwrap();
+        let mut cursor = 0;
+        let mut collected = String::new();
+        loop {
+            let value = manager
+                .operate(
+                    &Operation {
+                        server_id: "server".into(),
+                        job_id: job.id.clone(),
+                        job_action: "read".into(),
+                        stdout_cursor: cursor,
+                        ..Default::default()
+                    },
+                    &None,
+                )
+                .unwrap();
+            collected.push_str(value["stdout"].as_str().unwrap());
+            cursor = value["next_stdout_cursor"].as_u64().unwrap();
+            if value["stdout_has_more"] != true {
+                break;
+            }
+        }
+        assert_eq!(collected, expected);
+        assert_eq!(cursor, expected.len() as u64);
+    }
+
+    #[test]
+    fn overwritten_history_reports_lost_bytes_and_a_contiguous_cursor() {
+        let manager = JobManager::default();
+        let job = Arc::new(Job::new("server"));
+        job.data
+            .lock()
+            .unwrap()
+            .stdout
+            .append(&vec![b'a'; CAPACITY + 100]);
+        manager.retain(&job).unwrap();
+        let value = manager
+            .operate(
+                &Operation {
+                    server_id: "server".into(),
+                    job_id: job.id.clone(),
+                    job_action: "read".into(),
+                    ..Default::default()
+                },
+                &None,
+            )
+            .unwrap();
+        assert_eq!(value["stdout_truncated"], true);
+        assert_eq!(value["stdout_lost_bytes"], 100);
+        assert_eq!(
+            value["next_stdout_cursor"],
+            100 + value["stdout"].as_str().unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn close_returns_only_the_close_result() {
+        let manager = JobManager::default();
+        let job = Arc::new(Job::new("server"));
+        job.data.lock().unwrap().stdout.append(b"already read");
+        manager.retain(&job).unwrap();
+        job.finish("exited", Some(0), None);
+        let value = manager
+            .operate(
+                &Operation {
+                    server_id: "server".into(),
+                    job_id: job.id.clone(),
+                    job_action: "close".into(),
+                    ..Default::default()
+                },
+                &None,
+            )
+            .unwrap();
+        assert_eq!(value["closed"], true);
+        assert_eq!(value["status"], "exited");
+        assert!(value.get("stdout").is_none());
+    }
+
+    #[test]
+    fn concurrent_readers_keep_independent_cursors_and_waiting_does_not_block() {
+        let manager = Arc::new(JobManager::default());
+        let job = Arc::new(Job::new("server"));
+        job.data.lock().unwrap().stdout.append(b"0123456789");
+        manager.retain(&job).unwrap();
+        let read = |cursor: u64| Operation {
+            server_id: "server".into(),
+            job_id: job.id.clone(),
+            job_action: "read".into(),
+            stdout_cursor: cursor,
+            ..Default::default()
+        };
+        let first = manager.operate(&read(0), &None).unwrap();
+        let second = manager.operate(&read(5), &None).unwrap();
+        assert_eq!(first["stdout"], "0123456789");
+        assert_eq!(second["stdout"], "56789");
+        assert_eq!(first["next_stdout_cursor"], 10);
+        assert_eq!(second["next_stdout_cursor"], 10);
+
+        let waiting = {
+            let manager = manager.clone();
+            let mut op = read(10);
+            op.wait_secs = 2;
+            std::thread::spawn(move || manager.operate(&op, &None))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let immediate = manager.operate(&read(10), &None).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(immediate["status"], "running");
+        job.finish("exited", Some(0), None);
+        assert_eq!(waiting.join().unwrap().unwrap()["status"], "exited");
     }
 
     #[test]

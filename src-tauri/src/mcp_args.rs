@@ -213,22 +213,28 @@ into_op!(RemoveArgs, a, {path:a.path, file_request:Some(FileRequest::Remove {rec
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(extend("type" = "object"))]
 pub enum JobArgs {
+    /// List retained jobs for a server.
     List {
         #[schemars(length(min = 1, max = 128))]
         server_id: String,
     },
+    /// Read only the output after the supplied byte cursors.
     Read {
         #[schemars(length(min = 1, max = 128))]
         server_id: String,
         #[schemars(length(min = 1, max = 128))]
         job_id: String,
 
+        /// Byte offset of the first unread stdout byte. Start at 0 after an exec handoff.
         stdout_cursor: Option<u64>,
+        /// Byte offset of the first unread stderr byte. Start at 0 after an exec handoff.
         stderr_cursor: Option<u64>,
 
+        /// Seconds to wait for new output or a status change (0-30). Use 10 while monitoring.
         #[schemars(range(max = 30))]
         wait_secs: Option<u64>,
     },
+    /// Request that the retained SSH execution channel be closed.
     Close {
         #[schemars(length(min = 1, max = 128))]
         server_id: String,

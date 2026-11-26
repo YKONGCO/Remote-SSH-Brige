@@ -77,6 +77,7 @@ pub(crate) fn session_unhealthy(error: &anyhow::Error) -> bool {
             | "SSH_HOST_UNTRUSTED"
             | "SSH_SESSION_BUSY"
             | "SSH_TIMEOUT"
+            | "IO_TIMEOUT"
             | "CONNECTION_LOST"
             | "CONNECTION_REFUSED"
             | "SSH_ERROR"

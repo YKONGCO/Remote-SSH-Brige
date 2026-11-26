@@ -1,6 +1,6 @@
 use remote_ssh_brige_lib::{
     database::{AuditDeleteRange, AuditQuery, Database},
-    model::Audit,
+    model::{Audit, AuditEventKind, AuditOutcome},
 };
 
 #[test]
@@ -29,6 +29,10 @@ fn time_range_filters_count_pages_export_and_delete_across_dates_and_timezones()
                 success: true,
                 duration_ms: 1,
                 summary: "ok".into(),
+                outcome: AuditOutcome::Success,
+                event_kind: AuditEventKind::ToolCall,
+                reason_code: None,
+                related_id: None,
                 response: None,
             })
             .unwrap();

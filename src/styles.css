@@ -2038,7 +2038,7 @@
     flex-shrink: 0;
   }
   .file-table .row-actions {
-    justify-content: flex-end;
+    justify-content: flex-start;
   }
   .editor-head > span {
     min-width: 0;
@@ -5277,10 +5277,22 @@
 .settings-footer-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 10px;
 }
 .settings-footer-actions .version-pill {
   margin-left: 0;
+}
+.settings-update-note {
+  color: var(--ink-tertiary);
+  font-size: 11px;
+}
+button.settings-update-note {
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
 }
 .sidebar-bottom .nav-item.active {
   font-weight: var(--weight-body);

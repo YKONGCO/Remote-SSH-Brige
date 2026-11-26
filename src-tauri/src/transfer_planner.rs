@@ -149,7 +149,9 @@ fn plan(
     let mut lease = if upload {
         None
     } else {
-        Some(state.sftp_sessions.acquire(server, settings)?)
+        let mut connection = settings.clone();
+        connection.io_timeout_secs = settings.transfers.io_timeout_secs;
+        Some(state.sftp_sessions.acquire(server, &connection)?)
     };
     let result = (|| -> Result<Plan> {
         let sftp = match lease.as_mut() {

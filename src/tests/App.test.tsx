@@ -850,6 +850,38 @@ test("server creation uses its toolbar while terminal actions use the titlebar",
   expect(screen.queryByRole("button", { name: "新建终端" })).toBeNull();
 });
 
+test("server terminal button opens the selected server while sidebar navigation stays passive", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  const open = vi
+    .spyOn(remoteApi, "operate")
+    .mockResolvedValue({ session_id: "term-1" } as never);
+  try {
+    render(<App />);
+    await screen.findByText("生产服务器");
+    await user.click(screen.getByRole("button", { name: "终端会话" }));
+    await screen.findByRole("button", { name: "新建终端" });
+    expect(
+      open.mock.calls.filter(([op]) => op.kind === "terminal_open"),
+    ).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "服务器" }));
+    await screen.findByText("生产服务器");
+    await user.click(
+      screen.getByRole("button", { name: "打开终端 生产服务器" }),
+    );
+    await screen.findByRole("button", { name: "新建终端" });
+    await waitFor(() =>
+      expect(
+        open.mock.calls.filter(
+          ([op]) => op.kind === "terminal_open" && op.server_id === "demo-1",
+        ),
+      ).toHaveLength(1),
+    );
+  } finally {
+    open.mockRestore();
+  }
+});
+
 test("command approval entry is always available for protected commands", async () => {
   localStorage.clear();
   render(<App />);

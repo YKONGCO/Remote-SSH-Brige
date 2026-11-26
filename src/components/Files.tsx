@@ -8,8 +8,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { FilePreview } from "./FilePreview";
 import { useEffect, useState, useRef, type DragEvent } from "react";
 import {
@@ -27,6 +29,8 @@ import {
   ChevronDown,
   Files as FilesIcon,
   Search,
+  MoreHorizontal,
+  Copy,
 } from "lucide-react";
 import { api, desktop, operate } from "../api";
 import { listenForNativeDrops, nativeDragDropAvailable } from "../native-drop";
@@ -77,6 +81,18 @@ function rememberFilePath(serverId: string, path: string) {
     paths[serverId] = path;
     localStorage.setItem(filePathsKey, JSON.stringify(paths));
   } catch {}
+}
+
+export function getAbsolutePath(entry: FileEntry): string {
+  return entry.path;
+}
+
+export function getRelativePath(currentDir: string, entry: FileEntry): string {
+  const base = currentDir === "/" ? "/" : currentDir.replace(/\/+$/, "") + "/";
+  const relative = entry.path.startsWith(base)
+    ? entry.path.slice(base.length)
+    : entry.name;
+  return "./" + (relative || entry.name);
 }
 
 export function Files({
@@ -349,6 +365,20 @@ export function Files({
     } catch (e) {
       if (request === previewRequest.current)
         setPreview({ entry, loading: false, error: String(e) });
+    }
+  };
+  const copyPath = async (value: string, message: string) => {
+    try {
+      if (desktop) {
+        await writeText(value);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        throw new Error("当前环境不支持剪贴板");
+      }
+      notify(message);
+    } catch (e) {
+      notify(String(e), true);
     }
   };
   const download = async (entry: FileEntry) => {
@@ -693,37 +723,92 @@ export function Files({
                           <Download size={15} />
                         </Button>
                       )}
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="icon-btn"
-                        title="重命名"
-                        disabled={security?.remote_read_only}
-                        onClick={() =>
-                          setDialog({ kind: "rename", name: e.name, entry: e })
-                        }
-                      >
-                        <Pencil size={14} />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="icon-btn danger"
-                        title={
-                          security?.deletion_protection
-                            ? "删除保护已开启"
-                            : "删除"
-                        }
-                        disabled={
-                          security?.deletion_protection ||
-                          security?.remote_read_only
-                        }
-                        onClick={() =>
-                          setDialog({ kind: "remove", name: e.name, entry: e })
-                        }
-                      >
-                        <Trash2 size={15} />
-                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="icon-btn"
+                            title="更多操作"
+                            aria-label={`更多操作 ${e.name}`}
+                          >
+                            <MoreHorizontal size={16} />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          className="min-w-40 text-left"
+                        >
+                          <DropdownMenuItem
+                            className="justify-start"
+                            onSelect={() =>
+                              void copyPath(
+                                getRelativePath(path, e),
+                                "已复制相对路径",
+                              )
+                            }
+                          >
+                            <Copy size={14} />
+                            复制相对路径
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            className="justify-start"
+                            onSelect={() =>
+                              void copyPath(
+                                getAbsolutePath(e),
+                                "已复制绝对路径",
+                              )
+                            }
+                          >
+                            <Copy size={14} />
+                            复制绝对路径
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="justify-start"
+                            disabled={security?.remote_read_only}
+                            title={
+                              security?.remote_read_only
+                                ? "只读保护已开启"
+                                : "重命名"
+                            }
+                            onSelect={() =>
+                              setDialog({
+                                kind: "rename",
+                                name: e.name,
+                                entry: e,
+                              })
+                            }
+                          >
+                            <Pencil size={14} />
+                            重命名
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            className="danger justify-start"
+                            disabled={
+                              security?.deletion_protection ||
+                              security?.remote_read_only
+                            }
+                            title={
+                              security?.deletion_protection
+                                ? "删除保护已开启"
+                                : security?.remote_read_only
+                                  ? "只读保护已开启"
+                                  : "删除"
+                            }
+                            onSelect={() =>
+                              setDialog({
+                                kind: "remove",
+                                name: e.name,
+                                entry: e,
+                              })
+                            }
+                          >
+                            <Trash2 size={15} />
+                            删除
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </td>
                 </tr>

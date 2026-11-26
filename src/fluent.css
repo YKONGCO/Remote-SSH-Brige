@@ -746,6 +746,15 @@
   .failed {
     color: var(--error-text) !important;
   }
+  .warning {
+    color: var(--warning-text) !important;
+  }
+  .neutral {
+    color: var(--ink-tertiary) !important;
+  }
+  .running {
+    color: var(--accent-text) !important;
+  }
   .status-dot.green {
     background: var(--success);
   }

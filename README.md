@@ -56,6 +56,17 @@ Tauri 2 / Rust / React / TypeScript
 
 在「设置 → 安全控制」可逐行添加自定义保护规则。`docker rmi` 匹配以这两个词开头的命令，单写 `docker` 则保护所有 Docker 子命令。
 
+## 自动更新
+
+「设置 → 关于与更新」显示当前版本并检查 GitHub Releases 中的签名更新。下载和安装必须由用户确认；MCP 正在运行时会先询问是否停止服务。停止失败或仍有活动请求时不会开始安装。
+
+发布签名更新需要配置以下仓库 Secrets：
+
+- `TAURI_SIGNING_PRIVATE_KEY`：minisign 私钥内容或文件路径。
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥口令。
+
+`src-tauri/tauri.updater.conf.json` 启用 `createUpdaterArtifacts`，仅在有签名密钥时参与构建。更新公钥和 `latest.json` 地址位于 `src-tauri/tauri.conf.json` 的 `plugins.updater`。
+
 ## 开发
 
 需要 Node.js 24.15+、Rust stable 和 Tauri 构建环境。Windows 需 MSVC Build Tools、WebView2 和 Perl，macOS 需 Xcode Command Line Tools。

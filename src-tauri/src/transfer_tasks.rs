@@ -333,12 +333,13 @@ fn spawn_worker(state: Arc<AppState>, h: Arc<Handle>) {
         }
         if let Ok(server) = state.server(&op.server_id) {
             let value = serde_json::to_value(h.snapshot()).unwrap_or_default();
-            if let Err(e) = state.log(
+            if let Err(e) = state.log_event(
                 &server,
                 source,
                 &op,
                 &Ok(value),
                 h.created.elapsed().as_millis() as u64,
+                crate::model::AuditEventKind::TransferFinished,
             ) {
                 h.update(|s| s.audit_error = Some(e.to_string()));
             }

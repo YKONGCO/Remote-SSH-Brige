@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -24,9 +27,11 @@ pub struct AppState {
     pub terminal_open_lock: Mutex<()>,
     pub file_mutation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub mcp: Mutex<McpStatus>,
+    pub mcp_active: AtomicUsize,
     pub mcp_sessions: crate::mcp::McpSessionRegistry,
     pub cancel: Mutex<Option<CancellationToken>>,
     pub service_lock: tokio::sync::Mutex<()>,
+    pub update: Mutex<UpdaterPhase>,
 }
 impl AppState {
     pub fn open(dir: PathBuf) -> Result<Arc<Self>> {
@@ -61,9 +66,11 @@ impl AppState {
             terminal_open_lock: Mutex::new(()),
             file_mutation_locks: Mutex::new(HashMap::new()),
             mcp: Mutex::new(McpStatus::default()),
+            mcp_active: AtomicUsize::new(0),
             mcp_sessions: crate::mcp::McpSessionRegistry::default(),
             cancel: Mutex::new(None),
             service_lock: tokio::sync::Mutex::new(()),
+            update: Mutex::new(UpdaterPhase::Idle),
         });
         state.transfers.restore(&state)?;
         let weak = Arc::downgrade(&state);
@@ -152,6 +159,25 @@ impl AppState {
         json!({"servers": self.config.lock().unwrap().servers, "audits": audits,
             "terminals": terminals, "mcp": self.mcp.lock().unwrap().clone(), "data_dir": self.dir.to_string_lossy(), "database_path": self.dir.join(crate::database::DATABASE_FILE).to_string_lossy()})
     }
+    pub fn update_status(&self) -> UpdateStatus {
+        update_status(self)
+    }
+
+    pub fn begin_update(&self) -> Result<UpdateStatus> {
+        let mut phase = self.update.lock().unwrap();
+        anyhow::ensure!(
+            *phase == UpdaterPhase::Idle,
+            "UPDATE_IN_PROGRESS: Another update flow is already active"
+        );
+        *phase = UpdaterPhase::Preparing;
+        drop(phase);
+        Ok(self.update_status())
+    }
+
+    pub fn set_update_phase(&self, phase: UpdaterPhase) {
+        *self.update.lock().unwrap() = phase;
+    }
+
     pub fn audit_details(&self, id: &str) -> Result<Audit> {
         self.database.lock().unwrap().audit(id)
     }
@@ -181,7 +207,7 @@ impl AppState {
                 kind: if approved { "security_approve".into() } else { "security_reject".into() },
                 server_id: view.server_id.clone(), command: view.command.clone(), ..Default::default()
             };
-            self.log(&server, &view.source, &op, &Ok(json!({"approval":{
+            self.log_event(&server, &view.source, &op, &Ok(json!({"approval":{
                 "request_id":view.id,"status":if approved {"approved"} else {"rejected"},
                 "approved":approved,"kind":view.kind,"request_source":view.source,"decision_by":"desktop",
                 "server_name":view.server_name,"host":view.host,"username":view.username,
@@ -191,7 +217,7 @@ impl AppState {
                 "timeout_secs":view.timeout_secs,
                 "command_bytes":view.command_bytes,"command_sha256":view.command_sha256,
                 "server_sha256":view.server_sha256
-            }})), 0)
+            }})), 0, AuditEventKind::ApprovalDecision)
         }).map(|_| ())
     }
     pub fn save_server(&self, server: Server, secret: Option<String>) -> Result<Server> {
@@ -372,6 +398,23 @@ impl AppState {
         result: &Result<Value>,
         elapsed: u64,
     ) -> Result<()> {
+        let event_kind = if op.kind == "job" && op.job_action == "finish" {
+            AuditEventKind::JobFinished
+        } else {
+            AuditEventKind::ToolCall
+        };
+        self.log_event(server, source, op, result, elapsed, event_kind)
+    }
+
+    pub fn log_event(
+        &self,
+        server: &Server,
+        source: &str,
+        op: &Operation,
+        result: &Result<Value>,
+        elapsed: u64,
+        event_kind: AuditEventKind,
+    ) -> Result<()> {
         if source != "mcp" {
             return Ok(());
         }
@@ -396,26 +439,7 @@ impl AppState {
                 op.path.clone()
             }
         };
-        let summary = match result {
-            Ok(_) if op.kind == "security_approve" => "审批已批准".into(),
-            Ok(_) if op.kind == "security_reject" => "审批已拒绝，操作未执行".into(),
-            Ok(v) if op.kind == "exec" && v.get("job_id").is_some() => {
-                format!("已转入 Job: {}", v["job_id"])
-            }
-            Ok(v) if op.kind == "job" => format!("Job {}: {}", op.job_id, v["status"]),
-            Ok(v) if op.kind == "transfer" && op.transfer_action != "list" => {
-                format!("Transfer {}: {}", op.transfer_id, v["status"])
-            }
-            Ok(v) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
-                format!("{}: {}", op.transfer_id, v["status"])
-            }
-            Ok(v) if op.kind == "exec" => format!("exit: {}", v["exit_code"]),
-            Ok(_) => "完成".into(),
-            Err(e) => crate::operation_error::error_message(e)
-                .chars()
-                .take(1000)
-                .collect(),
-        };
+        let (outcome, reason_code, related_id) = classify_audit(op, result, event_kind);
         let entry = Audit {
             id: uuid::Uuid::new_v4().to_string(),
             time: chrono::Utc::now().to_rfc3339(),
@@ -424,29 +448,13 @@ impl AppState {
             source: source.into(),
             kind: op.kind.clone(),
             detail,
-            success: result
-                .as_ref()
-                .ok()
-                .is_some_and(|v| op.kind == "exec" && v.get("job_id").is_some())
-                || (!result
-                    .as_ref()
-                    .ok()
-                    .is_some_and(|v| match v["status"].as_str() {
-                        Some("closed") => op.kind != "port_forward_close",
-                        Some("disconnected" | "failed" | "cancelled") => true,
-                        _ => false,
-                    })
-                    && op.kind != "security_reject"
-                    && result.is_ok()
-                    && result
-                        .as_ref()
-                        .ok()
-                        .and_then(|v| v.get("exit_code"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0)
-                        == 0),
+            success: matches!(outcome, AuditOutcome::Success | AuditOutcome::Running),
             duration_ms: elapsed,
-            summary,
+            summary: audit_summary(op, result, event_kind, outcome),
+            outcome,
+            event_kind,
+            reason_code,
+            related_id,
             response: Some(audit_response(op, result)),
         };
         let mut audits = self.audit.lock().unwrap();
@@ -460,6 +468,277 @@ impl AppState {
             audits.remove(0);
         }
         Ok(())
+    }
+}
+
+fn update_status(state: &AppState) -> UpdateStatus {
+    UpdateStatus {
+        phase: *state.update.lock().unwrap(),
+        mcp_running: state.mcp.lock().unwrap().running,
+        mcp_active_requests: state.mcp_active.load(Ordering::SeqCst),
+    }
+}
+
+fn audit_related_id(op: &Operation, result: &Result<Value>) -> Option<String> {
+    if !op.job_id.is_empty() {
+        return Some(op.job_id.clone());
+    }
+    if let Ok(value) = result {
+        for pointer in [
+            "/approval/request_id",
+            "/transfer_id",
+            "/group_id",
+            "/tunnel_id",
+            "/session_id",
+        ] {
+            if let Some(id) = value.pointer(pointer).and_then(Value::as_str) {
+                if !id.is_empty() {
+                    return Some(id.to_owned());
+                }
+            }
+        }
+    }
+    if !op.transfer_id.is_empty() {
+        return Some(op.transfer_id.clone());
+    }
+    op.transfer_group
+        .clone()
+        .or_else(|| (!op.tunnel_id.is_empty()).then(|| op.tunnel_id.clone()))
+}
+
+fn classify_transfer(value: &Value) -> (AuditOutcome, Option<String>) {
+    match value["status"].as_str() {
+        Some("completed") => (AuditOutcome::Success, None),
+        Some("failed") => {
+            let completed = value["completed"].as_u64().unwrap_or(0);
+            if completed > 0 {
+                (AuditOutcome::Partial, Some("TRANSFER_PARTIAL".into()))
+            } else {
+                (AuditOutcome::Failed, Some("TRANSFER_FAILED".into()))
+            }
+        }
+        Some("cancelled") => (AuditOutcome::Cancelled, Some("TRANSFER_CANCELLED".into())),
+        Some("paused") => (AuditOutcome::Cancelled, Some("TRANSFER_PAUSED".into())),
+        Some("partial") => (AuditOutcome::Partial, Some("TRANSFER_PARTIAL".into())),
+        Some("running" | "queued" | "preparing" | "retrying" | "verifying") => {
+            (AuditOutcome::Running, None)
+        }
+        Some("unknown") => (AuditOutcome::Unknown, None),
+        _ => (AuditOutcome::Success, None),
+    }
+}
+
+fn classify_tool_call(op: &Operation, value: &Value) -> (AuditOutcome, Option<String>) {
+    match op.kind.as_str() {
+        "security_approve" => (AuditOutcome::Success, None),
+        "security_reject" => (AuditOutcome::Rejected, Some("APPROVAL_REJECTED".into())),
+        "exec" => {
+            if value.get("job_id").is_some() {
+                return (AuditOutcome::Running, None);
+            }
+            if value["status"] == "disconnected" {
+                return (AuditOutcome::Unknown, Some("SSH_DISCONNECTED".into()));
+            }
+            if let Some(code) = value["exit_code"].as_i64() {
+                if code == 0 {
+                    (AuditOutcome::Success, None)
+                } else {
+                    (AuditOutcome::NonzeroExit, Some(format!("EXIT_{code}")))
+                }
+            } else if value["status"] == "exited" {
+                (AuditOutcome::Success, None)
+            } else {
+                (AuditOutcome::Success, None)
+            }
+        }
+        "job" => match value["status"].as_str() {
+            Some("failed") => (AuditOutcome::Failed, Some("JOB_FAILED".into())),
+            _ => (AuditOutcome::Success, None),
+        },
+        "transfer" => match op.transfer_action.as_str() {
+            "pause" | "cancel" | "resume" | "read" | "list" => (AuditOutcome::Success, None),
+            _ => match value["status"].as_str() {
+                Some("failed") => (AuditOutcome::Failed, Some("TRANSFER_FAILED".into())),
+                Some("cancelled") => (AuditOutcome::Cancelled, Some("TRANSFER_CANCELLED".into())),
+                Some("disconnected") => (AuditOutcome::Unknown, Some("OUTCOME_UNKNOWN".into())),
+                Some("partial") => (AuditOutcome::Partial, None),
+                _ => (AuditOutcome::Success, None),
+            },
+        },
+        "upload_file" | "download_file" => match value["status"].as_str() {
+            Some("failed") => (AuditOutcome::Failed, Some("TRANSFER_FAILED".into())),
+            Some("cancelled") => (AuditOutcome::Cancelled, Some("TRANSFER_CANCELLED".into())),
+            Some("paused") => (AuditOutcome::Cancelled, Some("TRANSFER_PAUSED".into())),
+            _ if value.get("transfer_id").is_some() || value.get("group_id").is_some() => {
+                (AuditOutcome::Running, None)
+            }
+            _ => (AuditOutcome::Success, None),
+        },
+        "port_forward_open" => match value["status"].as_str() {
+            Some("failed") => (AuditOutcome::Failed, Some("TUNNEL_FAILED".into())),
+            Some("disconnected") => (AuditOutcome::Unknown, Some("TUNNEL_DISCONNECTED".into())),
+            Some("closed") => (AuditOutcome::Failed, Some("TUNNEL_CLOSED".into())),
+            _ => (AuditOutcome::Success, None),
+        },
+        "port_forward_close" => match value["status"].as_str() {
+            Some("closing" | "closed") => (AuditOutcome::Success, None),
+            Some("disconnected") => (AuditOutcome::Unknown, Some("TUNNEL_DISCONNECTED".into())),
+            Some("failed") => (AuditOutcome::Failed, Some("TUNNEL_FAILED".into())),
+            Some("cancelled") => (AuditOutcome::Cancelled, Some("TUNNEL_CANCELLED".into())),
+            _ => (AuditOutcome::Success, None),
+        },
+        "port_forward_read" | "port_forward_list" | "terminal_read" | "terminal_close" => {
+            (AuditOutcome::Success, None)
+        }
+        _ => {
+            if let Some(code) = value["exit_code"].as_i64().filter(|code| *code != 0) {
+                return (AuditOutcome::NonzeroExit, Some(format!("EXIT_{code}")));
+            }
+            match value["status"].as_str() {
+                Some("failed") => (AuditOutcome::Failed, Some("OPERATION_FAILED".into())),
+                Some("disconnected") => (AuditOutcome::Unknown, Some("OUTCOME_UNKNOWN".into())),
+                Some("cancelled") => (AuditOutcome::Cancelled, Some("CANCELLED".into())),
+                Some("partial") => (AuditOutcome::Partial, None),
+                _ => (AuditOutcome::Success, None),
+            }
+        }
+    }
+}
+
+fn classify_audit(
+    op: &Operation,
+    result: &Result<Value>,
+    event_kind: AuditEventKind,
+) -> (AuditOutcome, Option<String>, Option<String>) {
+    let related_id = audit_related_id(op, result);
+    let (outcome, reason_code) = match result {
+        Err(error) => {
+            let code = crate::operation_error::error_code(error);
+            let details = error
+                .downcast_ref::<crate::operation_error::OperationError>()
+                .and_then(|error| error.details.as_ref());
+            let outcome = if details.is_some_and(|details| details["outcome_unknown"] == true) {
+                AuditOutcome::Unknown
+            } else if code == "SSH_DISCONNECTED" || code == "COMMIT_STATUS_UNKNOWN" {
+                AuditOutcome::Unknown
+            } else if details.is_some_and(|details| details["partial"] == true) {
+                AuditOutcome::Partial
+            } else {
+                match code {
+                    "APPROVAL_REQUIRED" | "APPROVAL_TIMEOUT" => AuditOutcome::ActionRequired,
+                    "APPROVAL_REJECTED"
+                    | "APPROVAL_CANCELLED"
+                    | "COMMAND_POLICY_DENIED"
+                    | "READ_ONLY_POLICY"
+                    | "DELETION_PROTECTED"
+                    | "EXEC_DISABLED"
+                    | "TERMINAL_POLICY_DENIED" => AuditOutcome::Rejected,
+                    _ => AuditOutcome::Failed,
+                }
+            };
+            (outcome, Some(code.to_owned()))
+        }
+        Ok(value) => match event_kind {
+            AuditEventKind::JobFinished => match value["status"].as_str() {
+                Some("exited") => match value["exit_code"].as_i64() {
+                    Some(0) => (AuditOutcome::Success, None),
+                    Some(code) => (AuditOutcome::NonzeroExit, Some(format!("EXIT_{code}"))),
+                    None => (AuditOutcome::Unknown, Some("EXIT_UNKNOWN".into())),
+                },
+                Some("closed") => (AuditOutcome::Cancelled, Some("JOB_CLOSED".into())),
+                Some("disconnected") => (AuditOutcome::Unknown, Some("JOB_DISCONNECTED".into())),
+                _ => (AuditOutcome::Unknown, Some("JOB_OUTCOME_UNKNOWN".into())),
+            },
+            AuditEventKind::TransferFinished => classify_transfer(value),
+            AuditEventKind::ApprovalDecision => {
+                let approved = value["approval"]["approved"] == true
+                    || value["approval"]["status"] == "approved";
+                if approved {
+                    (AuditOutcome::Success, None)
+                } else {
+                    (AuditOutcome::Rejected, Some("APPROVAL_REJECTED".into()))
+                }
+            }
+            AuditEventKind::ToolCall => classify_tool_call(op, value),
+        },
+    };
+    (outcome, reason_code, related_id)
+}
+
+fn audit_summary(
+    op: &Operation,
+    result: &Result<Value>,
+    event_kind: AuditEventKind,
+    outcome: AuditOutcome,
+) -> String {
+    if event_kind == AuditEventKind::JobFinished {
+        return match outcome {
+            AuditOutcome::Success => format!("Job {}: 正常结束", op.job_id),
+            AuditOutcome::NonzeroExit => format!(
+                "Job {}: 非零退出 (Exit {})",
+                op.job_id,
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value["exit_code"].as_i64())
+                    .unwrap_or_default()
+            ),
+            AuditOutcome::Cancelled => format!("Job {}: 已关闭", op.job_id),
+            AuditOutcome::Unknown => format!("Job {}: 结果未知", op.job_id),
+            _ => format!("Job {}: 失败", op.job_id),
+        };
+    }
+    if event_kind == AuditEventKind::ApprovalDecision {
+        return if outcome == AuditOutcome::Success {
+            "审批已批准".into()
+        } else {
+            "审批已拒绝，操作未执行".into()
+        };
+    }
+    match result {
+        Ok(v) if op.kind == "exec" && v.get("job_id").is_some() => {
+            format!("已转入 Job: {}", v["job_id"])
+        }
+        Ok(v) if op.kind == "job" => match op.job_action.as_str() {
+            "read" => match (v["status"].as_str(), v["exit_code"].as_i64()) {
+                (Some("exited"), Some(code)) if code != 0 => {
+                    format!("Job {}: 已读取 · 任务 Exit {code}", op.job_id)
+                }
+                (Some("disconnected"), _) => format!("Job {}: 已读取 · 结果未知", op.job_id),
+                _ => format!("Job {}: 已读取", op.job_id),
+            },
+            "close" => format!("Job {}: 已关闭", op.job_id),
+            _ => format!("Job {}: {}", op.job_id, v["status"]),
+        },
+        Ok(v) if op.kind == "transfer" && op.transfer_action != "list" => {
+            format!("Transfer {}: {}", op.transfer_id, v["status"])
+        }
+        Ok(v) if matches!(op.kind.as_str(), "upload_file" | "download_file") => {
+            format!("{}: {}", op.transfer_id, v["status"])
+        }
+        Ok(v) if op.kind == "exec" => match outcome {
+            AuditOutcome::Success => "exit: 0".into(),
+            AuditOutcome::NonzeroExit => format!("非零退出: {}", v["exit_code"]),
+            AuditOutcome::Unknown => "结果未知".into(),
+            _ => "完成".into(),
+        },
+        Ok(_) => "完成".into(),
+        Err(e) => match outcome {
+            AuditOutcome::ActionRequired => "需要人工审批".into(),
+            AuditOutcome::Rejected => "已拒绝，命令未执行".into(),
+            AuditOutcome::Unknown => "结果未知".into(),
+            AuditOutcome::Partial => format!(
+                "部分完成: {}",
+                crate::operation_error::error_message(e)
+                    .chars()
+                    .take(1000)
+                    .collect::<String>()
+            ),
+            _ => crate::operation_error::error_message(e)
+                .chars()
+                .take(1000)
+                .collect(),
+        },
     }
 }
 
@@ -523,11 +802,32 @@ pub async fn execute_with_progress(
                 state.jobs.operate(&op, &progress)
             } else if op.kind.starts_with("terminal_") {
                 crate::terminal::operate(&state, &live, &op, source)
-            } else {
+            } else if crate::ssh::uses_session_pool(&op) {
+                let mut settings = settings;
+                let prepared = crate::ssh::prepare_operation(&op, &settings)?;
+                let _permit = state.sftp_sessions.acquire_file_operation(&live.id)?;
                 let mut attempts = 0;
                 loop {
-                    let result = crate::ssh::operate_with_settings(&live, &op, &settings);
-                    let safe = matches!(op.kind.as_str(), "list_files" | "stat_file" | "read_file");
+                    let mut lease = state
+                        .sftp_sessions
+                        .acquire(&live, &settings)
+                        .map_err(|error| crate::operation_error::with_stage(error, "connection"))?;
+                    let result = crate::ssh::operate_with_session(
+                        &live,
+                        &op,
+                        &settings,
+                        lease.session(),
+                        prepared.as_deref(),
+                    );
+                    let healthy = result
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::transfer_engine::session_unhealthy(error));
+                    lease.release(healthy);
+                    let safe = matches!(
+                        op.kind.as_str(),
+                        "list_files" | "stat_file" | "read_file" | "preview_file"
+                    );
                     if attempts >= 2
                         || !safe
                         || !result
@@ -544,8 +844,10 @@ pub async fn execute_with_progress(
                         serde_json::to_value(&current)? == serde_json::to_value(&live)?,
                         "Server configuration changed during retry"
                     );
-                    validate_operation(&state, &current, &op, source)?;
+                    settings = validate_operation(&state, &current, &op, source)?;
                 }
+            } else {
+                crate::ssh::operate_with_settings(&live, &op, &settings)
             }
         })();
         if source == "mcp" {

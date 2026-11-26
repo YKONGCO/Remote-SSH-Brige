@@ -4,6 +4,14 @@ import type {
   RuntimeSettings,
   NumericRuntimeSetting,
 } from "../runtime-settings";
+import type { UpdateStatus } from "../types";
+import {
+  checkForUpdate,
+  discardUpdate,
+  installUpdate,
+  type UpdateInfo,
+  type UpdateProgress,
+} from "../updater";
 import {
   defaultTransferSettings,
   defaultAdvancedMcpTools,
@@ -23,6 +31,7 @@ import {
   FolderOpen,
   ShieldAlert,
   ChevronRight,
+  Download,
 } from "lucide-react";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
@@ -78,7 +87,32 @@ export function Settings({
   const [pickingDirectories, setPickingDirectories] = useState(false);
   const [protectedDraft, setProtectedDraft] = useState("");
   const [builtinRules, setBuiltinRules] = useState<BuiltinRule[]>([]);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [updateNotice, setUpdateNotice] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState("");
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(
+    null,
+  );
+  const [confirmMcpUpdate, setConfirmMcpUpdate] = useState(false);
+  const updatePrepared = useRef(false);
+  const installingRef = useRef(false);
   const policy = runtime ? effectiveCommandPolicy(runtime) : undefined;
+  useEffect(() => {
+    installingRef.current = installingUpdate;
+  }, [installingUpdate]);
+  useEffect(
+    () => () => {
+      if (installingRef.current) return;
+      if (updatePrepared.current) {
+        void api<UpdateStatus>("update_cancel").catch(() => {});
+      }
+      void discardUpdate();
+    },
+    [],
+  );
   async function pickDirectories() {
     if (pickingDirectories || saving) return;
     setPickingDirectories(true);
@@ -194,6 +228,100 @@ export function Settings({
     } finally {
       setSaving(false);
     }
+  }
+  async function checkUpdates() {
+    if (!desktop || checkingUpdate || installingUpdate) return;
+    setCheckingUpdate(true);
+    setUpdateError("");
+    setUpdateNotice("");
+    try {
+      const info = await checkForUpdate();
+      setUpdateInfo(info);
+      if (info) {
+        setUpdateDialogOpen(true);
+      } else {
+        setUpdateNotice("已是最新版本");
+      }
+    } catch (e) {
+      setUpdateInfo(null);
+      setUpdateError(String(e));
+      setUpdateNotice("检查更新失败");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+  async function installNow(stopMcp: boolean) {
+    if (installingUpdate || !updateInfo) return;
+    installingRef.current = true;
+    updatePrepared.current = false;
+    setConfirmMcpUpdate(false);
+    setUpdateDialogOpen(true);
+    setInstallingUpdate(true);
+    setUpdateError("");
+    setUpdateProgress(null);
+    let mcpStopped = false;
+    try {
+      if (stopMcp) {
+        await api<UpdateStatus>("update_stop_mcp");
+        mcpStopped = true;
+      } else {
+        const status = await api<UpdateStatus>("update_begin_install");
+        if (status.mcp_running) {
+          throw new Error("MCP 服务仍在运行，更新未开始。");
+        }
+      }
+      await installUpdate(setUpdateProgress);
+    } catch (e) {
+      installingRef.current = false;
+      setUpdateNotice("更新失败");
+      setUpdateError(String(e));
+      setInstallingUpdate(false);
+      setUpdateDialogOpen(true);
+      try {
+        await api<UpdateStatus>("update_failed", { restoreMcp: mcpStopped });
+      } catch (restoreError) {
+        setUpdateError(`${String(e)}\n${String(restoreError)}`);
+      }
+    }
+  }
+  async function startUpdate() {
+    if (!desktop || !updateInfo || installingUpdate) return;
+    setInstallingUpdate(true);
+    setUpdateError("");
+    setUpdateNotice("");
+    try {
+      const status = await api<UpdateStatus>("update_prepare");
+      updatePrepared.current = true;
+      if (status.mcp_running) {
+        setUpdateDialogOpen(false);
+        setConfirmMcpUpdate(true);
+        setInstallingUpdate(false);
+        return;
+      }
+      await installNow(false);
+    } catch (e) {
+      updatePrepared.current = false;
+      setInstallingUpdate(false);
+      setUpdateError(String(e));
+      setUpdateNotice("更新准备失败");
+      setUpdateDialogOpen(true);
+      await api<UpdateStatus>("update_cancel").catch(() => {});
+    }
+  }
+  async function cancelUpdate() {
+    updatePrepared.current = false;
+    setConfirmMcpUpdate(false);
+    setUpdateNotice("已取消更新");
+    setUpdateDialogOpen(Boolean(updateInfo));
+    await api<UpdateStatus>("update_cancel").catch(() => {});
+  }
+  function closeUpdateDialog() {
+    if (installingUpdate) return;
+    setUpdateDialogOpen(false);
+  }
+  function openUpdateDialog() {
+    if (updateInfo) setUpdateDialogOpen(true);
+    else void checkUpdates();
   }
   function runtimeSelect(
     name: NumericRuntimeSetting,
@@ -1026,6 +1154,108 @@ export function Settings({
           </form>
         </ModalFrame>
       )}
+      {updateDialogOpen && (updateInfo || updateError) && (
+        <ModalFrame className="compact-modal" onClose={closeUpdateDialog}>
+          <div className="modal-layout">
+            <div className="modal-head">
+              <DialogTitle asChild>
+                <h2>
+                  {updateInfo
+                    ? `发现新版本 v${updateInfo.version}`
+                    : "检查更新失败"}
+                </h2>
+              </DialogTitle>
+            </div>
+            <div className="modal-body">
+              {updateInfo?.date && (
+                <p className="audit-message">{updateInfo.date}</p>
+              )}
+              {updateInfo?.body ? (
+                <pre className="audit-code audit-output" tabIndex={0}>
+                  {updateInfo.body}
+                </pre>
+              ) : (
+                updateInfo && (
+                  <p className="audit-message">
+                    新版本已准备好，可以开始更新。
+                  </p>
+                )
+              )}
+              {updateError && (
+                <p className="error-inline" role="alert">
+                  {updateError}
+                </p>
+              )}
+              {installingUpdate && (
+                <p className="audit-message" role="status">
+                  {updateProgress?.total
+                    ? `已下载 ${Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))}%`
+                    : "正在准备更新…"}
+                </p>
+              )}
+            </div>
+            <div className="modal-foot flex gap-2 justify-end">
+              <Button
+                variant="outline"
+                disabled={installingUpdate}
+                onClick={closeUpdateDialog}
+              >
+                {updateInfo ? "取消" : "关闭"}
+              </Button>
+              {updateInfo ? (
+                <Button
+                  disabled={installingUpdate}
+                  aria-busy={installingUpdate}
+                  onClick={() => void startUpdate()}
+                >
+                  <Download size={15} />
+                  {installingUpdate ? "更新中…" : "更新应用"}
+                </Button>
+              ) : (
+                <Button onClick={() => void checkUpdates()}>重试</Button>
+              )}
+            </div>
+          </div>
+        </ModalFrame>
+      )}
+      {confirmMcpUpdate && (
+        <ModalFrame
+          className="compact-modal"
+          onClose={() => {
+            if (!installingUpdate) void cancelUpdate();
+          }}
+        >
+          <div className="modal-layout">
+            <div className="modal-head">
+              <DialogTitle asChild>
+                <h2>更新前需要关闭 MCP 服务</h2>
+              </DialogTitle>
+            </div>
+            <div className="modal-body">
+              <p>
+                当前 MCP 服务正在运行。更新应用需要暂时停止 MCP 服务，已连接的
+                Agent 将断开，正在执行的 MCP 请求可能受到影响。
+              </p>
+              <p>更新完成后，可重新启动 MCP 服务。</p>
+            </div>
+            <div className="modal-foot flex gap-2 justify-end">
+              <Button
+                variant="outline"
+                disabled={installingUpdate}
+                onClick={() => void cancelUpdate()}
+              >
+                取消更新
+              </Button>
+              <Button
+                disabled={installingUpdate}
+                onClick={() => void installNow(true)}
+              >
+                关闭 MCP 并更新
+              </Button>
+            </div>
+          </div>
+        </ModalFrame>
+      )}
       <footer className="settings-footer">
         <span role="status">
           {saving
@@ -1043,6 +1273,30 @@ export function Settings({
           >
             v{appPackage.version}
           </span>
+          <button
+            className="text-btn"
+            disabled={!desktop || checkingUpdate || installingUpdate}
+            aria-busy={checkingUpdate}
+            onClick={openUpdateDialog}
+          >
+            {checkingUpdate
+              ? "检查更新中…"
+              : updateInfo
+                ? `更新到 v${updateInfo.version}`
+                : "检查更新"}
+          </button>
+          {updateNotice &&
+            (updateError ? (
+              <button
+                className="text-btn settings-update-note failed"
+                title={updateError}
+                onClick={() => setUpdateDialogOpen(true)}
+              >
+                {updateNotice}
+              </button>
+            ) : (
+              <span className="settings-update-note">{updateNotice}</span>
+            ))}
           <button className="text-btn" onClick={() => update(defaults)}>
             恢复界面默认设置
           </button>

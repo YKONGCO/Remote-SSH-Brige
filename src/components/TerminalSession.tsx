@@ -21,6 +21,7 @@ const labels: Record<TerminalState, string> = {
 export function TerminalSession({
   session,
   active,
+  focusRequest,
   enabled,
   appearance,
   refresh,
@@ -30,6 +31,7 @@ export function TerminalSession({
 }: {
   session: Session;
   active: boolean;
+  focusRequest?: number;
   enabled: boolean;
   appearance: string;
   refresh: () => Promise<void>;
@@ -41,6 +43,7 @@ export function TerminalSession({
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<XTerminal | null>(null);
   const remoteAlive = useRef(true);
+  const lastFocusRequest = useRef(focusRequest ?? 0);
   const controls = useRef<{
     wake: () => void;
     fit: () => void;
@@ -334,6 +337,15 @@ export function TerminalSession({
   useEffect(() => {
     if (active && state === "connected") controls.current?.fit();
   }, [active, state]);
+  useEffect(() => {
+    if (focusRequest === undefined) return;
+    if (lastFocusRequest.current === focusRequest) return;
+    lastFocusRequest.current = focusRequest;
+    if (!active) return;
+    controls.current?.fit();
+    terminal.current?.focus();
+    controls.current?.wake();
+  }, [focusRequest, active]);
 
   return (
     <div

@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-dialog"]
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-dialog", "dep:tauri-plugin-updater", "dep:tauri-plugin-process", "dep:tauri-plugin-clipboard-manager"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -21,6 +21,9 @@ tauri-build = { version = "2", features = [], optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 tauri-plugin-single-instance = { version = "2", optional = true }
+tauri-plugin-updater = { version = "2", optional = true }
+tauri-plugin-process = { version = "2", optional = true }
+tauri-plugin-clipboard-manager = { version = "2", optional = true }
 tauri = { version = "2", features = ["tray-icon"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

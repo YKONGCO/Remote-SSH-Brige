@@ -495,6 +495,81 @@ impl Server {
 pub struct Config {
     pub servers: Vec<Server>,
 }
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    #[default]
+    Success,
+    Running,
+    NonzeroExit,
+    ActionRequired,
+    Rejected,
+    Cancelled,
+    Partial,
+    Unknown,
+    Failed,
+}
+
+impl AuditOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Running => "running",
+            Self::NonzeroExit => "nonzero_exit",
+            Self::ActionRequired => "action_required",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "success" => Self::Success,
+            "running" => Self::Running,
+            "nonzero_exit" => Self::NonzeroExit,
+            "action_required" => Self::ActionRequired,
+            "rejected" => Self::Rejected,
+            "cancelled" => Self::Cancelled,
+            "partial" => Self::Partial,
+            "unknown" => Self::Unknown,
+            _ => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventKind {
+    #[default]
+    ToolCall,
+    JobFinished,
+    ApprovalDecision,
+    TransferFinished,
+}
+
+impl AuditEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolCall => "tool_call",
+            Self::JobFinished => "job_finished",
+            Self::ApprovalDecision => "approval_decision",
+            Self::TransferFinished => "transfer_finished",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "job_finished" => Self::JobFinished,
+            "approval_decision" => Self::ApprovalDecision,
+            "transfer_finished" => Self::TransferFinished,
+            _ => Self::ToolCall,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Audit {
     pub id: String,
@@ -507,6 +582,14 @@ pub struct Audit {
     pub success: bool,
     pub duration_ms: u64,
     pub summary: String,
+    #[serde(default)]
+    pub outcome: AuditOutcome,
+    #[serde(default)]
+    pub event_kind: AuditEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<AuditResponse>,
 }
@@ -623,6 +706,23 @@ pub struct McpStatus {
     pub token: String,
     pub error: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdaterPhase {
+    #[default]
+    Idle,
+    Preparing,
+    StoppingMcp,
+    Updating,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpdateStatus {
+    pub phase: UpdaterPhase,
+    pub mcp_running: bool,
+    pub mcp_active_requests: usize,
+}
+
 impl McpStatus {
     pub fn client_url(&self) -> String {
         let host = match self.host.as_str() {

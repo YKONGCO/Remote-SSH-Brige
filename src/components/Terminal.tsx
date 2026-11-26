@@ -11,7 +11,7 @@ import {
   Maximize2,
   Server as ServerIcon,
 } from "lucide-react";
-import type { Server, Session } from "../types";
+import type { Server, Session, TerminalOpenRequest } from "../types";
 import { operate } from "../api";
 import { TerminalSession, type TerminalState } from "./TerminalSession";
 
@@ -20,6 +20,8 @@ export function Terminals({
   servers,
   onServerChange,
   sessions,
+  openRequest,
+  onOpenRequestConsumed,
   refresh,
   notify,
   headerHost,
@@ -29,6 +31,8 @@ export function Terminals({
   servers: Server[];
   onServerChange: (id: string) => void;
   sessions: Session[];
+  openRequest?: TerminalOpenRequest | null;
+  onOpenRequestConsumed?: () => void;
   refresh: () => Promise<void>;
   notify: (message: string, error?: boolean) => void;
 }) {
@@ -40,10 +44,17 @@ export function Terminals({
   );
   const [visited, setVisited] = useState<Set<string>>(() => new Set());
   const [states, setStates] = useState<Record<string, TerminalState>>({});
-  const [busy, setBusy] = useState(false);
+  const [creatingServers, setCreatingServers] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [focusRequest, setFocusRequest] = useState(0);
   const [closing, setClosing] = useState<Session | null>(null);
   const [closingId, setClosingId] = useState("");
-  const opening = useRef(false);
+  const creating = useRef(new Map<string, Promise<string | null>>());
+  const recent = useRef(new Map<string, { id: string; at: number }>());
+  const handledRequest = useRef(0);
+  const serverIdRef = useRef(server?.id);
+  serverIdRef.current = server?.id;
   const removing = useRef(false);
   const list = sessions.filter((s) => !server || s.server_id === server.id);
   const selected =
@@ -52,6 +63,7 @@ export function Terminals({
     list[0];
   const callbacks = useRef({ refresh, notify });
   callbacks.current = { refresh, notify };
+  const busy = server ? creatingServers.has(server.id) : false;
   useEffect(() => {
     void callbacks.current.refresh();
   }, []);
@@ -88,29 +100,106 @@ export function Terminals({
       ...previous,
       [session.server_id]: session.id,
     }));
+  const createSession = (target: Server): Promise<string | null> => {
+    const inflight = creating.current.get(target.id);
+    if (inflight) return inflight;
+    setCreatingServers((previous) => new Set(previous).add(target.id));
+    const promise = (async () => {
+      try {
+        const result = await operate<{ session_id: string }>({
+          kind: "terminal_open",
+          server_id: target.id,
+          cols: 100,
+          rows: 28,
+        });
+        recent.current.set(target.id, {
+          id: result.session_id,
+          at: Date.now(),
+        });
+        return result.session_id;
+      } catch (e) {
+        callbacks.current.notify(String(e), true);
+        return null;
+      } finally {
+        creating.current.delete(target.id);
+        setCreatingServers((previous) => {
+          const next = new Set(previous);
+          next.delete(target.id);
+          return next;
+        });
+      }
+    })();
+    creating.current.set(target.id, promise);
+    return promise;
+  };
+  const activateSession = async (
+    targetId: string,
+    sessionId: string,
+    refreshList: boolean,
+  ) => {
+    setActiveByServer((previous) => ({
+      ...previous,
+      [targetId]: sessionId,
+    }));
+    if (refreshList) await callbacks.current.refresh();
+    if (serverIdRef.current === targetId)
+      setFocusRequest((previous) => previous + 1);
+  };
+  const openForServer = async (target: Server) => {
+    if (!target.enabled) return;
+    const usable = (session: Session) =>
+      session.server_id === target.id &&
+      session.alive &&
+      states[session.id] !== "ended" &&
+      states[session.id] !== "error";
+    const available =
+      sessions.find(
+        (session) =>
+          session.id === activeByServer[target.id] && usable(session),
+      ) || sessions.find(usable);
+    if (available) {
+      await activateSession(target.id, available.id, false);
+      return;
+    }
+    const recentEntry = recent.current.get(target.id);
+    if (recentEntry && Date.now() - recentEntry.at < 3000) {
+      const known = sessions.find((session) => session.id === recentEntry.id);
+      if (!known) {
+        await activateSession(target.id, recentEntry.id, true);
+        return;
+      }
+      if (
+        known.alive &&
+        states[known.id] !== "ended" &&
+        states[known.id] !== "error"
+      ) {
+        await activateSession(target.id, known.id, false);
+        return;
+      }
+      recent.current.delete(target.id);
+    }
+    const sessionId = await createSession(target);
+    if (sessionId) await activateSession(target.id, sessionId, true);
+  };
   const open = async () => {
-    if (!server?.enabled || opening.current) return;
-    opening.current = true;
-    setBusy(true);
+    if (!server?.enabled) return;
     try {
-      const result = await operate<{ session_id: string }>({
-        kind: "terminal_open",
-        server_id: server.id,
-        cols: 100,
-        rows: 28,
-      });
-      setActiveByServer((previous) => ({
-        ...previous,
-        [server.id]: result.session_id,
-      }));
-      await refresh();
+      const target = server;
+      const sessionId = await createSession(target);
+      if (sessionId) await activateSession(target.id, sessionId, true);
     } catch (e) {
-      notify(String(e), true);
-    } finally {
-      opening.current = false;
-      setBusy(false);
+      callbacks.current.notify(String(e), true);
     }
   };
+  useEffect(() => {
+    if (!openRequest || !server || openRequest.serverId !== server.id) return;
+    if (handledRequest.current === openRequest.requestId) return;
+    handledRequest.current = openRequest.requestId;
+    onOpenRequestConsumed?.();
+    void openForServer(server).catch((e) =>
+      callbacks.current.notify(String(e), true),
+    );
+  }, [openRequest?.requestId, server?.id]);
   const close = async (session: Session) => {
     if (removing.current) return;
     removing.current = true;
@@ -296,6 +385,7 @@ export function Terminals({
                 key={session.id}
                 session={session}
                 active={session.id === selected?.id}
+                focusRequest={focusRequest}
                 enabled={
                   servers.find((item) => item.id === session.server_id)
                     ?.enabled ?? false

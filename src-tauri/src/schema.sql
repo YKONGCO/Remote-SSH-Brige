@@ -19,10 +19,16 @@ CREATE TABLE IF NOT EXISTS audit_entries (
     source TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL,
     success INTEGER NOT NULL CHECK(success IN (0,1)),
     duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0), summary TEXT NOT NULL,
-    response_json TEXT
+    response_json TEXT,
+    outcome TEXT NOT NULL DEFAULT 'success',
+    event_kind TEXT NOT NULL DEFAULT 'tool_call',
+    reason_code TEXT,
+    related_id TEXT
 );
 CREATE INDEX IF NOT EXISTS audit_server_sequence ON audit_entries(server_id,sequence DESC);
 CREATE INDEX IF NOT EXISTS audit_kind_sequence ON audit_entries(kind,sequence DESC);
+CREATE INDEX IF NOT EXISTS audit_outcome_sequence ON audit_entries(outcome,sequence DESC);
+CREATE INDEX IF NOT EXISTS audit_related ON audit_entries(related_id);
 CREATE TABLE IF NOT EXISTS transfer_tasks (
     id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, record_json TEXT NOT NULL
 );

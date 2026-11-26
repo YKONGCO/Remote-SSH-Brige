@@ -414,8 +414,15 @@ export async function api<T = unknown>(
         (a) =>
           (query.category === "all" ||
             (query.category === "mcp" && a.source === "mcp") ||
+            (query.category === "failed" &&
+              (a.outcome ?? (a.success ? "success" : "failed")) === "failed") ||
             (query.category === "error" &&
-              (!a.success || a.kind === "security_reject")) ||
+              (a.outcome ?? (a.success ? "success" : "failed")) === "failed") ||
+            (query.category === "nonzero" && a.outcome === "nonzero_exit") ||
+            (query.category === "security" &&
+              (a.kind.startsWith("security_") ||
+                a.outcome === "action_required" ||
+                a.outcome === "rejected")) ||
             (query.category === "exec" && a.kind === "exec") ||
             (query.category === "files" &&
               [
@@ -498,10 +505,13 @@ export async function api<T = unknown>(
     throw new Error("同步登录 PATH 需要在桌面应用中连接远端服务器。");
   if (command === "probe_host")
     return "SHA256:BrowserDemoFingerprintForPreviewOnly" as T;
+  if (command === "mcp_status") return { ...demo.mcp } as T;
   if (command === "start_mcp" || command === "stop_mcp")
     throw new Error(
       "MCP 服务需要在 Tauri 桌面应用中启动，浏览器只提供界面演示。",
     );
+  if (command.startsWith("update_"))
+    throw new Error("自动更新需要在桌面应用中使用。");
   throw new Error("未知操作");
 }
 export async function operate<T = Record<string, unknown>>(

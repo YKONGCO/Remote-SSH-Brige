@@ -64,6 +64,7 @@ pub fn success(op: &Operation, value: &Value) -> CallToolResult {
                 item["command"] = json!(bounded(field(job, "command"), 200));
                 item
             })}),
+            "close" => return text("Job closed."),
             _ => return command_output(value, false),
         },
         "read_file" => return read_file(value),
@@ -196,96 +197,149 @@ fn streams(value: &Value) -> String {
     }
 }
 
-fn stream_cursors(
-    value: &Value,
-    can_read: bool,
-    running: bool,
-    notices: &mut Vec<String>,
-) -> Value {
-    let mut metadata = json!({});
-    let continue_reading = can_read
-        && (running
-            || [
-                "stdout_truncated",
-                "stderr_truncated",
-                "stdout_has_more",
-                "stderr_has_more",
-            ]
-            .iter()
-            .any(|key| value[*key] == true));
-    for (name, next, truncated) in [
-        ("stdout_cursor", "next_stdout_cursor", "stdout_truncated"),
-        ("stderr_cursor", "next_stderr_cursor", "stderr_truncated"),
-    ] {
-        if value[truncated] == true {
-            notices.push(format!("Earlier {} lost", name.trim_end_matches("_cursor")));
-        }
-        if continue_reading {
-            if let Some(cursor) = value[next].as_u64() {
-                notices.push(format!("{name}={cursor}"));
-                metadata[name] = json!(cursor);
-            }
+fn notice_blocks(blocks: Vec<String>) -> String {
+    blocks
+        .into_iter()
+        .filter(|block| !block.is_empty())
+        .map(|block| format!("[{block}]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn lost_notice(value: &Value, name: &str, readable: bool) -> Option<String> {
+    if value[format!("{name}_truncated")] != true {
+        return None;
+    }
+    let mut text = match value[format!("{name}_lost_bytes")]
+        .as_u64()
+        .filter(|bytes| *bytes > 0)
+    {
+        Some(bytes) => format!("Earlier {name} lost: {bytes} bytes."),
+        None => format!("Earlier {name} lost."),
+    };
+    if readable {
+        if let Some(cursor) = value[format!("next_{name}_cursor")].as_u64() {
+            text.push_str(&format!("\nContinuing from {name}_cursor={cursor}."));
         }
     }
-    metadata
+    Some(text)
 }
 
 fn command_output(value: &Value, foreground: bool) -> CallToolResult {
-    let mut body = streams(value);
+    let job_id = field(value, "job_id");
+    if foreground && !job_id.is_empty() {
+        return text(if field(value, "status") == "running" {
+            format!(
+                "Command still running: {job_id}.\nUse job.read with stdout_cursor=0, stderr_cursor=0, wait_secs=10."
+            )
+        } else {
+            format!(
+                "Command finished: {job_id}.\nUse job.read with stdout_cursor=0, stderr_cursor=0 to read the output."
+            )
+        });
+    }
+    let body = streams(value);
     let status = field(value, "status");
     let running = status == "running";
+    let readable = !foreground;
     let more = value["stdout_has_more"] == true || value["stderr_has_more"] == true;
-    let mut notices = Vec::new();
-    let mut metadata = stream_cursors(value, !foreground || running, running, &mut notices);
+    let mut metadata = json!({});
+    let mut blocks = Vec::new();
+    for name in ["stdout", "stderr"] {
+        if let Some(notice) = lost_notice(value, name, readable) {
+            blocks.push(notice);
+        }
+    }
+    let mut status_parts = Vec::new();
     if running {
         metadata["status"] = json!(status);
-        let label = if foreground {
-            metadata["job_id"] = value["job_id"].clone();
-            format!("Running: {}. Use job.read", field(value, "job_id"))
-        } else if body.is_empty() {
-            "Running; no new output".into()
+        status_parts.push(
+            if value["closing"] == true {
+                "Closing"
+            } else {
+                "Running"
+            }
+            .into(),
+        );
+        if readable {
+            for (name, advanced) in [
+                (
+                    "stdout",
+                    value["stdout_advanced"] == true || value["stdout_has_more"] == true,
+                ),
+                (
+                    "stderr",
+                    value["stderr_advanced"] == true || value["stderr_has_more"] == true,
+                ),
+            ] {
+                if advanced {
+                    if let Some(cursor) = value[format!("next_{name}_cursor")].as_u64() {
+                        status_parts.push(format!("{name}_cursor={cursor}"));
+                        metadata[format!("{name}_cursor")] = json!(cursor);
+                    }
+                }
+            }
+        }
+        if body.is_empty() && blocks.is_empty() && status_parts.len() == 1 {
+            return text(format!("{}; no new output.", status_parts[0]));
+        }
+    } else if status == "exited" || value["exit_code"].is_number() {
+        if let Some(code) = value["exit_code"].as_i64() {
+            if code != 0 || !foreground {
+                status_parts.push(format!("Exited {code}"));
+            }
+            if code != 0 {
+                metadata["exit_code"] = json!(code);
+            }
         } else {
-            "Running".into()
-        };
-        notices.insert(0, label);
-    } else if let Some(code) = value["exit_code"].as_i64().filter(|code| *code != 0) {
-        metadata["exit_code"] = json!(code);
-        body = if body.is_empty() {
-            format!("Exit {code}")
-        } else if field(value, "stdout").is_empty() {
-            format!("Exit {code}\n{}", field(value, "stderr"))
-        } else {
-            format!("Exit {code}\n{body}")
-        };
-    } else if !matches!(status, "" | "exited") {
+            status_parts.push("Exited".into());
+        }
+        if more {
+            status_parts.push("more output available".into());
+            if readable {
+                for name in ["stdout", "stderr"] {
+                    if value[format!("{name}_has_more")] == true {
+                        if let Some(cursor) = value[format!("next_{name}_cursor")].as_u64() {
+                            status_parts.push(format!("{name}_cursor={cursor}"));
+                            metadata[format!("{name}_cursor")] = json!(cursor);
+                        }
+                    }
+                }
+            }
+        }
+    } else if !status.is_empty() {
         metadata["status"] = json!(status);
-        notices.insert(
-            0,
+        status_parts.push(
             if status == "disconnected" {
                 "Disconnected; execution outcome unknown. Inspect remote state before retrying"
-                    .into()
+            } else if status == "closed" {
+                "Job closed"
             } else {
-                status.into()
-            },
+                status
+            }
+            .into(),
         );
     }
+    if !status_parts.is_empty() {
+        blocks.insert(0, status_parts.join("; "));
+    }
     if let Some(error) = diagnostic(&value["error"]) {
-        notices.push(error);
+        blocks.push(error);
     }
-    if more {
-        notices.insert(0, "More output available".into());
-    }
-    if body.is_empty() && notices.is_empty() {
-        body = "OK".into();
-    }
-    report(body, notice(notices), metadata)
+    report(
+        if body.is_empty() && blocks.is_empty() {
+            "OK".into()
+        } else {
+            body
+        },
+        notice_blocks(blocks),
+        metadata,
+    )
 }
 
 pub fn progress(value: &Value) -> Option<String> {
-    let mut notices = Vec::new();
-    stream_cursors(value, true, true, &mut notices);
     let output = streams(value);
-    (!output.is_empty() || !notices.is_empty()).then(|| format!("{output}\n{}", notice(notices)))
+    (!output.is_empty()).then_some(output)
 }
 
 fn notice(parts: Vec<String>) -> String {
@@ -486,9 +540,13 @@ pub fn failure(op: &Operation, error: &anyhow::Error) -> CallToolResult {
             content.push(ContentBlock::text(error));
         }
         let mut notices = Vec::new();
-        stream_cursors(output, false, false, &mut notices);
+        for name in ["stdout", "stderr"] {
+            if let Some(notice) = lost_notice(output, name, false) {
+                notices.push(notice);
+            }
+        }
         if !notices.is_empty() {
-            content.push(ContentBlock::text(notice(notices)));
+            content.push(ContentBlock::text(notice_blocks(notices)));
         }
     }
     CallToolResult::error(content)
@@ -612,7 +670,7 @@ mod tests {
         assert_eq!(blocks(&result), ["  ready\r\n"]);
         assert!(result.structured_content.is_none());
         let result = present("exec", json!({"exit_code":2,"stderr":"missing\n"}));
-        assert_eq!(blocks(&result), ["Exit 2\nmissing\n"]);
+        assert_eq!(blocks(&result), ["stderr:\nmissing\n", "[Exited 2]"]);
         assert_ne!(result.is_error, Some(true));
         assert_eq!(result.structured_content, Some(json!({"exit_code":2})));
         assert_eq!(blocks(&present("exec", json!({"exit_code":0}))), ["OK"]);
@@ -625,7 +683,97 @@ mod tests {
             json!({"stdout":"tail","status":"exited","exit_code":0,
                 "stdout_truncated":true,"next_stdout_cursor":900}),
         );
-        assert_eq!(blocks(&result), ["tail", "[Earlier stdout lost]"]);
+        assert_eq!(blocks(&result), ["tail", "[Earlier stdout lost.]"]);
+        assert!(result.structured_content.is_none());
+    }
+
+    #[test]
+    fn exec_handoff_reports_only_the_job_and_how_to_read_it() {
+        let result = present(
+            "exec",
+            json!({"job_id":"job_123","server_id":"server-1","status":"running"}),
+        );
+        assert_eq!(
+            blocks(&result),
+            ["Command still running: job_123.\nUse job.read with stdout_cursor=0, stderr_cursor=0, wait_secs=10."]
+        );
+        assert!(result.structured_content.is_none());
+        let result = present(
+            "exec",
+            json!({"job_id":"job_123","server_id":"server-1","status":"exited"}),
+        );
+        assert!(blocks(&result)[0].starts_with("Command finished: job_123."));
+    }
+
+    #[test]
+    fn job_reads_report_incremental_cursors_status_and_lost_bytes() {
+        let result = command_output(
+            &json!({
+                "stdout":"loading\n", "status":"running",
+                "stdout_advanced":true, "stderr_advanced":false,
+                "next_stdout_cursor":8, "next_stderr_cursor":0
+            }),
+            false,
+        );
+        assert_eq!(blocks(&result), ["loading\n", "[Running; stdout_cursor=8]"]);
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"status":"running","stdout_cursor":8}))
+        );
+        assert_eq!(
+            blocks(&command_output(
+                &json!({"status":"running","stdout_advanced":false,"stderr_advanced":false}),
+                false
+            )),
+            ["Running; no new output."]
+        );
+        let result = command_output(
+            &json!({
+                "stdout":"partial", "status":"exited", "exit_code":1,
+                "stdout_has_more":true, "next_stdout_cursor":400
+            }),
+            false,
+        );
+        assert_eq!(
+            blocks(&result),
+            [
+                "partial",
+                "[Exited 1; more output available; stdout_cursor=400]"
+            ]
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"exit_code":1,"stdout_cursor":400}))
+        );
+        let result = command_output(
+            &json!({
+                "stdout":"resumed", "status":"exited", "exit_code":0,
+                "stdout_truncated":true, "stdout_lost_bytes":8192, "next_stdout_cursor":8200
+            }),
+            false,
+        );
+        assert_eq!(
+            blocks(&result),
+            [
+                "resumed",
+                "[Exited 0]\n[Earlier stdout lost: 8192 bytes.\nContinuing from stdout_cursor=8200.]"
+            ]
+        );
+    }
+
+    #[test]
+    fn job_close_returns_only_the_close_confirmation() {
+        let op = Operation {
+            kind: "job".into(),
+            job_action: "close".into(),
+            job_id: "job_1".into(),
+            ..Default::default()
+        };
+        let result = success(
+            &op,
+            &json!({"job_id":"job_1","status":"closed","closed":true}),
+        );
+        assert_eq!(blocks(&result), ["Job closed."]);
         assert!(result.structured_content.is_none());
     }
 
@@ -711,13 +859,10 @@ mod tests {
             blocks(&job),
             [
                 "output",
-                "[More output available; Earlier stdout lost; stdout_cursor=400; stderr_cursor=7]"
+                "[Exited 0; more output available; stdout_cursor=400]\n[Earlier stdout lost.\nContinuing from stdout_cursor=400.]"
             ]
         );
-        assert_eq!(
-            job.structured_content,
-            Some(json!({"stdout_cursor":400,"stderr_cursor":7}))
-        );
+        assert_eq!(job.structured_content, Some(json!({"stdout_cursor":400})));
         let terminal = present(
             "terminal_read",
             json!({

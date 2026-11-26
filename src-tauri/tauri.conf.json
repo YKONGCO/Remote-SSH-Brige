@@ -29,5 +29,13 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "RWRyiXwdvlAcO7kX1u2D+bHAf6t7b8632FxVtn0xhi7tTj0AqLlVHNP/",
+      "endpoints": [
+        "https://github.com/YKONGCO/Remote-SSH-Brige/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

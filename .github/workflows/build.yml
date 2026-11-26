@@ -20,9 +20,13 @@ jobs:
     name: Windows x64
     runs-on: windows-2022
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     defaults:
       run:
         shell: pwsh
@@ -81,7 +85,12 @@ jobs:
       - name: Test MCP and SSH protocol
         run: npm run test:e2e
 
-      - name: Build desktop installer
+      - name: Build signed desktop installer with updater artifacts
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: npm run desktop:build -- --ci --bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked
+
+      - name: Build unsigned desktop installer
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
         run: npm run desktop:build -- --ci --bundles nsis -- --locked
 
       - name: Prepare downloadable packages
@@ -95,6 +104,25 @@ jobs:
           $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer.' }
           Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          $updater = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.nsis.zip' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($updater) {
+            Copy-Item -LiteralPath $updater.FullName -Destination $output
+            $signaturePath = "$($updater.FullName).sig"
+            if (Test-Path $signaturePath) {
+              Copy-Item -LiteralPath $signaturePath -Destination $output
+              $signature = (Get-Content $signaturePath -Raw).Trim()
+              $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$($updater.Name)"
+              @{
+                version = $version
+                notes = ''
+                pub_date = (Get-Date).ToUniversalTime().ToString('o')
+                platforms = @{
+                  'windows-x86_64' = @{ signature = $signature; url = $url }
+                }
+              } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'latest.json') -Encoding utf8
+            }
+          }
           Copy-Item -LiteralPath 'src-tauri/target/release/remote-ssh-brige.exe', 'LICENSE' -Destination $portable
           @(
             "Remote SSH Brige $version - Windows x64"
@@ -126,11 +154,29 @@ jobs:
           path: |
             .artifacts/packages/*.exe
             .artifacts/packages/*.zip
+            .artifacts/packages/*.sig
+            .artifacts/packages/latest.json
             .artifacts/packages/SHA256SUMS.txt
           include-hidden-files: true
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Publish signed Windows update assets
+        if: startsWith(github.ref, 'refs/tags/') && env.TAURI_SIGNING_PRIVATE_KEY != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:GITHUB_REF_NAME --title $env:GITHUB_REF_NAME --generate-notes
+          }
+          gh release upload $env:GITHUB_REF_NAME `
+            .artifacts/packages/*.exe `
+            .artifacts/packages/*.zip `
+            .artifacts/packages/*.sig `
+            .artifacts/packages/latest.json `
+            --clobber
 
       - name: Upload protocol test reports
         if: always()

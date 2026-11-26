@@ -24,6 +24,18 @@ export interface Server {
 export interface LoginPathUpdate {
   value: string | null;
 }
+export type AuditOutcome =
+  | "success"
+  | "running"
+  | "nonzero_exit"
+  | "action_required"
+  | "rejected"
+  | "cancelled"
+  | "partial"
+  | "unknown"
+  | "failed";
+export type AuditEventKind =
+  "tool_call" | "job_finished" | "approval_decision" | "transfer_finished";
 export interface Audit {
   id: string;
   time: string;
@@ -35,6 +47,10 @@ export interface Audit {
   success: boolean;
   duration_ms: number;
   summary: string;
+  outcome?: AuditOutcome;
+  event_kind?: AuditEventKind;
+  reason_code?: string | null;
+  related_id?: string | null;
   response?: {
     data: Record<string, unknown>;
     truncated: boolean;
@@ -48,6 +64,10 @@ export interface Session {
   created_at: string;
   alive: boolean;
   state?: "opening" | "running" | "closing" | "closed" | "disconnected";
+}
+export interface TerminalOpenRequest {
+  serverId: string;
+  requestId: number;
 }
 export interface AuditQuery {
   category: string;
@@ -74,6 +94,12 @@ export interface McpStatus {
   port: number;
   token: string;
   error?: string;
+}
+export type UpdaterPhase = "idle" | "preparing" | "stopping_mcp" | "updating";
+export interface UpdateStatus {
+  phase: UpdaterPhase;
+  mcp_running: boolean;
+  mcp_active_requests: number;
 }
 export interface Snapshot {
   servers: Server[];

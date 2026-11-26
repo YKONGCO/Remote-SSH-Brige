@@ -384,3 +384,126 @@ test("remote EOF drains remaining text pages before stopping", async () => {
     vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "terminal_read"),
   ).toHaveLength(2);
 });
+
+test("new terminal button creates sessions independently", async () => {
+  let created = 0;
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "terminal_open")
+      return { session_id: `new-${++created}` } as never;
+    return { stdout: "", cursor: 0, alive: true, truncated: false } as never;
+  });
+  const input = { ...props(), sessions: [] as Session[] };
+  await act(async () => {
+    render(<Terminals {...input} />);
+  });
+  const button = screen.getByRole("button", { name: "新建终端" });
+  await act(async () => {
+    fireEvent.click(button);
+    await Promise.resolve();
+  });
+  await act(async () => {
+    fireEvent.click(button);
+    await Promise.resolve();
+  });
+  expect(
+    vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "terminal_open"),
+  ).toHaveLength(2);
+});
+
+test("open request reuses the active live terminal and focuses it", async () => {
+  vi.useFakeTimers();
+  stubOperations();
+  const input = props();
+  let view!: ReturnType<typeof render>;
+  await act(async () => {
+    view = render(<Terminals {...input} />);
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("tab", { name: "终端 2" }));
+  });
+  expect(
+    screen.getByRole("tab", { name: "终端 2" }).getAttribute("aria-selected"),
+  ).toBe("true");
+  instances[1].focus.mockClear();
+  const consumed = vi.fn();
+  await act(async () => {
+    view.rerender(
+      <Terminals
+        {...input}
+        openRequest={{ serverId: "a", requestId: 1 }}
+        onOpenRequestConsumed={consumed}
+      />,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+  });
+  expect(
+    vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "terminal_open"),
+  ).toHaveLength(0);
+  expect(
+    screen.getByRole("tab", { name: "终端 2" }).getAttribute("aria-selected"),
+  ).toBe("true");
+  expect(instances[1].focus).toHaveBeenCalled();
+  expect(consumed).toHaveBeenCalledTimes(1);
+});
+
+test("rapid open requests share one terminal creation", async () => {
+  vi.useFakeTimers();
+  let finish!: (value: unknown) => void;
+  const pending = new Promise<unknown>((resolve) => {
+    finish = resolve;
+  });
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "terminal_open") return pending as never;
+    return { stdout: "", cursor: 0, alive: true, truncated: false } as never;
+  });
+  const input = { ...props(), sessions: [] as Session[] };
+  const consumed = vi.fn();
+  let view!: ReturnType<typeof render>;
+  await act(async () => {
+    view = render(
+      <Terminals
+        {...input}
+        openRequest={{ serverId: "a", requestId: 1 }}
+        onOpenRequestConsumed={consumed}
+      />,
+    );
+    await Promise.resolve();
+  });
+  await act(async () => {
+    view.rerender(
+      <Terminals
+        {...input}
+        openRequest={{ serverId: "a", requestId: 2 }}
+        onOpenRequestConsumed={consumed}
+      />,
+    );
+    await Promise.resolve();
+  });
+  expect(
+    vi.mocked(operate).mock.calls.filter(([op]) => op.kind === "terminal_open"),
+  ).toHaveLength(1);
+  await act(async () => {
+    finish({ session_id: "a3" });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  await act(async () => {
+    view.rerender(
+      <Terminals
+        {...input}
+        sessions={[
+          {
+            id: "a3",
+            server_id: "a",
+            name: "A third",
+            alive: true,
+            created_at: "2026-11-01T00:00:00Z",
+          },
+        ]}
+      />,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+  });
+  expect(screen.getByRole("tab", { name: "终端 1" })).toBeTruthy();
+  expect(input.refresh).toHaveBeenCalled();
+});

@@ -10,13 +10,15 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Files } from "../components/Files";
+import { Files, getAbsolutePath, getRelativePath } from "../components/Files";
 import { api, operate } from "../api";
 import { defaultRuntimeSettings } from "../runtime-settings";
 import { newServer } from "../types";
 import { TransferPanel } from "../components/TransferPanel";
 import type { FileTransfer } from "../transfers";
 
+const clipboard = vi.hoisted(() => ({ writeText: vi.fn() }));
+vi.mock("@tauri-apps/plugin-clipboard-manager", () => clipboard);
 vi.mock("../api", () => ({ desktop: true, api: vi.fn(), operate: vi.fn() }));
 
 type DropHandlers = {
@@ -547,6 +549,93 @@ test("native transfers pass only file-selection parameters and never file conten
   expect(
     vi.mocked(operate).mock.calls.every(([op]) => op.kind === "list_files"),
   ).toBe(true);
+});
+
+test("path helpers use the current remote directory and POSIX separators", () => {
+  const entry = {
+    name: "模型 1.py",
+    path: "/srv/projects/demo/模型 1.py",
+    is_dir: false,
+    size: 1,
+    modified: 0,
+    permissions: "644",
+  };
+  expect(getRelativePath("/srv/projects/demo", entry)).toBe("./模型 1.py");
+  expect(getAbsolutePath(entry)).toBe("/srv/projects/demo/模型 1.py");
+  expect(
+    getRelativePath("/", {
+      ...entry,
+      name: "README.md",
+      path: "/README.md",
+    }),
+  ).toBe("./README.md");
+});
+
+test("file rows keep download and move copy, rename and delete into the menu", async () => {
+  localStorage.clear();
+  clipboard.writeText.mockResolvedValue(undefined);
+  const notify = vi.fn();
+  vi.mocked(api).mockImplementation(async (command) =>
+    command === "runtime_settings"
+      ? ({ ...defaultRuntimeSettings } as never)
+      : (null as never),
+  );
+  vi.mocked(operate).mockImplementation(async (op) => {
+    if (op.kind === "list_files")
+      return {
+        path: "/srv/projects/demo",
+        entries: [
+          {
+            name: "train.py",
+            path: "/srv/projects/demo/train.py",
+            is_dir: false,
+            size: 12,
+            modified: 0,
+            permissions: "644",
+          },
+        ],
+      } as never;
+    return {} as never;
+  });
+  const user = userEvent.setup();
+  render(
+    <Files
+      server={{ ...newServer(), id: "server", root: "/srv/projects/demo" }}
+      refresh={vi.fn()}
+      notify={notify}
+    />,
+  );
+  const name = await screen.findByRole("button", { name: "train.py" });
+  const row = name.closest("tr")!;
+  expect(within(row).getByTitle("下载")).toBeTruthy();
+  expect(within(row).queryByTitle("重命名")).toBeNull();
+  expect(within(row).queryByTitle("删除")).toBeNull();
+
+  await user.click(
+    within(row).getByRole("button", { name: "更多操作 train.py" }),
+  );
+  await user.click(screen.getByRole("menuitem", { name: "复制相对路径" }));
+  await waitFor(() =>
+    expect(clipboard.writeText).toHaveBeenCalledWith("./train.py"),
+  );
+  expect(notify).toHaveBeenCalledWith("已复制相对路径");
+
+  await user.click(
+    within(row).getByRole("button", { name: "更多操作 train.py" }),
+  );
+  await user.click(screen.getByRole("menuitem", { name: "复制绝对路径" }));
+  await waitFor(() =>
+    expect(clipboard.writeText).toHaveBeenCalledWith(
+      "/srv/projects/demo/train.py",
+    ),
+  );
+  expect(notify).toHaveBeenCalledWith("已复制绝对路径");
+
+  await user.click(
+    within(row).getByRole("button", { name: "更多操作 train.py" }),
+  );
+  expect(screen.getByRole("menuitem", { name: "重命名" })).toBeTruthy();
+  expect(screen.getByRole("menuitem", { name: "删除" })).toBeTruthy();
 });
 
 test("shows transfer history only after opening the toolbar transfer menu", async () => {

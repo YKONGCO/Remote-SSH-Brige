@@ -392,11 +392,25 @@ fn destructive_path(sftp: &Sftp, server: &Server, value: &str) -> Result<PathBuf
 pub fn operate(server: &Server, op: &Operation) -> Result<Value> {
     operate_with_settings(server, op, &RuntimeSettings::default())
 }
-pub fn operate_with_settings(
-    server: &Server,
-    op: &Operation,
-    settings: &RuntimeSettings,
-) -> Result<Value> {
+pub(crate) fn uses_session_pool(op: &Operation) -> bool {
+    matches!(
+        op.kind.as_str(),
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "list_files"
+            | "stat_file"
+            | "remove_path"
+            | "preview_file"
+            | "download"
+            | "upload"
+            | "mkdir"
+            | "remove"
+            | "rename"
+    )
+}
+
+pub fn prepare_operation(op: &Operation, settings: &RuntimeSettings) -> Result<Option<Vec<u8>>> {
     anyhow::ensure!(
         op.kind != "exec",
         "Use state::execute for managed SSH execution"
@@ -404,7 +418,6 @@ pub fn operate_with_settings(
     settings.validate()?;
     validate_payload(op, settings)?;
     let limit = settings.transfer_limit(&op.kind);
-
     if op.kind == "upload" && op.content.len() as u64 > ((limit + 2) / 3) * 4 {
         bail!(
             "File exceeds the {} MiB upload limit",
@@ -417,7 +430,7 @@ pub fn operate_with_settings(
             settings.upload_limit_mib
         )
     }
-    let upload_bytes = if op.kind == "upload" {
+    if op.kind == "upload" {
         let bytes = STANDARD.decode(&op.content)?;
         if bytes.len() as u64 > limit {
             bail!(
@@ -425,14 +438,33 @@ pub fn operate_with_settings(
                 settings.upload_limit_mib
             )
         }
-        Some(bytes)
+        Ok(Some(bytes))
     } else {
-        None
-    };
-    let session = connect_with_settings(server, settings)?;
-    if op.kind == "test" {
-        return Ok(json!({"connected": true, "fingerprint": fingerprint(&session)?}));
+        Ok(None)
     }
+}
+
+pub fn operate_with_settings(
+    server: &Server,
+    op: &Operation,
+    settings: &RuntimeSettings,
+) -> Result<Value> {
+    let upload_bytes = prepare_operation(op, settings)?;
+    let session = connect_with_settings(server, settings)?;
+    operate_with_session(server, op, settings, &session, upload_bytes.as_deref())
+}
+
+pub fn operate_with_session(
+    server: &Server,
+    op: &Operation,
+    settings: &RuntimeSettings,
+    session: &Session,
+    upload_bytes: Option<&[u8]>,
+) -> Result<Value> {
+    if op.kind == "test" {
+        return Ok(json!({"connected": true, "fingerprint": fingerprint(session)?}));
+    }
+    let limit = settings.transfer_limit(&op.kind);
     let sftp = session.sftp()?;
     if let Some(FileRequest::Remove {
         recursive,
@@ -628,7 +660,9 @@ pub fn operate_with_settings(
             }
             let p = remote_path(&sftp, server, &op.path, true)?;
             let bytes = if op.kind == "upload" {
-                upload_bytes.context("Upload content was not decoded")?
+                upload_bytes
+                    .context("Upload content was not decoded")?
+                    .to_vec()
             } else {
                 op.content.as_bytes().to_vec()
             };

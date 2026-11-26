@@ -1,9 +1,37 @@
 import { useEffect, useState } from "react";
 import { Copy, RefreshCw, X } from "lucide-react";
 import { api } from "../api";
-import { labels, type Audit } from "../types";
+import { labels, type Audit, type AuditOutcome } from "../types";
 import { ModalFrame, DialogTitle } from "./ModalFrame";
 import { Button } from "./ui/button";
+
+const outcomeLabels: Record<AuditOutcome, string> = {
+  success: "成功",
+  running: "运行中",
+  nonzero_exit: "非零退出",
+  action_required: "需要处理",
+  rejected: "已拒绝",
+  cancelled: "已取消",
+  partial: "部分完成",
+  unknown: "结果未知",
+  failed: "失败",
+};
+const outcomeClasses: Record<AuditOutcome, string> = {
+  success: "success",
+  running: "running",
+  nonzero_exit: "warning",
+  action_required: "neutral",
+  rejected: "neutral",
+  cancelled: "neutral",
+  partial: "warning",
+  unknown: "warning",
+  failed: "failed",
+};
+function outcomeOf(detail: Audit): AuditOutcome {
+  if (detail.outcome) return detail.outcome;
+  if (detail.kind === "security_reject") return "rejected";
+  return detail.success ? "success" : "failed";
+}
 
 export function AuditDetails({
   entry,
@@ -157,9 +185,15 @@ export function AuditDetails({
           <span
             className={
               "audit-result " +
-              ((approvalResult ? approvalResult === "已批准" : detail.success)
-                ? "success"
-                : "failed")
+              (approvalResult
+                ? approvalResult === "已批准"
+                  ? "success"
+                  : "neutral"
+                : detail.kind === "security_approve"
+                  ? "success"
+                  : detail.kind === "security_reject"
+                    ? "neutral"
+                    : outcomeClasses[outcomeOf(detail)])
             }
           >
             {approvalResult ||
@@ -167,9 +201,7 @@ export function AuditDetails({
                 ? "已批准"
                 : detail.kind === "security_reject"
                   ? "已拒绝"
-                  : detail.success
-                    ? "成功"
-                    : "失败")}
+                  : outcomeLabels[outcomeOf(detail)])}
           </span>
           <Button
             variant="ghost"
@@ -186,6 +218,10 @@ export function AuditDetails({
             <span>{labels[detail.kind] || detail.kind}</span>
             <span>{detail.server_name}</span>
             <span>{detail.source === "mcp" ? "MCP" : "手动操作"}</span>
+            {detail.kind === "job" && detail.summary && (
+              <span>{detail.summary}</span>
+            )}
+            {detail.reason_code && <span>{detail.reason_code}</span>}
             <span>{detail.duration_ms} 毫秒</span>
             <time>
               {new Date(detail.time).toLocaleString("zh-CN", { hour12: false })}

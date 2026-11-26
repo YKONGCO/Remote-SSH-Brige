@@ -583,11 +583,18 @@ mod desktop {
             .map_err(|e| format!("{e:#}"))
     }
     #[tauri::command]
+    fn mcp_status(state: Shared<'_>) -> model::McpStatus {
+        state.mcp.lock().unwrap().clone()
+    }
+    #[tauri::command]
     async fn start_mcp(
         state: Shared<'_>,
         port: u16,
         host: Option<String>,
     ) -> Result<model::McpStatus, String> {
+        if *state.update.lock().unwrap() != model::UpdaterPhase::Idle {
+            return Err("UPDATE_IN_PROGRESS: MCP cannot start during an update".into());
+        }
         mcp::start_on(
             state.inner().clone(),
             port,
@@ -602,9 +609,98 @@ mod desktop {
             .await
             .map_err(|e| format!("{e:#}"))
     }
+    #[tauri::command]
+    fn update_status(state: Shared<'_>) -> model::UpdateStatus {
+        state.update_status()
+    }
+    #[tauri::command]
+    fn update_prepare(state: Shared<'_>) -> Result<model::UpdateStatus, String> {
+        state.begin_update().map_err(|e| format!("{e:#}"))
+    }
+    #[tauri::command]
+    async fn update_begin_install(state: Shared<'_>) -> Result<model::UpdateStatus, String> {
+        let mut phase = state.update.lock().unwrap();
+        if !matches!(
+            *phase,
+            model::UpdaterPhase::Preparing | model::UpdaterPhase::StoppingMcp
+        ) {
+            return Err("UPDATE_NOT_PREPARED: Check for updates first".into());
+        }
+        *phase = model::UpdaterPhase::Updating;
+        drop(phase);
+        Ok(state.update_status())
+    }
+    #[tauri::command]
+    async fn update_stop_mcp(state: Shared<'_>) -> Result<model::UpdateStatus, String> {
+        {
+            let mut phase = state.update.lock().unwrap();
+            if !matches!(
+                *phase,
+                model::UpdaterPhase::Preparing | model::UpdaterPhase::StoppingMcp
+            ) {
+                return Err("UPDATE_NOT_PREPARED: Check for updates first".into());
+            }
+            *phase = model::UpdaterPhase::StoppingMcp;
+        }
+        for _ in 0..50 {
+            if state.mcp_active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if state.mcp_active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            state.set_update_phase(model::UpdaterPhase::Idle);
+            return Err("MCP 仍有正在执行的请求，更新未开始。请稍后重试。".into());
+        }
+        if state.mcp.lock().unwrap().running {
+            if let Err(error) = mcp::stop(state.inner().clone()).await {
+                state.set_update_phase(model::UpdaterPhase::Idle);
+                return Err(format!("无法关闭 MCP 服务，更新未执行：{error:#}"));
+            }
+        }
+        if state.mcp.lock().unwrap().running {
+            state.set_update_phase(model::UpdaterPhase::Idle);
+            return Err("MCP 服务仍在运行，更新未执行。".into());
+        }
+        state.set_update_phase(model::UpdaterPhase::Updating);
+        Ok(state.update_status())
+    }
+    #[tauri::command]
+    fn update_cancel(state: Shared<'_>) -> Result<model::UpdateStatus, String> {
+        let mut phase = state.update.lock().unwrap();
+        if *phase == model::UpdaterPhase::Updating {
+            return Err("UPDATE_ALREADY_STARTED: The update is already being installed".into());
+        }
+        *phase = model::UpdaterPhase::Idle;
+        drop(phase);
+        Ok(state.update_status())
+    }
+    #[tauri::command]
+    async fn update_failed(
+        state: Shared<'_>,
+        restore_mcp: bool,
+    ) -> Result<model::UpdateStatus, String> {
+        let restore = restore_mcp
+            && state.update_status().phase == model::UpdaterPhase::Updating
+            && !state.mcp.lock().unwrap().running;
+        let restored = if restore {
+            let settings = state.settings.lock().unwrap().clone();
+            Some(mcp::start_on(state.inner().clone(), settings.mcp_port, &settings.mcp_host).await)
+        } else {
+            None
+        };
+        state.set_update_phase(model::UpdaterPhase::Idle);
+        if let Some(Err(error)) = restored {
+            return Err(format!("MCP 服务恢复失败，请手动启动：{error:#}"));
+        }
+        Ok(state.update_status())
+    }
     pub fn run() {
         tauri::Builder::default()
             .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init())
+            .plugin(tauri_plugin_clipboard_manager::init())
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
                 show_main(app);
             }))
@@ -691,8 +787,15 @@ mod desktop {
                 remove_server,
                 probe_host,
                 operate,
+                mcp_status,
                 start_mcp,
-                stop_mcp
+                stop_mcp,
+                update_status,
+                update_prepare,
+                update_begin_install,
+                update_stop_mcp,
+                update_cancel,
+                update_failed
             ])
             .build(tauri::generate_context!())
             .expect("启动 Remote SSH Brige 失败")

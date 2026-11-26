@@ -85,6 +85,235 @@ fn audit_recognizes_successful_port_forward_close_without_hiding_failures() {
 }
 
 #[test]
+fn job_queries_succeed_independently_of_the_remote_task_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().into()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    for (action, value, success, summary) in [
+        (
+            "read",
+            serde_json::json!({"status":"exited","exit_code":1}),
+            true,
+            "已读取",
+        ),
+        (
+            "read",
+            serde_json::json!({"status":"disconnected","exit_code":null}),
+            true,
+            "已读取",
+        ),
+        (
+            "close",
+            serde_json::json!({"status":"closed","closed":true}),
+            true,
+            "已关闭",
+        ),
+        (
+            "finish",
+            serde_json::json!({"status":"exited","exit_code":1}),
+            false,
+            "非零退出",
+        ),
+        (
+            "finish",
+            serde_json::json!({"status":"exited","exit_code":0}),
+            true,
+            "正常结束",
+        ),
+        (
+            "finish",
+            serde_json::json!({"status":"disconnected","exit_code":null}),
+            false,
+            "结果未知",
+        ),
+    ] {
+        let op = Operation {
+            kind: "job".into(),
+            job_action: action.into(),
+            job_id: "job_1".into(),
+            ..Default::default()
+        };
+        state.log(&saved, "mcp", &op, &Ok(value), 5).unwrap();
+        let entry = state.audit.lock().unwrap().last().unwrap().clone();
+        assert_eq!(entry.success, success, "{action}");
+        assert!(entry.summary.contains(summary), "{}", entry.summary);
+        assert_eq!(entry.duration_ms, 5);
+    }
+    let op = Operation {
+        kind: "job".into(),
+        job_action: "read".into(),
+        job_id: "missing".into(),
+        ..Default::default()
+    };
+    state
+        .log(
+            &saved,
+            "mcp",
+            &op,
+            &Err(anyhow::anyhow!("JOB_NOT_FOUND: Job does not exist")),
+            5,
+        )
+        .unwrap();
+    assert!(!state.audit.lock().unwrap().last().unwrap().success);
+}
+
+#[test]
+fn audit_outcome_filters_separate_failures_from_nonzero_exits_and_rejections() {
+    use remote_ssh_brige_lib::database::AuditQuery;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().into()).unwrap();
+    let saved = state.save_server(server(), None).unwrap();
+    let exec = |command: &str| Operation {
+        kind: "exec".into(),
+        command: command.into(),
+        ..Default::default()
+    };
+    state
+        .log(
+            &saved,
+            "mcp",
+            &exec("ok"),
+            &Ok(serde_json::json!({"status":"exited","exit_code":0})),
+            1,
+        )
+        .unwrap();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &exec("nonzero"),
+            &Ok(serde_json::json!({"status":"exited","exit_code":1})),
+            1,
+        )
+        .unwrap();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &exec("failed"),
+            &Err(remote_ssh_brige_lib::operation_error::error(
+                "SSH_CONNECT_FAILED",
+                "connection failed",
+            )),
+            1,
+        )
+        .unwrap();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &Operation {
+                kind: "security_reject".into(),
+                ..Default::default()
+            },
+            &Ok(serde_json::json!({})),
+            0,
+        )
+        .unwrap();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &exec("partial"),
+            &Err(remote_ssh_brige_lib::operation_error::error_with_details(
+                "IO_ERROR",
+                "partial delete",
+                serde_json::json!({"partial":true,"removed_entries":1}),
+            )),
+            1,
+        )
+        .unwrap();
+    state
+        .log(
+            &saved,
+            "mcp",
+            &exec("unknown"),
+            &Err(remote_ssh_brige_lib::operation_error::error_with_details(
+                "IO_ERROR",
+                "write outcome unknown",
+                serde_json::json!({"outcome_unknown":true}),
+            )),
+            1,
+        )
+        .unwrap();
+    state
+        .log_event(
+            &saved,
+            "mcp",
+            &Operation {
+                kind: "job".into(),
+                job_action: "finish".into(),
+                job_id: "job_1".into(),
+                ..Default::default()
+            },
+            &Ok(serde_json::json!({"status":"exited","exit_code":2})),
+            10,
+            remote_ssh_brige_lib::model::AuditEventKind::JobFinished,
+        )
+        .unwrap();
+    let entries = state.audit.lock().unwrap().clone();
+    let outcome = |detail: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.detail == detail)
+            .map(|entry| entry.outcome)
+            .unwrap()
+    };
+    assert_eq!(
+        outcome("nonzero"),
+        remote_ssh_brige_lib::model::AuditOutcome::NonzeroExit
+    );
+    assert_eq!(
+        outcome("partial"),
+        remote_ssh_brige_lib::model::AuditOutcome::Partial
+    );
+    assert_eq!(
+        outcome("unknown"),
+        remote_ssh_brige_lib::model::AuditOutcome::Unknown
+    );
+    assert_eq!(
+        outcome("job_1"),
+        remote_ssh_brige_lib::model::AuditOutcome::NonzeroExit
+    );
+    let total = |category: &str| {
+        state
+            .audit_page(&AuditQuery {
+                category: category.into(),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap()
+            .total
+    };
+    assert_eq!(total("all"), 7);
+    assert_eq!(total("failed"), 1);
+    assert_eq!(total("nonzero"), 2);
+    assert_eq!(total("security"), 1);
+}
+
+#[test]
+fn update_flow_is_single_flight_and_reports_backend_mcp_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::open(dir.path().into()).unwrap();
+    assert_eq!(
+        state.update_status().phase,
+        remote_ssh_brige_lib::model::UpdaterPhase::Idle
+    );
+    let status = state.begin_update().unwrap();
+    assert_eq!(
+        status.phase,
+        remote_ssh_brige_lib::model::UpdaterPhase::Preparing
+    );
+    assert_eq!(status.mcp_active_requests, 0);
+    assert!(state.begin_update().is_err());
+    state.set_update_phase(remote_ssh_brige_lib::model::UpdaterPhase::Idle);
+    assert_eq!(
+        state.update_status().phase,
+        remote_ssh_brige_lib::model::UpdaterPhase::Idle
+    );
+}
+
+#[test]
 fn audit_batch_delete_is_atomic_and_updates_pages_details_cache_and_restart() {
     use remote_ssh_brige_lib::database::{AuditDeleteRange, AuditQuery, DATABASE_FILE};
     let dir = workspace();
@@ -968,7 +1197,7 @@ fn json_workspaces_are_rejected_without_creating_a_database_or_changing_files() 
 
 #[test]
 fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
-    for version in [0, 1, 6] {
+    for version in [0, 1, 7] {
         let dir = workspace();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("remote-desk.sqlite3");
@@ -987,6 +1216,77 @@ fn unsupported_database_versions_are_rejected_without_modifying_the_database() {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         cleanup(dir);
     }
+}
+
+#[test]
+fn legacy_audits_gain_outcomes_without_losing_readable_rows() {
+    use remote_ssh_brige_lib::database::AuditQuery;
+    let dir = workspace();
+    std::fs::create_dir_all(&dir).unwrap();
+    let connection = rusqlite::Connection::open(dir.join("remote-desk.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE audit_entries (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                time TEXT NOT NULL, server_id TEXT NOT NULL, server_name TEXT NOT NULL,
+                source TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL,
+                success INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+                summary TEXT NOT NULL, response_json TEXT
+             );
+             INSERT INTO audit_entries
+                (id,time,server_id,server_name,source,kind,detail,success,duration_ms,summary,response_json)
+             VALUES
+                ('ok','2026-01-01T00:00:00Z','s','S','mcp','exec','ok',1,1,'完成','{\"data\":{\"exit_code\":0},\"truncated\":false}'),
+                ('reject','2026-01-01T00:00:01Z','s','S','mcp','security_reject','reject',0,1,'已拒绝',NULL),
+                ('nonzero','2026-01-01T00:00:02Z','s','S','mcp','exec','nonzero',0,1,'失败','{\"data\":{\"exit_code\":1},\"truncated\":false}'),
+                ('unknown','2026-01-01T00:00:03Z','s','S','mcp','exec','unknown',0,1,'失败','{\"data\":{\"status\":\"disconnected\"},\"truncated\":false}');",
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    drop(connection);
+    let state = AppState::open(dir.clone()).unwrap();
+    let page = state
+        .audit_page(&AuditQuery {
+            category: "all".into(),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    let outcome = |detail: &str| {
+        page.entries
+            .iter()
+            .find(|entry| entry.detail == detail)
+            .unwrap()
+            .outcome
+    };
+    assert_eq!(
+        outcome("ok"),
+        remote_ssh_brige_lib::model::AuditOutcome::Success
+    );
+    assert_eq!(
+        outcome("reject"),
+        remote_ssh_brige_lib::model::AuditOutcome::Rejected
+    );
+    assert_eq!(
+        outcome("nonzero"),
+        remote_ssh_brige_lib::model::AuditOutcome::NonzeroExit
+    );
+    assert_eq!(
+        outcome("unknown"),
+        remote_ssh_brige_lib::model::AuditOutcome::Unknown
+    );
+    for (category, total) in [("nonzero", 1), ("security", 1), ("failed", 0)] {
+        let page = state
+            .audit_page(&AuditQuery {
+                category: category.into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, total, "{category}");
+    }
+    drop(state);
+    cleanup(dir);
 }
 
 #[test]
@@ -1128,8 +1428,12 @@ fn audit_pages_filter_globally_and_stay_stable_when_records_arrive() {
         .all(|entry| !first.entries.iter().any(|previous| previous.id == entry.id)));
     query.offset = 0;
     query.upper = None;
-    query.category = "error".into();
-    assert_eq!(state.audit_page(&query).unwrap().total, 31);
+    query.category = "failed".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 0);
+    query.category = "nonzero".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 30);
+    query.category = "security".into();
+    assert_eq!(state.audit_page(&query).unwrap().total, 1);
     query.category = "exec".into();
     assert_eq!(state.audit_page(&query).unwrap().total, 40);
     query.category = "files".into();

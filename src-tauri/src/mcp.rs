@@ -22,7 +22,10 @@ use rmcp::{
     },
     RoleServer, ServerHandler,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +61,19 @@ impl McpSessionRegistry {
     }
 }
 
+struct ActiveRequest<'a>(&'a AtomicUsize);
+impl<'a> ActiveRequest<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteMcp {
     state: Arc<AppState>,
@@ -89,6 +105,15 @@ impl RemoteMcp {
         op: Operation,
         ctx: Option<RequestContext<RoleServer>>,
     ) -> CallToolResult {
+        if matches!(
+            *self.state.update.lock().unwrap(),
+            UpdaterPhase::StoppingMcp | UpdaterPhase::Updating
+        ) {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "MCP is stopping for an application update; retry after the update completes.",
+            )]);
+        }
+        let _active = ActiveRequest::new(&self.state.mcp_active);
         let token = ctx
             .as_ref()
             .and_then(|ctx| ctx.meta.get("progressToken"))
@@ -237,7 +262,7 @@ impl RemoteMcp {
         )
     }
     #[tool(
-        description = "Execute a command. Returns output or a nonzero exit code. APPROVAL_REQUIRED directs you to exec_approved. A retained command returns a job ID and cursors for job.read."
+        description = "Execute a command. Returns output or a nonzero exit code. APPROVAL_REQUIRED directs you to exec_approved. If the command outlives the foreground wait it is handed off to a job; read it with job.read from stdout_cursor=0 and stderr_cursor=0."
     )]
     async fn exec(
         &self,
@@ -268,7 +293,7 @@ impl RemoteMcp {
         self.call(&kind, op).await
     }
     #[tool(
-        description = "List, read or close retained commands. Read returns new output and byte cursors when further reads are needed."
+        description = "List, read or close retained commands. Read returns only output after stdout_cursor/stderr_cursor and the cursors needed to continue. Use wait_secs=10 while monitoring; a running job with no new output returns a short status."
     )]
     async fn job(
         &self,

@@ -21,7 +21,13 @@ import {
 } from "../runtime-settings";
 import appPackage from "../../package.json";
 
+const updater = vi.hoisted(() => ({
+  checkForUpdate: vi.fn(),
+  installUpdate: vi.fn(),
+  discardUpdate: vi.fn(),
+}));
 vi.mock("../api", () => ({ desktop: true, api: vi.fn() }));
+vi.mock("../updater", () => updater);
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
@@ -77,6 +83,71 @@ test("settings footer shows the application version", async () => {
     `应用版本 ${appPackage.version}`,
   );
   expect(version.textContent).toBe(`v${appPackage.version}`);
+});
+
+test("updates require confirmation before stopping a running MCP service", async () => {
+  vi.mocked(api).mockImplementation(async (command) => {
+    if (command === "runtime_settings")
+      return { ...defaultRuntimeSettings } as never;
+    if (command === "update_prepare")
+      return {
+        phase: "preparing",
+        mcp_running: true,
+        mcp_active_requests: 0,
+      } as never;
+    if (command === "update_stop_mcp")
+      return {
+        phase: "updating",
+        mcp_running: false,
+        mcp_active_requests: 0,
+      } as never;
+    if (command === "update_cancel")
+      return {
+        phase: "idle",
+        mcp_running: true,
+        mcp_active_requests: 0,
+      } as never;
+    if (command === "update_failed")
+      return {
+        phase: "idle",
+        mcp_running: true,
+        mcp_active_requests: 0,
+      } as never;
+    throw new Error(`unexpected ${command}`);
+  });
+  updater.checkForUpdate.mockResolvedValue({
+    version: "0.9.0",
+    currentVersion: "0.8.1",
+    body: "- 改进操作记录",
+  });
+  updater.installUpdate.mockResolvedValue(undefined);
+  updater.discardUpdate.mockResolvedValue(undefined);
+  render(<Settings />);
+  await screen.findByLabelText(`应用版本 ${appPackage.version}`);
+  fireEvent.click(screen.getByRole("button", { name: "检查更新" }));
+  await screen.findByText("发现新版本 v0.9.0");
+  fireEvent.click(screen.getByRole("button", { name: "更新应用" }));
+  await screen.findByRole("heading", { name: "更新前需要关闭 MCP 服务" });
+
+  fireEvent.click(screen.getByRole("button", { name: "取消更新" }));
+  await waitFor(() => expect(api).toHaveBeenCalledWith("update_cancel"));
+  expect(updater.installUpdate).not.toHaveBeenCalled();
+  expect(
+    screen.queryByRole("heading", { name: "更新前需要关闭 MCP 服务" }),
+  ).toBeNull();
+  await screen.findByRole("heading", { name: "发现新版本 v0.9.0" });
+
+  fireEvent.click(screen.getByRole("button", { name: "更新应用" }));
+  await screen.findByRole("heading", { name: "更新前需要关闭 MCP 服务" });
+  fireEvent.click(screen.getByRole("button", { name: "关闭 MCP 并更新" }));
+  await waitFor(() => expect(api).toHaveBeenCalledWith("update_stop_mcp"));
+  expect(updater.installUpdate).toHaveBeenCalledTimes(1);
+  const stopCall = vi
+    .mocked(api)
+    .mock.calls.findIndex(([command]) => command === "update_stop_mcp");
+  expect(vi.mocked(api).mock.invocationCallOrder[stopCall]).toBeLessThan(
+    updater.installUpdate.mock.invocationCallOrder[0],
+  );
 });
 
 test("settings render cached values immediately and ignore a load superseded by a save", async () => {

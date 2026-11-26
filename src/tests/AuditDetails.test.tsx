@@ -146,6 +146,6 @@ test("approval audits show readable decision metadata and the complete original 
   expect(screen.getByText("example.test:22")).toBeTruthy();
   expect(document.querySelector(".audit-result")?.textContent).toBe("已拒绝");
   expect(
-    document.querySelector(".audit-result")?.classList.contains("failed"),
+    document.querySelector(".audit-result")?.classList.contains("neutral"),
   ).toBe(true);
 });
