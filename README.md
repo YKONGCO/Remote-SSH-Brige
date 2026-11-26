@@ -62,10 +62,12 @@ Tauri 2 / Rust / React / TypeScript
 
 发布签名更新需要配置以下仓库 Secrets：
 
-- `TAURI_SIGNING_PRIVATE_KEY`：minisign 私钥内容或文件路径。
+- `TAURI_SIGNING_PRIVATE_KEY`：Tauri CLI 生成的 `.key` 文件的完整内容（不是本地文件路径）。
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥口令。
 
 `src-tauri/tauri.updater.conf.json` 启用 `createUpdaterArtifacts`，仅在有签名密钥时参与构建。更新公钥和 `latest.json` 地址位于 `src-tauri/tauri.conf.json` 的 `plugins.updater`。
+
+`pubkey` 必须使用对应 `.key.pub` 文件的完整内容，不能只复制解码后的 minisign 公钥行。Windows 构建会先签名测试文件并验证密钥配对，再生成安装包 `.exe`、`.exe.sig` 和更新清单 `latest.json`。PR 只构建未签名包；发布 `v<package.json 版本>` 标签需要签名密钥，并等待 Windows 和 macOS 检查全部通过后上传两端安装包、Windows 更新资源和完整校验文件，再公开 Release。
 
 ## 开发
 
