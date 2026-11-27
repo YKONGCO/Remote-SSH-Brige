@@ -58,7 +58,7 @@ Tauri 2 / Rust / React / TypeScript
 
 ## 自动更新
 
-「设置 → 关于与更新」显示当前版本并检查 GitHub Releases 中的签名更新。下载和安装必须由用户确认；MCP 正在运行时会先询问是否停止服务。停止失败或仍有活动请求时不会开始安装。
+Windows x64 和 macOS（Apple Silicon）均可在「设置 → 关于与更新」查看当前版本并检查 GitHub Releases 中的签名更新。下载和安装必须由用户确认；MCP 正在运行时会先询问是否停止服务。停止失败或仍有活动请求时不会开始安装。
 
 发布签名更新需要配置以下仓库 Secrets：
 
@@ -67,7 +67,7 @@ Tauri 2 / Rust / React / TypeScript
 
 `src-tauri/tauri.updater.conf.json` 启用 `createUpdaterArtifacts`，仅在有签名密钥时参与构建。更新公钥和 `latest.json` 地址位于 `src-tauri/tauri.conf.json` 的 `plugins.updater`。
 
-`pubkey` 必须使用对应 `.key.pub` 文件的完整内容，不能只复制解码后的 minisign 公钥行。Windows 构建会先签名测试文件并验证密钥配对，再生成安装包 `.exe`、`.exe.sig` 和更新清单 `latest.json`。PR 只构建未签名包；发布 `v<package.json 版本>` 标签需要签名密钥，并等待 Windows 和 macOS 检查全部通过后上传两端安装包、Windows 更新资源和完整校验文件，再公开 Release。
+`pubkey` 必须使用对应 `.key.pub` 文件的完整内容，不能只复制解码后的 minisign 公钥行。Windows 和 macOS 构建均会先签名测试文件并验证密钥配对。Windows 生成 `.exe` 和 `.exe.sig`，macOS 生成 `.app.tar.gz` 和 `.app.tar.gz.sig` 更新资源；发布时将 `windows-x86_64` 与 `darwin-aarch64` 合并到同一个 `latest.json`，并校验两端版本与标签一致。PR 不生成签名更新资源；发布 `v<package.json 版本>` 标签需要签名密钥，并等待两端检查全部通过后上传安装包、更新资源和完整校验文件，再公开 Release。Tauri 更新签名与 Apple 代码签名相互独立，macOS 应用仍使用 ad-hoc 签名。
 
 ## 开发
 
